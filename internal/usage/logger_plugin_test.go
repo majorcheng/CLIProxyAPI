@@ -2,9 +2,13 @@ package usage
 
 import (
 	"context"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 
+	"github.com/gin-gonic/gin"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/logging"
 	coreusage "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/usage"
 )
 
@@ -29,6 +33,86 @@ func TestRequestStatisticsRecordIncludesLatency(t *testing.T) {
 	}
 	if details[0].LatencyMs != 1500 {
 		t.Fatalf("latency_ms = %d, want 1500", details[0].LatencyMs)
+	}
+}
+
+func TestRequestStatisticsRecordIncludesClientIP(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	tests := []struct {
+		name       string
+		remoteAddr string
+		wantIP     string
+	}{
+		{name: "ipv4", remoteAddr: "203.0.113.10:54321", wantIP: "203.0.113.10"},
+		{name: "ipv6", remoteAddr: "[2001:db8::1]:443", wantIP: "2001:db8::1"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			stats := NewRequestStatistics()
+			recorder := httptest.NewRecorder()
+			ginCtx, _ := gin.CreateTestContext(recorder)
+			req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+			req.RemoteAddr = tt.remoteAddr
+			ginCtx.Request = req
+
+			ctx := context.WithValue(context.Background(), "gin", ginCtx)
+			stats.Record(ctx, coreusage.Record{
+				APIKey:      "test-key",
+				Model:       "gpt-5.4",
+				RequestedAt: time.Date(2026, 3, 20, 12, 0, 0, 0, time.UTC),
+				Detail: coreusage.Detail{
+					InputTokens:  10,
+					OutputTokens: 20,
+					TotalTokens:  30,
+				},
+			})
+
+			snapshot := stats.Snapshot()
+			details := snapshot.APIs["test-key"].Models["gpt-5.4"].Details
+			if len(details) != 1 {
+				t.Fatalf("details len = %d, want 1", len(details))
+			}
+			if details[0].ClientIP != tt.wantIP {
+				t.Fatalf("client_ip = %q, want %q", details[0].ClientIP, tt.wantIP)
+			}
+		})
+	}
+}
+
+func TestRequestStatisticsRecordMatchesHTTPLogClientIP(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	stats := NewRequestStatistics()
+	recorder := httptest.NewRecorder()
+	ginCtx, _ := gin.CreateTestContext(recorder)
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	req.RemoteAddr = "203.0.113.10:54321"
+	req.Header.Set("X-Forwarded-For", "198.51.100.8")
+	ginCtx.Request = req
+
+	expectedIP := logging.ResolveClientIP(ginCtx)
+
+	ctx := context.WithValue(context.Background(), "gin", ginCtx)
+	stats.Record(ctx, coreusage.Record{
+		APIKey:      "test-key",
+		Model:       "gpt-5.4",
+		RequestedAt: time.Date(2026, 3, 20, 12, 0, 0, 0, time.UTC),
+		Detail: coreusage.Detail{
+			InputTokens:  10,
+			OutputTokens: 20,
+			TotalTokens:  30,
+		},
+	})
+
+	snapshot := stats.Snapshot()
+	details := snapshot.APIs["test-key"].Models["gpt-5.4"].Details
+	if len(details) != 1 {
+		t.Fatalf("details len = %d, want 1", len(details))
+	}
+	if details[0].ClientIP != expectedIP {
+		t.Fatalf("client_ip = %q, want same as HTTP log %q", details[0].ClientIP, expectedIP)
 	}
 }
 

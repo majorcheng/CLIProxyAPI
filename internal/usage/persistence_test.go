@@ -2,17 +2,20 @@ package usage
 
 import (
 	"context"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
 
+	"github.com/gin-gonic/gin"
 	coreusage "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/usage"
 )
 
 func TestPersistAndRestoreRequestStatisticsRoundTrip(t *testing.T) {
 	stats := NewRequestStatistics()
-	recordUsageForTest(stats, coreusage.Record{
+	recordUsageWithRemoteAddrForTest(t, stats, "203.0.113.10:54321", coreusage.Record{
 		APIKey:      "test-key",
 		Model:       "gpt-5.4",
 		RequestedAt: time.Date(2026, 3, 26, 10, 0, 0, 0, time.UTC),
@@ -25,7 +28,7 @@ func TestPersistAndRestoreRequestStatisticsRoundTrip(t *testing.T) {
 			TotalTokens:  30,
 		},
 	})
-	recordUsageForTest(stats, coreusage.Record{
+	recordUsageWithRemoteAddrForTest(t, stats, "[2001:db8::1]:443", coreusage.Record{
 		APIKey:      "test-key",
 		Model:       "gpt-5.4",
 		RequestedAt: time.Date(2026, 3, 26, 11, 0, 0, 0, time.UTC),
@@ -83,6 +86,12 @@ func TestPersistAndRestoreRequestStatisticsRoundTrip(t *testing.T) {
 	details := snapshot.APIs["test-key"].Models["gpt-5.4"].Details
 	if len(details) != 2 {
 		t.Fatalf("details len = %d, want 2", len(details))
+	}
+	if details[0].ClientIP != "203.0.113.10" {
+		t.Fatalf("details[0].client_ip = %q, want %q", details[0].ClientIP, "203.0.113.10")
+	}
+	if details[1].ClientIP != "2001:db8::1" {
+		t.Fatalf("details[1].client_ip = %q, want %q", details[1].ClientIP, "2001:db8::1")
 	}
 	if restored.HasPendingPersistence() {
 		t.Fatalf("restored stats should be clean immediately after restore")
@@ -241,4 +250,18 @@ func TestRestoreRequestStatisticsFallsBackToLegacyJSONFile(t *testing.T) {
 
 func recordUsageForTest(stats *RequestStatistics, record coreusage.Record) {
 	stats.Record(context.Background(), record)
+}
+
+func recordUsageWithRemoteAddrForTest(t *testing.T, stats *RequestStatistics, remoteAddr string, record coreusage.Record) {
+	t.Helper()
+	gin.SetMode(gin.TestMode)
+
+	recorder := httptest.NewRecorder()
+	ginCtx, _ := gin.CreateTestContext(recorder)
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	req.RemoteAddr = remoteAddr
+	ginCtx.Request = req
+
+	ctx := context.WithValue(context.Background(), "gin", ginCtx)
+	stats.Record(ctx, record)
 }

@@ -155,15 +155,46 @@ type authMaintenanceHook struct {
 	service *Service
 }
 
+type skipAuthLifecycleSyncContextKey struct{}
+
+func withSkipAuthLifecycleSync(ctx context.Context) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithValue(ctx, skipAuthLifecycleSyncContextKey{}, true)
+}
+
+func shouldSkipAuthLifecycleSync(ctx context.Context) bool {
+	if ctx == nil {
+		return false
+	}
+	skip, _ := ctx.Value(skipAuthLifecycleSyncContextKey{}).(bool)
+	return skip
+}
+
 func (h authMaintenanceHook) OnAuthRegistered(ctx context.Context, auth *coreauth.Auth) {
 	if h.next != nil {
 		h.next.OnAuthRegistered(ctx, auth)
+	}
+	if h.service != nil && auth != nil && auth.ID != "" && !shouldSkipAuthLifecycleSync(ctx) {
+		h.service.emitAuthUpdate(ctx, watcher.AuthUpdate{
+			Action: watcher.AuthUpdateActionAdd,
+			ID:     auth.ID,
+			Auth:   auth.Clone(),
+		})
 	}
 }
 
 func (h authMaintenanceHook) OnAuthUpdated(ctx context.Context, auth *coreauth.Auth) {
 	if h.next != nil {
 		h.next.OnAuthUpdated(ctx, auth)
+	}
+	if h.service != nil && auth != nil && auth.ID != "" && !shouldSkipAuthLifecycleSync(ctx) {
+		h.service.emitAuthUpdate(ctx, watcher.AuthUpdate{
+			Action: watcher.AuthUpdateActionModify,
+			ID:     auth.ID,
+			Auth:   auth.Clone(),
+		})
 	}
 }
 
@@ -543,6 +574,7 @@ func (s *Service) applyCoreAuthAddOrUpdate(ctx context.Context, auth *coreauth.A
 	if s == nil || s.coreManager == nil || auth == nil || auth.ID == "" {
 		return
 	}
+	ctx = withSkipAuthLifecycleSync(ctx)
 	auth = auth.Clone()
 	s.ensureExecutorsForAuth(auth)
 

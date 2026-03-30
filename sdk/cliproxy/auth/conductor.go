@@ -2301,6 +2301,31 @@ func isModelSupportResultError(err *Error) bool {
 	return isModelSupportErrorMessage(err.Message)
 }
 
+func isTransientProviderError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if authErr, ok := err.(*Error); ok && authErr != nil && authErr.Retryable {
+		return true
+	}
+	switch statusCodeFromError(err) {
+	case http.StatusRequestTimeout, http.StatusInternalServerError, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+		return true
+	}
+	message := strings.ToLower(strings.TrimSpace(err.Error()))
+	if message == "" {
+		return false
+	}
+	return strings.Contains(message, "context deadline exceeded") ||
+		strings.Contains(message, "deadline exceeded") ||
+		strings.Contains(message, "timeout") ||
+		strings.Contains(message, "temporary") ||
+		strings.Contains(message, "connection refused") ||
+		strings.Contains(message, "connection reset") ||
+		strings.Contains(message, "unexpected eof") ||
+		strings.Contains(message, "eof")
+}
+
 // isRequestInvalidError returns true if the error represents a caller-side
 // request-shape failure that should not keep poisoning auth state. Model-support
 // failures remain eligible for auth/upstream fallback, but 422 responses and
@@ -2322,7 +2347,7 @@ func isBlockableInvalidRequestError(err error) bool {
 	case http.StatusUnauthorized, http.StatusTooManyRequests:
 		return false
 	}
-	if isTransientError(err) {
+	if isTransientProviderError(err) {
 		return false
 	}
 	message := strings.ToLower(strings.TrimSpace(err.Error()))
@@ -2333,7 +2358,8 @@ func isBlockableInvalidRequestError(err error) bool {
 		return true
 	}
 	if status == http.StatusBadRequest {
-		return strings.Contains(message, "invalid_request_error") ||
+		return isRequestInvalidBody(err.Error()) ||
+			strings.Contains(message, "invalid_request_error") ||
 			strings.Contains(message, "invalid response format") ||
 			strings.Contains(message, "invalid_response_format") ||
 			strings.Contains(message, "response_format")

@@ -140,14 +140,14 @@ type hookState struct {
 
 // Manager orchestrates auth lifecycle, selection, execution, and persistence.
 type Manager struct {
-	store     Store
-	executors map[string]ProviderExecutor
-	selector  Selector
-	hookValue atomic.Value
+	store           Store
+	executors       map[string]ProviderExecutor
+	selector        Selector
+	hookValue       atomic.Value
 	blockedRequests *blockedRequestLRU
-	mu        sync.RWMutex
-	auths     map[string]*Auth
-	scheduler *authScheduler
+	mu              sync.RWMutex
+	auths           map[string]*Auth
+	scheduler       *authScheduler
 	// providerOffsets tracks per-model provider rotation state for multi-provider routing.
 	providerOffsets map[string]int
 

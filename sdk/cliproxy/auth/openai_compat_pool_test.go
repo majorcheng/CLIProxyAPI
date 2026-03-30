@@ -6,6 +6,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	internalconfig "github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
@@ -424,6 +425,24 @@ func TestManagerExecute_DoesNotBlockRepeatedUnauthorizedRequest(t *testing.T) {
 	opts := cliproxyexecutor.Options{OriginalRequest: []byte(`{"model":"claude-opus-4.66"}`)}
 
 	_, _ = m.Execute(context.Background(), []string{"pool"}, cliproxyexecutor.Request{Model: alias}, opts)
+	authID := "pool-auth-" + t.Name()
+	m.mu.Lock()
+	auth := m.auths[authID]
+	if auth == nil {
+		m.mu.Unlock()
+		t.Fatalf("expected auth to remain registered")
+	}
+	auth.Status = StatusActive
+	auth.StatusMessage = ""
+	auth.Unavailable = false
+	auth.NextRetryAfter = time.Time{}
+	auth.LastError = nil
+	auth.ModelStates = nil
+	snapshot := auth.Clone()
+	m.mu.Unlock()
+	if m.scheduler != nil {
+		m.scheduler.upsertAuth(snapshot)
+	}
 	_, _ = m.Execute(context.Background(), []string{"pool"}, cliproxyexecutor.Request{Model: alias}, opts)
 
 	got := executor.ExecuteModels()

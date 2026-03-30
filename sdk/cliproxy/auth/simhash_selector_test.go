@@ -51,11 +51,11 @@ func TestSimHashSelectorSkipsUnavailableAuths(t *testing.T) {
 	selector := &SimHashSelector{}
 	auths := []*Auth{
 		{
-			ID:                   "a",
-			Provider:             "codex",
-			Status:               StatusActive,
+			ID:                    "a",
+			Provider:              "codex",
+			Status:                StatusActive,
 			HasLastRequestSimHash: true,
-			LastRequestSimHash:   0,
+			LastRequestSimHash:    0,
 			ModelStates: map[string]*ModelState{
 				"gpt-5.4": {
 					Status:         StatusError,
@@ -65,11 +65,11 @@ func TestSimHashSelectorSkipsUnavailableAuths(t *testing.T) {
 			},
 		},
 		{
-			ID:                   "b",
-			Provider:             "codex",
-			Status:               StatusActive,
+			ID:                    "b",
+			Provider:              "codex",
+			Status:                StatusActive,
 			HasLastRequestSimHash: true,
-			LastRequestSimHash:   7,
+			LastRequestSimHash:    7,
 		},
 	}
 	opts := cliproxyexecutor.Options{Metadata: map[string]any{cliproxyexecutor.RequestSimHashMetadataKey: uint64(0)}}

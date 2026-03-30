@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/audit"
 	internalconfig "github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
@@ -577,6 +578,25 @@ func streamErrorResult(headers http.Header, err error) *cliproxyexecutor.StreamR
 	}
 }
 
+func (m *Manager) withAuditContext(ctx context.Context, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) context.Context {
+	if audit.FromContext(ctx) != nil {
+		return ctx
+	}
+	maxBodyBytes := 0
+	cfg, _ := m.runtimeConfig.Load().(*internalconfig.Config)
+	if cfg != nil {
+		maxBodyBytes = cfg.RequestAudit.MaxBodyBytes
+	}
+	return audit.WithRequest(ctx, opts, req, maxBodyBytes)
+}
+
+func auditAuthPath(auth *Auth) string {
+	if auth == nil || auth.Attributes == nil {
+		return ""
+	}
+	return strings.TrimSpace(auth.Attributes["path"])
+}
+
 func readStreamBootstrap(ctx context.Context, ch <-chan cliproxyexecutor.StreamChunk) ([]cliproxyexecutor.StreamChunk, bool, error) {
 	if ch == nil {
 		return nil, true, nil
@@ -624,6 +644,9 @@ func (m *Manager) wrapStreamResult(ctx context.Context, authID, provider, result
 				}
 				m.MarkResult(ctx, Result{AuthID: authID, Provider: provider, Model: resultModel, Success: false, Error: rerr})
 			}
+			if len(chunk.Payload) > 0 {
+				audit.AppendClientResponse(ctx, chunk.Payload)
+			}
 			if !forward {
 				return false
 			}
@@ -667,6 +690,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 		resultModel := executionResultModel(routeModel, execModel, pooled)
 		execReq := req
 		execReq.Model = execModel
+		audit.SetAttempt(ctx, provider, execModel, auth.ID, auth.Label, auth.FileName, auditAuthPath(auth))
 		streamResult, errStream := executor.ExecuteStream(ctx, auth, execReq, opts)
 		if errStream != nil {
 			if errCtx := ctx.Err(); errCtx != nil {
@@ -1022,6 +1046,7 @@ func (m *Manager) Load(ctx context.Context) error {
 // Execute performs a non-streaming execution using the configured selector and executor.
 // It supports multiple providers for the same model and round-robins the starting provider per model.
 func (m *Manager) Execute(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	ctx = m.withAuditContext(ctx, req, opts)
 	normalized := m.normalizeProviders(providers)
 	if len(normalized) == 0 {
 		return cliproxyexecutor.Response{}, &Error{Code: "provider_not_found", Message: "no provider supplied"}
@@ -1053,6 +1078,7 @@ func (m *Manager) Execute(ctx context.Context, providers []string, req cliproxye
 // ExecuteCount performs a non-streaming execution using the configured selector and executor.
 // It supports multiple providers for the same model and round-robins the starting provider per model.
 func (m *Manager) ExecuteCount(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	ctx = m.withAuditContext(ctx, req, opts)
 	normalized := m.normalizeProviders(providers)
 	if len(normalized) == 0 {
 		return cliproxyexecutor.Response{}, &Error{Code: "provider_not_found", Message: "no provider supplied"}
@@ -1084,6 +1110,7 @@ func (m *Manager) ExecuteCount(ctx context.Context, providers []string, req clip
 // ExecuteStream performs a streaming execution using the configured selector and executor.
 // It supports multiple providers for the same model and round-robins the starting provider per model.
 func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
+	ctx = m.withAuditContext(ctx, req, opts)
 	normalized := m.normalizeProviders(providers)
 	if len(normalized) == 0 {
 		return nil, &Error{Code: "provider_not_found", Message: "no provider supplied"}
@@ -1172,6 +1199,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			resultModel := executionResultModel(routeModel, upstreamModel, pooled)
 			execReq := req
 			execReq.Model = upstreamModel
+			audit.SetAttempt(execCtx, provider, upstreamModel, auth.ID, auth.Label, auth.FileName, auditAuthPath(auth))
 			resp, errExec := executor.Execute(execCtx, auth, execReq, opts)
 			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: errExec == nil}
 			if errExec != nil {
@@ -1194,6 +1222,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 				authErr = errExec
 				continue
 			}
+			audit.SetClientResponse(execCtx, resp.Payload)
 			m.MarkResult(execCtx, result)
 			return resp, nil
 		}
@@ -1271,6 +1300,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 			resultModel := executionResultModel(routeModel, upstreamModel, pooled)
 			execReq := req
 			execReq.Model = upstreamModel
+			audit.SetAttempt(execCtx, provider, upstreamModel, auth.ID, auth.Label, auth.FileName, auditAuthPath(auth))
 			resp, errExec := executor.CountTokens(execCtx, auth, execReq, opts)
 			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: errExec == nil}
 			if errExec != nil {
@@ -1293,6 +1323,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 				authErr = errExec
 				continue
 			}
+			audit.SetClientResponse(execCtx, resp.Payload)
 			m.MarkResult(execCtx, result)
 			return resp, nil
 		}

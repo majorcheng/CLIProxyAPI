@@ -78,20 +78,29 @@ func (s *SimHashSelector) Pick(ctx context.Context, provider, model string, opts
 	poolMembers, outsiders := s.partitionAvailableLocked(available)
 
 	if len(s.pool.members) < s.effectivePoolSizeLocked() && len(outsiders) > 0 {
-		// 池子首次填满前允许快速补位；一旦填满过，后续补入新 auth 必须遵守冷却窗口，
-		// 避免可用 auth 抖动时把整个池子迅速洗牌。
-		if s.canAdmitLocked(now) {
-			admitted := s.admitLocked(now, outsiders)
-			if admitted != nil {
-				s.mu.Unlock()
-				return admitted, nil
+		admitted := s.pickAdmissionCandidateLocked(now, outsiders)
+		if admitted != nil {
+			s.pool.members[admitted.ID] = struct{}{}
+			if s.pool.preferredOutsiderID == admitted.ID {
+				s.pool.preferredOutsiderID = ""
 			}
+			s.pool.lastAdmittedAt = now
+			if len(s.pool.members) >= s.effectivePoolSizeLocked() {
+				s.pool.everFilled = true
+			}
+			s.mu.Unlock()
+			return admitted, nil
 		}
 	}
 
-	if len(poolMembers) == 0 && len(outsiders) > 0 && s.canAdmitLocked(now) {
-		admitted := s.admitLocked(now, outsiders)
+	if len(poolMembers) == 0 && len(outsiders) > 0 && (!s.pool.everFilled || now.Sub(s.pool.lastAdmittedAt) >= s.admitCooldownLocked()) {
+		admitted := s.pickAdmissionCandidateLocked(now, outsiders)
 		if admitted != nil {
+			s.pool.members[admitted.ID] = struct{}{}
+			if s.pool.preferredOutsiderID == admitted.ID {
+				s.pool.preferredOutsiderID = ""
+			}
+			s.pool.lastAdmittedAt = now
 			s.mu.Unlock()
 			return admitted, nil
 		}
@@ -254,32 +263,24 @@ func (s *SimHashSelector) pickRoundRobinLocked(key string, auths []*Auth) *Auth 
 	return auths[index%len(auths)]
 }
 
-func (s *SimHashSelector) canAdmitLocked(now time.Time) bool {
-	if !s.pool.everFilled {
-		return true
+func admissionEpoch(now time.Time) int64 {
+	if now.IsZero() {
+		now = time.Now()
 	}
-	if s.pool.lastAdmittedAt.IsZero() {
-		return true
-	}
-	return now.Sub(s.pool.lastAdmittedAt) >= s.admitCooldownLocked()
+	return now.UTC().Unix() / int64(simHashAdmissionEpoch/time.Second)
 }
 
-func (s *SimHashSelector) admitLocked(now time.Time, outsiders []*Auth) *Auth {
-	admitted := s.pickRoundRobinLocked("simhash:admit", outsiders)
-	if admitted == nil {
-		return nil
+func admissionOrderScore(epoch int64, auth *Auth) uint64 {
+	if auth == nil {
+		return 0
 	}
-	s.pool.members[admitted.ID] = struct{}{}
-	if s.pool.everFilled {
-		s.pool.lastAdmittedAt = now
-		return admitted
-	}
-	if len(s.pool.members) >= s.effectivePoolSizeLocked() {
-		s.pool.everFilled = true
-		// 首次填满不立刻启动冷却，允许下一次真实拓扑变化时补入 1 个新成员。
-		s.pool.lastAdmittedAt = time.Time{}
-	}
-	return admitted
+	h := fnv.New64a()
+	var buf [24]byte
+	epochBytes := strconv.AppendInt(buf[:0], epoch, 10)
+	_, _ = h.Write(epochBytes)
+	_, _ = h.Write([]byte{':'})
+	_, _ = h.Write([]byte(auth.ID))
+	return h.Sum64()
 }
 
 func (s *SimHashSelector) effectivePoolSizeLocked() int {

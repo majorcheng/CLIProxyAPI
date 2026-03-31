@@ -17,6 +17,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
+	chatcompletions "github.com/router-for-me/CLIProxyAPI/v6/internal/translator/codex/openai/chat-completions"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	coreexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
@@ -473,6 +474,7 @@ func (h *BaseAPIHandler) ExecuteWithAuthManager(ctx context.Context, handlerType
 	if errMsg != nil {
 		return nil, nil, errMsg
 	}
+	primeRequestTranslationCache(handlerType, rawJSON)
 	reqMeta := requestExecutionMetadata(ctx)
 	reqMeta[coreexecutor.RequestedModelMetadataKey] = normalizedModel
 	payload := rawJSON
@@ -519,6 +521,7 @@ func (h *BaseAPIHandler) ExecuteCountWithAuthManager(ctx context.Context, handle
 	if errMsg != nil {
 		return nil, nil, errMsg
 	}
+	primeRequestTranslationCache(handlerType, rawJSON)
 	reqMeta := requestExecutionMetadata(ctx)
 	reqMeta[coreexecutor.RequestedModelMetadataKey] = normalizedModel
 	payload := rawJSON
@@ -569,6 +572,7 @@ func (h *BaseAPIHandler) ExecuteStreamWithAuthManager(ctx context.Context, handl
 		close(errChan)
 		return nil, nil, errChan
 	}
+	primeRequestTranslationCache(handlerType, rawJSON)
 	reqMeta := requestExecutionMetadata(ctx)
 	reqMeta[coreexecutor.RequestedModelMetadataKey] = normalizedModel
 	payload := rawJSON
@@ -761,6 +765,16 @@ func validateSSEDataJSON(chunk []byte) error {
 		return fmt.Errorf("invalid SSE data JSON (len=%d): %q", len(data), preview)
 	}
 	return nil
+}
+
+func primeRequestTranslationCache(handlerType string, rawJSON []byte) {
+	if len(rawJSON) == 0 {
+		return
+	}
+	switch sdktranslator.FromString(handlerType) {
+	case sdktranslator.FormatOpenAI:
+		chatcompletions.PrimeOpenAIRequest(rawJSON)
+	}
 }
 
 func statusFromError(err error) int {

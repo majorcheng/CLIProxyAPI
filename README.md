@@ -1,75 +1,154 @@
-# CLIProxyAPI Auth/Codex Fork
+# CLIProxyAPI 二开项目说明
 
-English | [中文](README_CN.md)
+首先感谢原项目 [router-for-me/CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) 打下的基础
 
-This repository is an independently maintained derivative of `router-for-me/CLIProxyAPI`.
+同时感谢 [LINUX DO](https://linux.do) 社区以及各位佬友长期的使用反馈
 
-It is not the upstream project, is not affiliated with `router-for-me`, and should not be represented as an official mirror, release channel, support channel, or documentation endpoint for the upstream repository.
+## 这次二开主要做了两件事
 
-## What This Fork Is
+1. 重点做性能优化，尤其是压缩 Codex 请求转换链路中的 JSON 重复计算序列化次数。
+2. 增加了一批在真实使用中非常实用的新策略和新功能，让系统在复杂账号池和复杂请求场景下更稳、更好用。
 
-This fork keeps the original CLI proxy compatibility goals while carrying a smaller set of local changes focused on runtime behavior instead of product promotion.
+## 1. 性能改进                 
 
-Current fork-specific changes relative to `router-for-me/CLIProxyAPI`:
+这次二开的核心性能优化，不是抽象地说“更快了”，而是非常明确地减少了 Codex 请求转换链路中的整段 JSON 计算序列化次数。
 
-- Codex/OpenAI Responses request translation adjustments and executor wiring updates
-- Auth scheduler behavior changes aimed at lower churn under concurrency
-- Async auth persistence additions
-- Scheduler benchmark and persistence test updates
-- Container defaults adjusted for this repository's GHCR image distribution
+原实现的问题在于：它不是先把完整结构在内存里组装好，再统一输出；而是每设置一个字段、每追加一条消息、每追加一个内容块、每追加一个 tool call，都通过 `sjson.Set(...)` 或 `sjson.SetRaw(...)` 对当前整段 JSON 再计算序列化一次。
 
-At the moment, the Go module path is still `github.com/router-for-me/CLIProxyAPI/v6` for compatibility with the existing code layout. That compatibility detail does not imply any project affiliation.
+所以，要比较原实现和新实现，最直接的方法不是讲模糊的“请求复杂度”，而是直接比：
 
-## Core Capabilities
+- 原实现整段输出 JSON 一共会被计算序列化多少次
+- 新实现整段输出 JSON 一共会被计算序列化多少次
 
-- OpenAI, Gemini, Claude, and Codex compatible API endpoints for CLI-oriented clients
-- OAuth-based support for Codex, Claude Code, Qwen Code, and iFlow
-- Streaming and non-streaming responses
-- Multi-account routing and load balancing
-- Reusable Go SDK under `sdk/cliproxy`
-- Request translation and provider execution layers suitable for embedding
+### 1.1 变量定义
 
-## Quick Start
+设一次请求中：
 
-Use the fork's GHCR image:
+- `m_user`：`role = user` 的消息数
+- `m_assistant`：`role = assistant` 的消息数
+- `m_system`：`role = system` 的消息数
+- `m_tool`：`role = tool` 的消息数
+- `s_content`：普通消息中，`content` 为字符串的消息数
+- `pt`：所有数组型 `content` 中，`text` 类型内容块总数
+- `pi`：所有数组型 `content` 中，`image_url` 类型内容块总数
+- `pf`：所有数组型 `content` 中，`file` 类型内容块总数
+- `c`：所有 assistant 消息中的 `tool_calls` 总数
+- `tf`：`function` 类型工具总数
+- `tb`：内建工具总数
+- `rf_text`：`response_format.type = text` 时记 `1`，否则记 `0`
+- `rf_schema`：`response_format.type = json_schema` 时记 `1`，否则记 `0`
+- `v_only`：只使用 `text.verbosity` 且前面没有创建 `text` 时记 `1`，否则记 `0`
+- `v_with_rf`：在已有 `response_format` 的前提下再使用 `text.verbosity` 时记 `1`，否则记 `0`
+- `tc_str`：`tool_choice` 是字符串时记 `1`，否则记 `0`
+- `tc_func`：`tool_choice` 是 function object 时记 `1`，否则记 `0`
+- `tc_builtin`：`tool_choice` 是 builtin object 时记 `1`，否则记 `0`
 
-```bash
-docker run --rm -p 8317:8317 ghcr.io/arron196/cliproxyapi:latest
-```
+再定义：
 
-Or with Compose:
+- `z_old`：原实现中，整段输出 JSON 被重新计算序列化的总次数
+- `z_new`：新实现中，整段输出 JSON 被重新计算序列化的总次数
 
-```bash
-docker compose up -d
-```
+### 1.2 原实现整段 JSON 的总序列化次数
 
-The default image in `docker-compose.yml` is:
+原实现中，每一次 `sjson.Set(...)` 和 `sjson.SetRaw(...)` 都会触发一次整段输出 JSON 的重新计算序列化。
 
-```text
-ghcr.io/arron196/cliproxyapi:latest
-```
+把所有会命中的路径展开后，原实现请求侧的总序列化次数可以写成：
 
-## Local Documentation
+\[ z_{old} = 9 + 4(m_{user}+m_{assistant}+m_{system}) + 4m_{tool} + 3s_{content} + 3pt + 3pi + 4pf + 5c + tb + 6tf + 2rf_{text} + 5rf_{schema} + 2v_{only} + v_{with\_rf} + tc_{str} + 3tc_{func} + tc_{builtin} \]
 
-- SDK usage: [docs/sdk-usage.md](docs/sdk-usage.md)
-- SDK advanced topics: [docs/sdk-advanced.md](docs/sdk-advanced.md)
-- SDK access/auth: [docs/sdk-access.md](docs/sdk-access.md)
-- SDK watcher integration: [docs/sdk-watcher.md](docs/sdk-watcher.md)
+这个式子不是泛泛而谈，而是把原实现中“到底哪里会增加整段 JSON 重算次数”全部展开了：
 
-Management endpoints are exposed under `/v0/management` when enabled in configuration. This fork does not currently publish a separate external documentation site.
+- 每条普通消息固定增加 `4` 次
+- 每条 tool 消息固定增加 `4` 次
+- 每个字符串型 content 固定增加 `3` 次
+- 每个 `text` 内容块固定增加 `3` 次
+- 每个 `image_url` 内容块固定增加 `3` 次
+- 每个 `file` 内容块固定增加 `4` 次
+- 每个 tool call 固定增加 `5` 次
+- 每个内建工具固定增加 `1` 次
+- 每个 function 工具固定增加 `6` 次
 
-## Project Identity
+也就是说，原实现不是“看起来复杂一些”，而是请求里每多一条消息、每多一个内容块、每多一个 tool call，就会明确多出对应次数的整段 JSON 重新计算序列化。
 
-- Upstream base: `router-for-me/CLIProxyAPI`
-- This repository: independent derivative maintained in a separate GitHub repository
-- Upstream relationship: no affiliation, no endorsement, no shared release process, no shared support obligation
+### 1.3 新实现整段 JSON 的总序列化次数
 
-If you need upstream behavior or upstream support, use the upstream repository directly.
+二开后，请求侧改成了：
 
-## Contributing
+- 先在内存中完成结构化构造
+- 最后统一 `json.Marshal(out)` 一次输出
 
-Contributions should target this repository's behavior and documentation, not the upstream project's release promises or commercial integrations.
+因此：
 
-## License
+\[
+z_{new} = 1
+\]
 
-MIT. See [LICENSE](LICENSE).
+这个值是固定的，不再随着消息数量、内容块数量、工具数量和 tool call 数量继续增长。
+
+### 1.4 这次性能优化到底优化了什么
+
+所以这次性能优化的核心，不是简单地说“减少了一些 JSON 操作”，而是：
+
+- 原实现：整段 JSON 的总序列化次数是一个会随着请求结构持续增长的表达式
+- 二开后：整段 JSON 的总序列化次数直接收敛为 `1`
+
+也就是说，这次二开真正解决的是：
+
+- 原实现中，每条消息、每个内容块、每个 tool call 都在继续抬高整段 JSON 的重复序列化次数
+- 二开后，这些变量只影响内存中的结构构造，不再驱动整段输出 JSON 被反复重算
+
+这也是为什么在客户端一个请求里经常包含 20 多轮对话时，这条链路的收益会特别明显。原实现会随着消息和内容继续累加整段 JSON 的重算次数，而二开后请求侧始终只保留 1 次最终输出序列化。
+
+## 2. 新增功能
+
+除了性能优化，这次二开还补了一批真正有实际价值的新功能和新策略，重点不是堆入口，而是让复杂场景下的可用性和稳定性更高。
+
+### 2.1 新增认证池调度策略
+
+新增了更完整的认证池调度能力，不再只是简单轮询，而是开始支持：
+
+- 基于成功趋势的选择策略
+- 基于请求相似性的路由策略
+- 更稳定的虚拟池控制
+- 更稳定的入池和选路顺序
+
+这部分增强解决的是原项目在复杂账号池场景下一个非常现实的问题：当账号数量越来越多、模型种类越来越多、请求类型越来越杂时，只靠基础轮询或者简单优先级，系统虽然还能“分发请求”，但已经很难保证“分发得足够稳、足够准”。
+
+这次二开在认证调度上补的，不只是一个单点策略，而是一整套更适合真实使用环境的调度能力：
+
+- 会根据近期成功趋势调整选择方向，而不是只看静态顺序
+- 会利用请求相似性让路由更稳定，减少池内频繁漂移
+- 会把虚拟池控制做得更完整，而不是让不同来源的认证简单堆在一起
+- 会更强调入池顺序和选路顺序的稳定性，避免边界场景下行为不可预测
+
+这些能力叠加之后，系统的状态就不再只是“能挑一个账号出去跑”，而是更接近“知道什么请求应该更稳地落到什么账号或什么池上”。对多账号、多模型、多计划层级共存的场景来说，这一点非常关键，因为很多问题不是“完全不可用”，而是“经常抖、经常漂、经常选得不够好”，而这正是二开重点解决的部分。
+
+### 2.2 新增无效请求阻断能力
+
+新增了对重复无效请求的识别和阻断能力，避免明显错误的请求反复进入上游。
+
+这带来的价值包括：
+
+- 减少无意义的上游消耗
+- 减少错误日志的重复放大
+- 降低坏请求持续干扰调度的概率
+
+这部分增强解决的不是“系统会不会报错”，而是“同一个错误请求会不会反复消耗系统资源”。在真实使用里，最烦人的往往不是一次错误，而是重复的错误请求不断进入系统，然后不断占用：
+
+- 上游请求额度
+- 调度判断次数
+- 错误日志空间
+- 排障注意力
+
+如果系统只是被动返回错误，那么这些坏请求虽然每次都失败了，但依然会一轮一轮地走完整条链路。二开补上这部分之后，系统可以更早地识别重复无效载荷，并把它们挡在更前面，而不是每次都继续送到上游再失败一次。
+
+这类能力在代码层面看起来不像“新模型支持”那样显眼，但在长期运行场景里非常重要。因为一个成熟的代理层不只是要处理成功请求，也必须知道哪些请求根本不该继续放行。只有把这类重复无效请求拦住，调度层、日志层和上游资源才不会被持续污染。
+
+## 总结
+
+这次二开最核心的事情其实就两条：
+
+1. 在性能上，把原实现里会随着消息、内容块、tool call 持续增长的整段 JSON 重复序列化次数，压缩成了固定 `1` 次。
+2. 在功能上，增加了认证调度、无效请求阻断、审计、模型管理、流式/WebSocket 和多 Provider 兼容等一整批真正影响实际可用性的新能力。
+
+所以，这个二开版本不是简单做了几处零散修改，而是同时把请求转换链路做轻了，也把复杂场景下真正需要的能力补齐了。

@@ -66,6 +66,8 @@ const (
 	refreshFailureBackoff = 5 * time.Minute
 	quotaBackoffBase      = time.Second
 	quotaBackoffMax       = 30 * time.Minute
+	// 单个 auth 满载时给客户端一个很短的 Retry-After，表达“这是本地拥塞保护，不是上游长冷却”。
+	authCapacityRetryAfter = time.Second
 	// unlimitedRetrySafetyCap bounds legacy "retry all credentials" mode so a
 	// single unhealthy request cannot fan out across thousands of auth files.
 	unlimitedRetrySafetyCap = 32
@@ -167,6 +169,11 @@ type Manager struct {
 	// modelPoolOffsets tracks per-auth alias pool rotation state.
 	modelPoolOffsets map[string]int
 
+	// inflightPerAuth 只记录运行时进行中的请求数，用来保护单个 token 账号。
+	// 它故意不持久化，也不把 auth 标成 unavailable，避免污染管理面状态。
+	inflightMu      sync.Mutex
+	inflightPerAuth map[string]int
+
 	// runtimeConfig stores the latest application config for request-time decisions.
 	// It is initialized in NewManager; never Load() before first Store().
 	runtimeConfig atomic.Value
@@ -200,6 +207,7 @@ func NewManager(store Store, selector Selector, hook Hook) *Manager {
 		blockedRequests:  newBlockedRequestLRU(1000),
 		auths:            make(map[string]*Auth),
 		providerOffsets:  make(map[string]int),
+		inflightPerAuth:  make(map[string]int),
 		modelPoolOffsets: make(map[string]int),
 		refreshSemaphore: make(chan struct{}, refreshMaxConcurrency),
 	}
@@ -648,10 +656,13 @@ func readStreamBootstrap(ctx context.Context, ch <-chan cliproxyexecutor.StreamC
 	}
 }
 
-func (m *Manager) wrapStreamResult(ctx context.Context, authID, provider, resultModel string, headers http.Header, buffered []cliproxyexecutor.StreamChunk, remaining <-chan cliproxyexecutor.StreamChunk) *cliproxyexecutor.StreamResult {
+func (m *Manager) wrapStreamResult(ctx context.Context, authID, provider, resultModel string, headers http.Header, buffered []cliproxyexecutor.StreamChunk, remaining <-chan cliproxyexecutor.StreamChunk, release func()) *cliproxyexecutor.StreamResult {
 	out := make(chan cliproxyexecutor.StreamChunk)
 	go func() {
 		defer close(out)
+		if release != nil {
+			defer release()
+		}
 		var failed bool
 		forward := true
 		emit := func(chunk cliproxyexecutor.StreamChunk) bool {
@@ -700,9 +711,19 @@ func (m *Manager) wrapStreamResult(ctx context.Context, authID, provider, result
 	return &cliproxyexecutor.StreamResult{Headers: headers, Chunks: out}
 }
 
-func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor ProviderExecutor, auth *Auth, provider string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, routeModel string, execModels []string, pooled bool) (*cliproxyexecutor.StreamResult, error) {
+func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor ProviderExecutor, auth *Auth, provider string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, routeModel string, execModels []string, pooled bool, release func()) (*cliproxyexecutor.StreamResult, error) {
 	if executor == nil {
+		if release != nil {
+			release()
+		}
 		return nil, &Error{Code: "executor_not_found", Message: "executor not registered"}
+	}
+	releaseOnReturn := release
+	releaseNow := func() {
+		if releaseOnReturn != nil {
+			releaseOnReturn()
+			releaseOnReturn = nil
+		}
 	}
 	var lastErr error
 	for idx, execModel := range execModels {
@@ -713,6 +734,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 		streamResult, errStream := executor.ExecuteStream(ctx, auth, execReq, opts)
 		if errStream != nil {
 			if errCtx := ctx.Err(); errCtx != nil {
+				releaseNow()
 				return nil, errCtx
 			}
 			rerr := &Error{Message: errStream.Error()}
@@ -723,6 +745,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			result.RetryAfter = retryAfterFromError(errStream)
 			if isRequestInvalidError(errStream) {
 				m.Hook().OnResult(ctx, result)
+				releaseNow()
 				return nil, errStream
 			}
 			m.MarkResult(ctx, result)
@@ -734,6 +757,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 		if bootstrapErr != nil {
 			if errCtx := ctx.Err(); errCtx != nil {
 				discardStreamChunks(streamResult.Chunks)
+				releaseNow()
 				return nil, errCtx
 			}
 			if isRequestInvalidError(bootstrapErr) {
@@ -745,6 +769,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 				result.RetryAfter = retryAfterFromError(bootstrapErr)
 				m.Hook().OnResult(ctx, result)
 				discardStreamChunks(streamResult.Chunks)
+				releaseNow()
 				return nil, bootstrapErr
 			}
 			if idx < len(execModels)-1 {
@@ -767,6 +792,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			result.RetryAfter = retryAfterFromError(bootstrapErr)
 			m.MarkResult(ctx, result)
 			discardStreamChunks(streamResult.Chunks)
+			releaseNow()
 			return nil, newStreamBootstrapError(bootstrapErr, streamResult.Headers)
 		}
 
@@ -778,6 +804,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 				lastErr = emptyErr
 				continue
 			}
+			releaseNow()
 			return nil, newStreamBootstrapError(emptyErr, streamResult.Headers)
 		}
 
@@ -787,11 +814,14 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			close(closedCh)
 			remaining = closedCh
 		}
-		return m.wrapStreamResult(ctx, auth.ID, provider, resultModel, streamResult.Headers, buffered, remaining), nil
+		currentRelease := releaseOnReturn
+		releaseOnReturn = nil
+		return m.wrapStreamResult(ctx, auth.ID, provider, resultModel, streamResult.Headers, buffered, remaining, currentRelease), nil
 	}
 	if lastErr == nil {
 		lastErr = &Error{Code: "auth_not_found", Message: "no upstream model available"}
 	}
+	releaseNow()
 	return nil, lastErr
 }
 
@@ -1190,6 +1220,34 @@ func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cli
 	return nil, &Error{Code: "auth_not_found", Message: "no auth available"}
 }
 
+func (m *Manager) pickNextExecutableMixed(ctx context.Context, providers []string, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Auth, ProviderExecutor, string, func(), error) {
+	// 这里显式做“选中后再占位”的两阶段控制：
+	// 先沿现有路由策略挑候选 auth，再原子申请该 auth 的 inflight 配额。
+	// 这样才能保证上限是硬限制，而不是“看起来尽量不超过”。
+	var lastCapacityErr error
+	for {
+		auth, executor, provider, errPick := m.pickNextMixed(ctx, providers, model, opts, tried)
+		if errPick != nil {
+			if lastCapacityErr != nil {
+				var authErr *Error
+				if errors.As(errPick, &authErr) && authErr != nil {
+					switch authErr.Code {
+					case "auth_not_found", "auth_unavailable":
+						return nil, nil, "", nil, lastCapacityErr
+					}
+				}
+			}
+			return nil, nil, "", nil, errPick
+		}
+		release, ok := m.tryAcquireAuthSlot(auth.ID)
+		if ok {
+			return auth, executor, provider, release, nil
+		}
+		tried[auth.ID] = struct{}{}
+		lastCapacityErr = newAuthCapacityError(authCapacityRetryAfter)
+	}
+}
+
 func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, maxRetryCredentials int, maxInvalidRequestRetries int) (cliproxyexecutor.Response, error) {
 	if len(providers) == 0 {
 		return cliproxyexecutor.Response{}, &Error{Code: "provider_not_found", Message: "no provider supplied"}
@@ -1216,7 +1274,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			}
 			return cliproxyexecutor.Response{}, &Error{Code: "auth_not_found", Message: "no auth available"}
 		}
-		auth, executor, provider, errPick := m.pickNextMixed(ctx, providers, routeModel, opts, tried)
+		auth, executor, provider, release, errPick := m.pickNextExecutableMixed(ctx, providers, routeModel, opts, tried)
 		if errPick != nil {
 			if requestInvalidErr != nil {
 				return cliproxyexecutor.Response{}, requestInvalidErr
@@ -1244,6 +1302,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 
 		models, pooled := m.preparedExecutionModels(auth, routeModel)
 		if len(models) == 0 {
+			release()
 			continue
 		}
 		attempted[auth.ID] = struct{}{}
@@ -1258,6 +1317,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			attachRequestSimHashResult(&result, opts.Metadata)
 			if errExec != nil {
 				if errCtx := execCtx.Err(); errCtx != nil {
+					release()
 					return cliproxyexecutor.Response{}, errCtx
 				}
 				result.Error = &Error{Message: errExec.Error()}
@@ -1279,8 +1339,10 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			}
 			audit.SetClientResponse(execCtx, resp.Payload)
 			m.MarkResult(execCtx, result)
+			release()
 			return resp, nil
 		}
+		release()
 		if authErr != nil {
 			if isRequestInvalidError(authErr) {
 				requestInvalidErr = authErr
@@ -1321,7 +1383,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 			}
 			return cliproxyexecutor.Response{}, &Error{Code: "auth_not_found", Message: "no auth available"}
 		}
-		auth, executor, provider, errPick := m.pickNextMixed(ctx, providers, routeModel, opts, tried)
+		auth, executor, provider, release, errPick := m.pickNextExecutableMixed(ctx, providers, routeModel, opts, tried)
 		if errPick != nil {
 			if requestInvalidErr != nil {
 				return cliproxyexecutor.Response{}, requestInvalidErr
@@ -1349,6 +1411,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 
 		models, pooled := m.preparedExecutionModels(auth, routeModel)
 		if len(models) == 0 {
+			release()
 			continue
 		}
 		attempted[auth.ID] = struct{}{}
@@ -1363,6 +1426,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 			attachRequestSimHashResult(&result, opts.Metadata)
 			if errExec != nil {
 				if errCtx := execCtx.Err(); errCtx != nil {
+					release()
 					return cliproxyexecutor.Response{}, errCtx
 				}
 				result.Error = &Error{Message: errExec.Error()}
@@ -1384,8 +1448,10 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 			}
 			audit.SetClientResponse(execCtx, resp.Payload)
 			m.MarkResult(execCtx, result)
+			release()
 			return resp, nil
 		}
+		release()
 		if authErr != nil {
 			if isRequestInvalidError(authErr) {
 				requestInvalidErr = authErr
@@ -1430,7 +1496,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 			}
 			return nil, &Error{Code: "auth_not_found", Message: "no auth available"}
 		}
-		auth, executor, provider, errPick := m.pickNextMixed(ctx, providers, routeModel, opts, tried)
+		auth, executor, provider, release, errPick := m.pickNextExecutableMixed(ctx, providers, routeModel, opts, tried)
 		if errPick != nil {
 			if requestInvalidErr != nil {
 				return nil, requestInvalidErr
@@ -1461,10 +1527,11 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 		execCtx = withRequestSimHash(execCtx, opts.Metadata)
 		models, pooled := m.preparedExecutionModels(auth, routeModel)
 		if len(models) == 0 {
+			release()
 			continue
 		}
 		attempted[auth.ID] = struct{}{}
-		streamResult, errStream := m.executeStreamWithModelPool(execCtx, executor, auth, provider, req, opts, routeModel, models, pooled)
+		streamResult, errStream := m.executeStreamWithModelPool(execCtx, executor, auth, provider, req, opts, routeModel, models, pooled, release)
 		if errStream != nil {
 			if errCtx := execCtx.Err(); errCtx != nil {
 				return nil, errCtx
@@ -1821,6 +1888,68 @@ func (m *Manager) retrySettings() (int, int, time.Duration, int) {
 	return int(m.requestRetry.Load()), int(m.maxRetryCredentials.Load()), time.Duration(m.maxRetryInterval.Load()), int(m.maxInvalidRequestRetries.Load())
 }
 
+func (m *Manager) maxInflightPerAuth() int {
+	if m == nil {
+		return 0
+	}
+	cfg, _ := m.runtimeConfig.Load().(*internalconfig.Config)
+	if cfg == nil {
+		return 0
+	}
+	if cfg.Routing.MaxInflightPerAuth < 0 {
+		return 0
+	}
+	return cfg.Routing.MaxInflightPerAuth
+}
+
+func (m *Manager) tryAcquireAuthSlot(authID string) (func(), bool) {
+	if m == nil {
+		return nil, false
+	}
+	authID = strings.TrimSpace(authID)
+	if authID == "" {
+		return nil, false
+	}
+	limit := m.maxInflightPerAuth()
+	if limit <= 0 {
+		return func() {}, true
+	}
+	m.inflightMu.Lock()
+	if current := m.inflightPerAuth[authID]; current >= limit {
+		m.inflightMu.Unlock()
+		return nil, false
+	}
+	m.inflightPerAuth[authID]++
+	m.inflightMu.Unlock()
+
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			m.inflightMu.Lock()
+			defer m.inflightMu.Unlock()
+			current := m.inflightPerAuth[authID]
+			if current <= 1 {
+				delete(m.inflightPerAuth, authID)
+				return
+			}
+			m.inflightPerAuth[authID] = current - 1
+		})
+	}, true
+}
+
+func (m *Manager) authInflightCount(authID string) int {
+	if m == nil {
+		return 0
+	}
+	authID = strings.TrimSpace(authID)
+	if authID == "" {
+		return 0
+	}
+	m.inflightMu.Lock()
+	defer m.inflightMu.Unlock()
+	return m.inflightPerAuth[authID]
+}
+
 func effectiveCredentialRetryLimit(maxRetryCredentials int) int {
 	if maxRetryCredentials > 0 {
 		return maxRetryCredentials
@@ -1890,6 +2019,9 @@ func (m *Manager) shouldRetryAfterError(err error, attempt int, providers []stri
 		return 0, false
 	}
 	if maxWait <= 0 {
+		return 0, false
+	}
+	if isAuthCapacityError(err) {
 		return 0, false
 	}
 	if status := statusCodeFromError(err); status == http.StatusOK {

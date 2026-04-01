@@ -240,6 +240,9 @@ type RoutingConfig struct {
 	// Strategy selects the credential selection strategy.
 	// Supported values: "round-robin" (default), "fill-first", "success-rate", "simhash".
 	Strategy string `yaml:"strategy,omitempty" json:"strategy,omitempty"`
+	// MaxInflightPerAuth 限制单个 auth 同时允许的进行中请求数。
+	// 0 表示不限制；该限制只作用于运行态，不会把 auth 标成 unavailable。
+	MaxInflightPerAuth int `yaml:"max-inflight-per-auth,omitempty" json:"max-inflight-per-auth,omitempty"`
 
 	// SuccessRate configures the "success-rate" routing strategy.
 	SuccessRate RoutingSuccessRateConfig `yaml:"success-rate" json:"success-rate"`
@@ -724,6 +727,9 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 
 	// Sanitize routing config.
 	cfg.Routing.Strategy = strings.TrimSpace(cfg.Routing.Strategy)
+	if cfg.Routing.MaxInflightPerAuth < 0 {
+		cfg.Routing.MaxInflightPerAuth = 0
+	}
 	if cfg.Routing.SuccessRate.HalfLifeSeconds <= 0 {
 		cfg.Routing.SuccessRate.HalfLifeSeconds = 1800
 	}

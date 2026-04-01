@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -28,8 +29,9 @@ import (
 )
 
 const (
-	codexUserAgent = "codex_cli_rs/0.116.0 (Mac OS 26.0.1; arm64) Apple_Terminal/464"
-	codexOriginator = "codex_cli_rs"
+	codexUserAgent  = "codex-tui/0.118.0 (Ubuntu 24.4.0; x86_64) xterm-256color (codex-tui; 0.118.0)"
+	codexOriginator = "codex-tui"
+	codexSandbox    = "seccomp"
 	// Give non-stream /responses a short chance to reach EOF so keep-alive
 	// connections can be reused without reintroducing long tail latency.
 	codexCompletedDrainGracePeriod = 100 * time.Millisecond
@@ -641,17 +643,18 @@ func applyCodexHeaders(r *http.Request, auth *cliproxyauth.Auth, token string, s
 
 	misc.EnsureHeader(r.Header, ginHeaders, "Version", "")
 	misc.EnsureHeader(r.Header, ginHeaders, "Session_id", uuid.NewString())
-	misc.EnsureHeader(r.Header, ginHeaders, "X-Codex-Turn-Metadata", "")
-	misc.EnsureHeader(r.Header, ginHeaders, "X-Client-Request-Id", "")
 	cfgUserAgent, _ := codexHeaderDefaults(cfg, auth)
 	ensureHeaderWithConfigPrecedence(r.Header, ginHeaders, "User-Agent", cfgUserAgent, codexUserAgent)
+	misc.EnsureHeader(r.Header, ginHeaders, "X-Client-Request-Id", r.Header.Get("Session_id"))
+	ensureCodexTurnMetadata(r.Header, ginHeaders)
 
 	if stream {
 		r.Header.Set("Accept", "text/event-stream")
 	} else {
 		r.Header.Set("Accept", "application/json")
 	}
-	r.Header.Set("Connection", "Keep-Alive")
+	r.Header.Set("Connection", "close")
+	r.Close = true
 
 	isAPIKey := false
 	if auth != nil && auth.Attributes != nil {
@@ -659,12 +662,8 @@ func applyCodexHeaders(r *http.Request, auth *cliproxyauth.Auth, token string, s
 			isAPIKey = true
 		}
 	}
-	if originator := strings.TrimSpace(ginHeaders.Get("Originator")); originator != "" {
-		r.Header.Set("Originator", originator)
-	} else if !isAPIKey {
-		r.Header.Set("Originator", codexOriginator)
-	}
 	if !isAPIKey {
+		r.Header.Set("Originator", codexOriginator)
 		if auth != nil && auth.Metadata != nil {
 			if accountID, ok := auth.Metadata["account_id"].(string); ok {
 				r.Header.Set("Chatgpt-Account-Id", accountID)
@@ -676,6 +675,45 @@ func applyCodexHeaders(r *http.Request, auth *cliproxyauth.Auth, token string, s
 		attrs = auth.Attributes
 	}
 	util.ApplyCustomHeadersFromAttrs(r, attrs)
+}
+
+func ensureCodexTurnMetadata(target http.Header, source http.Header) {
+	if target == nil {
+		return
+	}
+	if source != nil {
+		if val := strings.TrimSpace(source.Get("X-Codex-Turn-Metadata")); val != "" {
+			target.Set("X-Codex-Turn-Metadata", val)
+			return
+		}
+	}
+	if strings.TrimSpace(target.Get("X-Codex-Turn-Metadata")) != "" {
+		return
+	}
+
+	seed := strings.TrimSpace(target.Get("X-Client-Request-Id"))
+	if seed == "" {
+		seed = strings.TrimSpace(target.Get("Session_id"))
+	}
+	if seed == "" {
+		seed = uuid.NewString()
+	}
+
+	sessionID := strings.TrimSpace(target.Get("Session_id"))
+	if sessionID == "" {
+		sessionID = uuid.NewSHA1(uuid.NameSpaceOID, []byte("cli-proxy-api:codex:session:"+seed)).String()
+		target.Set("Session_id", sessionID)
+	}
+
+	turnID := uuid.NewSHA1(uuid.NameSpaceOID, []byte("cli-proxy-api:codex:turn:"+seed)).String()
+	payload := map[string]any{
+		"session_id": sessionID,
+		"turn_id":    turnID,
+		"sandbox":    codexSandbox,
+	}
+	if encoded, err := json.Marshal(payload); err == nil {
+		target.Set("X-Codex-Turn-Metadata", string(encoded))
+	}
 }
 
 func newCodexStatusErr(statusCode int, body []byte) statusErr {

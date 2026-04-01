@@ -2,6 +2,7 @@ package executor
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -59,7 +60,7 @@ func TestApplyCodexWebsocketHeadersDefaultsToCurrentResponsesBeta(t *testing.T) 
 	}
 }
 
-func TestApplyCodexWebsocketHeadersPassesThroughClientIdentityHeaders(t *testing.T) {
+func TestApplyCodexWebsocketHeadersUsesCodexOriginatorWhilePassingThroughIdentityMetadata(t *testing.T) {
 	auth := &cliproxyauth.Auth{
 		Provider: "codex",
 		Metadata: map[string]any{"email": "user@example.com"},
@@ -73,8 +74,8 @@ func TestApplyCodexWebsocketHeadersPassesThroughClientIdentityHeaders(t *testing
 
 	headers := applyCodexWebsocketHeaders(ctx, http.Header{}, auth, "", nil)
 
-	if got := headers.Get("Originator"); got != "Codex Desktop" {
-		t.Fatalf("Originator = %s, want %s", got, "Codex Desktop")
+	if got := headers.Get("Originator"); got != codexOriginator {
+		t.Fatalf("Originator = %s, want %s", got, codexOriginator)
 	}
 	if got := headers.Get("Version"); got != "0.115.0-alpha.27" {
 		t.Fatalf("Version = %s, want %s", got, "0.115.0-alpha.27")
@@ -213,8 +214,35 @@ func TestApplyCodexHeadersUsesConfigUserAgentForOAuth(t *testing.T) {
 	if got := req.Header.Get("User-Agent"); got != "config-ua" {
 		t.Fatalf("User-Agent = %s, want %s", got, "config-ua")
 	}
+	if got := req.Header.Get("Originator"); got != codexOriginator {
+		t.Fatalf("Originator = %s, want %s", got, codexOriginator)
+	}
 	if got := req.Header.Get("x-codex-beta-features"); got != "" {
 		t.Fatalf("x-codex-beta-features = %q, want empty", got)
+	}
+	if got := req.Header.Get("Version"); got != "" {
+		t.Fatalf("Version = %q, want empty", got)
+	}
+	if got := req.Header.Get("Accept"); got != "text/event-stream" {
+		t.Fatalf("Accept = %s, want %s", got, "text/event-stream")
+	}
+
+	var meta struct {
+		SessionID string `json:"session_id"`
+		TurnID    string `json:"turn_id"`
+		Sandbox   string `json:"sandbox"`
+	}
+	if err := json.Unmarshal([]byte(req.Header.Get("X-Codex-Turn-Metadata")), &meta); err != nil {
+		t.Fatalf("X-Codex-Turn-Metadata unmarshal error = %v", err)
+	}
+	if meta.SessionID != req.Header.Get("Session_id") {
+		t.Fatalf("turn metadata session_id = %s, want %s", meta.SessionID, req.Header.Get("Session_id"))
+	}
+	if meta.TurnID == "" {
+		t.Fatal("turn metadata turn_id is empty")
+	}
+	if meta.Sandbox != codexSandbox {
+		t.Fatalf("turn metadata sandbox = %s, want %s", meta.Sandbox, codexSandbox)
 	}
 }
 
@@ -316,7 +344,7 @@ func TestCodexAutoExecutorExecuteStream_WebsocketStripsPrefixedModelFromOutbound
 	}
 }
 
-func TestApplyCodexHeadersPassesThroughClientIdentityHeaders(t *testing.T) {
+func TestApplyCodexHeadersUsesCodexOriginatorWhilePassingThroughIdentityMetadata(t *testing.T) {
 	req, err := http.NewRequest(http.MethodPost, "https://example.com/responses", nil)
 	if err != nil {
 		t.Fatalf("NewRequest() error = %v", err)
@@ -334,8 +362,8 @@ func TestApplyCodexHeadersPassesThroughClientIdentityHeaders(t *testing.T) {
 
 	applyCodexHeaders(req, auth, "oauth-token", true, nil)
 
-	if got := req.Header.Get("Originator"); got != "Codex Desktop" {
-		t.Fatalf("Originator = %s, want %s", got, "Codex Desktop")
+	if got := req.Header.Get("Originator"); got != codexOriginator {
+		t.Fatalf("Originator = %s, want %s", got, codexOriginator)
 	}
 	if got := req.Header.Get("Version"); got != "0.115.0-alpha.27" {
 		t.Fatalf("Version = %s, want %s", got, "0.115.0-alpha.27")
@@ -348,7 +376,7 @@ func TestApplyCodexHeadersPassesThroughClientIdentityHeaders(t *testing.T) {
 	}
 }
 
-func TestApplyCodexHeadersDoesNotInjectClientOnlyHeadersByDefault(t *testing.T) {
+func TestApplyCodexHeadersGeneratesTurnMetadataByDefault(t *testing.T) {
 	req, err := http.NewRequest(http.MethodPost, "https://example.com/responses", nil)
 	if err != nil {
 		t.Fatalf("NewRequest() error = %v", err)
@@ -359,11 +387,41 @@ func TestApplyCodexHeadersDoesNotInjectClientOnlyHeadersByDefault(t *testing.T) 
 	if got := req.Header.Get("Version"); got != "" {
 		t.Fatalf("Version = %q, want empty", got)
 	}
-	if got := req.Header.Get("X-Codex-Turn-Metadata"); got != "" {
-		t.Fatalf("X-Codex-Turn-Metadata = %q, want empty", got)
+	if got := req.Header.Get("Originator"); got != codexOriginator {
+		t.Fatalf("Originator = %s, want %s", got, codexOriginator)
 	}
-	if got := req.Header.Get("X-Client-Request-Id"); got != "" {
-		t.Fatalf("X-Client-Request-Id = %q, want empty", got)
+	if got := req.Header.Get("Accept"); got != "text/event-stream" {
+		t.Fatalf("Accept = %s, want %s", got, "text/event-stream")
+	}
+	if got := req.Header.Get("Connection"); got != "close" {
+		t.Fatalf("Connection = %s, want %s", got, "close")
+	}
+	if !req.Close {
+		t.Fatal("req.Close = false, want true")
+	}
+	if got := req.Header.Get("X-Client-Request-Id"); got == "" {
+		t.Fatal("X-Client-Request-Id is empty")
+	}
+	if got := req.Header.Get("Session_id"); got == "" {
+		t.Fatal("Session_id is empty")
+	}
+
+	var meta struct {
+		SessionID string `json:"session_id"`
+		TurnID    string `json:"turn_id"`
+		Sandbox   string `json:"sandbox"`
+	}
+	if err := json.Unmarshal([]byte(req.Header.Get("X-Codex-Turn-Metadata")), &meta); err != nil {
+		t.Fatalf("X-Codex-Turn-Metadata unmarshal error = %v", err)
+	}
+	if meta.SessionID != req.Header.Get("Session_id") {
+		t.Fatalf("turn metadata session_id = %s, want %s", meta.SessionID, req.Header.Get("Session_id"))
+	}
+	if meta.TurnID == "" {
+		t.Fatal("turn metadata turn_id is empty")
+	}
+	if meta.Sandbox != codexSandbox {
+		t.Fatalf("turn metadata sandbox = %s, want %s", meta.Sandbox, codexSandbox)
 	}
 }
 

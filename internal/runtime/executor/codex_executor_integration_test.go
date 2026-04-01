@@ -145,7 +145,6 @@ func TestCodexExecutorExecute_LocalServer_SucceedsWithoutTerminalNewline(t *test
 func TestCodexExecutorExecute_LocalServer_ReturnsAfterCompletedBeforeUpstreamCloses(t *testing.T) {
 	t.Parallel()
 
-	clientClosed := make(chan struct{}, 1)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		flusher, _ := w.(http.Flusher)
@@ -155,11 +154,7 @@ func TestCodexExecutorExecute_LocalServer_ReturnsAfterCompletedBeforeUpstreamClo
 			flusher.Flush()
 		}
 
-		select {
-		case <-r.Context().Done():
-			clientClosed <- struct{}{}
-		case <-time.After(1500 * time.Millisecond):
-		}
+		<-time.After(1500 * time.Millisecond)
 	}))
 	defer server.Close()
 
@@ -181,15 +176,9 @@ func TestCodexExecutorExecute_LocalServer_ReturnsAfterCompletedBeforeUpstreamClo
 	if elapsed >= 1200*time.Millisecond {
 		t.Fatalf("Execute() elapsed = %s, want < 1.2s", elapsed)
 	}
-
-	select {
-	case <-clientClosed:
-	case <-time.After(800 * time.Millisecond):
-		t.Fatal("expected Execute() to close upstream body after response.completed")
-	}
 }
 
-func TestCodexExecutorExecute_LocalServer_ReusesConnectionWhenCompletedEOFIsBrieflyDelayed(t *testing.T) {
+func TestCodexExecutorExecute_LocalServer_OpensFreshConnectionWhenCloseIsForced(t *testing.T) {
 	var newConnections atomic.Int64
 
 	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -226,8 +215,8 @@ func TestCodexExecutorExecute_LocalServer_ReusesConnectionWhenCompletedEOFIsBrie
 		}
 	}
 
-	if got := newConnections.Load(); got != 1 {
-		t.Fatalf("new TCP connections = %d, want 1", got)
+	if got := newConnections.Load(); got != 2 {
+		t.Fatalf("new TCP connections = %d, want 2", got)
 	}
 }
 

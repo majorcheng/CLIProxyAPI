@@ -89,6 +89,11 @@ type Config struct {
 	MaxInvalidRequestRetries int `yaml:"max-invalid-request-retries" json:"max-invalid-request-retries"`
 	// MaxRetryInterval defines the maximum wait time in seconds before retrying a cooled-down credential.
 	MaxRetryInterval int `yaml:"max-retry-interval" json:"max-retry-interval"`
+	// SharedExitPriorityZeroOAuthNetworkJitterFallback enables request-scoped fallback:
+	// when a priority=0 OAuth/token auth hits pure transport/network jitter, the
+	// current request stops retrying other priority=0 OAuth/token auths and drops
+	// to lower-priority compat providers instead.
+	SharedExitPriorityZeroOAuthNetworkJitterFallback bool `yaml:"shared-exit-priority-zero-oauth-network-jitter-fallback" json:"shared-exit-priority-zero-oauth-network-jitter-fallback"`
 
 	// QuotaExceeded defines the behavior when a quota is exceeded.
 	QuotaExceeded QuotaExceeded `yaml:"quota-exceeded" json:"quota-exceeded"`
@@ -637,6 +642,7 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	cfg.UsageStatisticsPersistIntervalSeconds = 30
 	cfg.UsageStatisticsRetentionDays = 0
 	cfg.DisableCooling = false
+	cfg.SharedExitPriorityZeroOAuthNetworkJitterFallback = false
 	cfg.AuthMaintenance.ScanIntervalSeconds = 30
 	cfg.AuthMaintenance.DeleteIntervalSeconds = 5
 	cfg.AuthMaintenance.DeleteStatusCodes = []int{401, 402, 403, 404, 429}

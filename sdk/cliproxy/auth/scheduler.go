@@ -292,6 +292,15 @@ func (s *authScheduler) pickMixed(ctx context.Context, providers []string, model
 	}
 
 	predicate := triedPredicate(tried)
+	if priorityZeroOAuthSkipped(opts.Metadata) {
+		basePredicate := predicate
+		predicate = func(entry *scheduledAuth) bool {
+			if !basePredicate(entry) {
+				return false
+			}
+			return !shouldSkipPriorityZeroOAuthAuth(opts.Metadata, entry.auth)
+		}
+	}
 	candidateShards := make([]*modelScheduler, len(normalized))
 	bestPriority := 0
 	hasCandidate := false

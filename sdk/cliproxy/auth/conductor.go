@@ -338,6 +338,14 @@ func (m *Manager) SetConfig(cfg *internalconfig.Config) {
 	m.rebuildAPIKeyModelAliasFromRuntimeConfig()
 }
 
+func (m *Manager) sharedExitPriorityZeroOAuthNetworkJitterFallbackEnabled() bool {
+	if m == nil {
+		return false
+	}
+	cfg, _ := m.runtimeConfig.Load().(*internalconfig.Config)
+	return sharedExitPriorityZeroOAuthNetworkJitterFallbackEnabled(cfg)
+}
+
 func (m *Manager) lookupAPIKeyUpstreamModel(authID, requestedModel string) string {
 	if m == nil {
 		return ""
@@ -1351,6 +1359,9 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 				}
 				continue
 			}
+			if m.sharedExitPriorityZeroOAuthNetworkJitterFallbackEnabled() {
+				markPriorityZeroOAuthSkippedOnNetworkJitter(opts.Metadata, auth, authErr)
+			}
 			lastErr = authErr
 			continue
 		}
@@ -1460,6 +1471,9 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 				}
 				continue
 			}
+			if m.sharedExitPriorityZeroOAuthNetworkJitterFallbackEnabled() {
+				markPriorityZeroOAuthSkippedOnNetworkJitter(opts.Metadata, auth, authErr)
+			}
 			lastErr = authErr
 			continue
 		}
@@ -1543,6 +1557,9 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 					return nil, errStream
 				}
 				continue
+			}
+			if m.sharedExitPriorityZeroOAuthNetworkJitterFallbackEnabled() {
+				markPriorityZeroOAuthSkippedOnNetworkJitter(opts.Metadata, auth, errStream)
 			}
 			lastErr = errStream
 			continue
@@ -2979,6 +2996,9 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 	registryRef := registry.GetGlobalRegistry()
 	for _, candidate := range m.auths {
 		if candidate == nil || candidate.Disabled {
+			continue
+		}
+		if shouldSkipPriorityZeroOAuthAuth(opts.Metadata, candidate) {
 			continue
 		}
 		if pinnedAuthID != "" && candidate.ID != pinnedAuthID {

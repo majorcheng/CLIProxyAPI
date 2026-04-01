@@ -142,6 +142,11 @@ max-invalid-request-retries: 0
 # Maximum wait time in seconds for a cooled-down credential before triggering a retry.
 max-retry-interval: 30
 
+# When true, a pure transport/network jitter on a priority=0 OAuth/token auth
+# will stop retrying other priority=0 OAuth/token auths in the same request and
+# fall through to lower-priority compat providers instead. Disabled by default.
+shared-exit-priority-zero-oauth-network-jitter-fallback: false
+
 # Quota exceeded behavior
 quota-exceeded:
   switch-project: true # Whether to automatically switch to another project when a quota is exceeded

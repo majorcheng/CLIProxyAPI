@@ -815,6 +815,7 @@ func applyCodexWebsocketHeaders(ctx context.Context, headers http.Header, auth *
 	if ginCtx := ginContextFrom(ctx); ginCtx != nil && ginCtx.Request != nil {
 		ginHeaders = ginCtx.Request.Header
 	}
+	sourceUserAgent := firstNonEmptyTrimmed(headers.Get("User-Agent"), headerValue(ginHeaders, "User-Agent"))
 
 	cfgUserAgent, cfgBetaFeatures := codexHeaderDefaults(cfg, auth)
 	ensureHeaderWithPriority(headers, ginHeaders, "x-codex-beta-features", cfgBetaFeatures, "")
@@ -857,6 +858,7 @@ func applyCodexWebsocketHeaders(ctx context.Context, headers http.Header, auth *
 		attrs = auth.Attributes
 	}
 	util.ApplyCustomHeadersFromAttrs(&http.Request{Header: headers}, attrs)
+	applyCodexAuthFileUserAgent(headers, auth, sourceUserAgent, codexDefaultUserAgent(cfg, auth))
 
 	return headers
 }

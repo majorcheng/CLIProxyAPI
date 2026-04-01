@@ -113,7 +113,7 @@ func TestApplyCodexWebsocketHeadersUsesConfigDefaultsForOAuth(t *testing.T) {
 	}
 }
 
-func TestApplyCodexWebsocketHeadersPrefersExistingHeadersOverClientAndConfig(t *testing.T) {
+func TestApplyCodexWebsocketHeadersUsesDefaultWhenIncomingUAMissesCodex(t *testing.T) {
 	cfg := &config.Config{
 		CodexHeaderDefaults: config.CodexHeaderDefaults{
 			UserAgent:    "config-ua",
@@ -134,11 +134,14 @@ func TestApplyCodexWebsocketHeadersPrefersExistingHeadersOverClientAndConfig(t *
 
 	got := applyCodexWebsocketHeaders(ctx, headers, auth, "", cfg)
 
-	if gotVal := got.Get("User-Agent"); gotVal != "existing-ua" {
-		t.Fatalf("User-Agent = %s, want %s", gotVal, "existing-ua")
+	if gotVal := got.Get("User-Agent"); gotVal != "config-ua" {
+		t.Fatalf("User-Agent = %s, want %s", gotVal, "config-ua")
 	}
 	if gotVal := got.Get("x-codex-beta-features"); gotVal != "existing-beta" {
 		t.Fatalf("x-codex-beta-features = %s, want %s", gotVal, "existing-beta")
+	}
+	if _, ok := auth.Metadata["cli_ua"]; ok {
+		t.Fatalf("cli_ua should not be written for non-codex user-agent")
 	}
 }
 
@@ -187,6 +190,52 @@ func TestApplyCodexWebsocketHeadersIgnoresConfigForAPIKeyAuth(t *testing.T) {
 	}
 	if got := headers.Get("x-codex-beta-features"); got != "" {
 		t.Fatalf("x-codex-beta-features = %q, want empty", got)
+	}
+}
+
+func TestApplyCodexWebsocketHeadersAuthFileUserAgentOverridesAllSources(t *testing.T) {
+	cfg := &config.Config{
+		CodexHeaderDefaults: config.CodexHeaderDefaults{
+			UserAgent:    "config-ua",
+			BetaFeatures: "config-beta",
+		},
+	}
+	auth := &cliproxyauth.Auth{
+		Provider: "codex",
+		Metadata: map[string]any{
+			"email":  "user@example.com",
+			"cli_ua": "auth-file-ua",
+		},
+	}
+	ctx := contextWithGinHeaders(map[string]string{
+		"User-Agent": "client-ua",
+	})
+	headers := http.Header{}
+	headers.Set("User-Agent", "existing-ua")
+
+	got := applyCodexWebsocketHeaders(ctx, headers, auth, "", cfg)
+
+	if gotVal := got.Get("User-Agent"); gotVal != "auth-file-ua" {
+		t.Fatalf("User-Agent = %s, want %s", gotVal, "auth-file-ua")
+	}
+}
+
+func TestApplyCodexWebsocketHeadersCapturesFirstCodexUserAgent(t *testing.T) {
+	auth := &cliproxyauth.Auth{
+		Provider: "codex",
+		Metadata: map[string]any{"email": "user@example.com"},
+	}
+	ctx := contextWithGinHeaders(map[string]string{
+		"User-Agent": "codex-cli/1.2.3",
+	})
+
+	got := applyCodexWebsocketHeaders(ctx, http.Header{}, auth, "", nil)
+
+	if gotVal := got.Get("User-Agent"); gotVal != "codex-cli/1.2.3" {
+		t.Fatalf("User-Agent = %s, want %s", gotVal, "codex-cli/1.2.3")
+	}
+	if gotVal, _ := auth.Metadata["cli_ua"].(string); gotVal != "codex-cli/1.2.3" {
+		t.Fatalf("cli_ua = %q, want %q", gotVal, "codex-cli/1.2.3")
 	}
 }
 
@@ -341,6 +390,58 @@ func TestCodexAutoExecutorExecuteStream_WebsocketStripsPrefixedModelFromOutbound
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for websocket request body")
+	}
+}
+
+func TestApplyCodexHeadersAuthFileUserAgentOverridesAllSources(t *testing.T) {
+	req, err := http.NewRequest(http.MethodPost, "https://example.com/responses", nil)
+	if err != nil {
+		t.Fatalf("NewRequest() error = %v", err)
+	}
+	cfg := &config.Config{
+		CodexHeaderDefaults: config.CodexHeaderDefaults{
+			UserAgent: "config-ua",
+		},
+	}
+	auth := &cliproxyauth.Auth{
+		Provider: "codex",
+		Metadata: map[string]any{
+			"email":  "user@example.com",
+			"cli_ua": "auth-file-ua",
+		},
+	}
+	req = req.WithContext(contextWithGinHeaders(map[string]string{
+		"User-Agent": "client-ua",
+	}))
+	req.Header.Set("User-Agent", "existing-ua")
+
+	applyCodexHeaders(req, auth, "oauth-token", true, cfg)
+
+	if got := req.Header.Get("User-Agent"); got != "auth-file-ua" {
+		t.Fatalf("User-Agent = %s, want %s", got, "auth-file-ua")
+	}
+}
+
+func TestApplyCodexHeadersCapturesFirstCodexUserAgent(t *testing.T) {
+	req, err := http.NewRequest(http.MethodPost, "https://example.com/responses", nil)
+	if err != nil {
+		t.Fatalf("NewRequest() error = %v", err)
+	}
+	auth := &cliproxyauth.Auth{
+		Provider: "codex",
+		Metadata: map[string]any{"email": "user@example.com"},
+	}
+	req = req.WithContext(contextWithGinHeaders(map[string]string{
+		"User-Agent": "codex-tui/0.118.0",
+	}))
+
+	applyCodexHeaders(req, auth, "oauth-token", true, nil)
+
+	if got := req.Header.Get("User-Agent"); got != "codex-tui/0.118.0" {
+		t.Fatalf("User-Agent = %s, want %s", got, "codex-tui/0.118.0")
+	}
+	if got, _ := auth.Metadata["cli_ua"].(string); got != "codex-tui/0.118.0" {
+		t.Fatalf("cli_ua = %q, want %q", got, "codex-tui/0.118.0")
 	}
 }
 

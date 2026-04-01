@@ -3253,6 +3253,14 @@ func (m *Manager) shouldRefresh(a *Auth, now time.Time) bool {
 	}
 
 	expiry, hasExpiry := a.ExpirationTime()
+	provider := strings.ToLower(strings.TrimSpace(a.Provider))
+
+	// Codex 在启动首轮/周期 auto-refresh 下改成“保守门控”：
+	// 只有 token JSON 明确表明需要刷新（已过期、临近过期、last_refresh 足够旧）才触发。
+	// 若缺少 refresh_token 或缺少关键时间字段，则默认不主动打上游，避免刚启动/刚入池就做探测式 refresh。
+	if provider == "codex" {
+		return shouldRefreshCodexFromTokenJSON(a, now, lastRefresh, expiry, hasExpiry)
+	}
 
 	if interval := authPreferredInterval(a); interval > 0 {
 		if hasExpiry && !expiry.IsZero() {
@@ -3269,7 +3277,6 @@ func (m *Manager) shouldRefresh(a *Auth, now time.Time) bool {
 		return now.Sub(lastRefresh) >= interval
 	}
 
-	provider := strings.ToLower(a.Provider)
 	lead := ProviderRefreshLead(provider, a.Runtime)
 	if lead == nil {
 		return false
@@ -3287,6 +3294,53 @@ func (m *Manager) shouldRefresh(a *Auth, now time.Time) bool {
 		return now.Sub(lastRefresh) >= *lead
 	}
 	return true
+}
+
+func shouldRefreshCodexFromTokenJSON(a *Auth, now, lastRefresh, expiry time.Time, hasExpiry bool) bool {
+	if !authHasRefreshToken(a) {
+		return false
+	}
+
+	if interval := authPreferredInterval(a); interval > 0 {
+		if hasExpiry && !expiry.IsZero() {
+			if !expiry.After(now) {
+				return true
+			}
+			if expiry.Sub(now) <= interval {
+				return true
+			}
+		}
+		if !lastRefresh.IsZero() {
+			return now.Sub(lastRefresh) >= interval
+		}
+		return false
+	}
+
+	lead := ProviderRefreshLead("codex", a.Runtime)
+	if lead == nil {
+		return false
+	}
+	if *lead <= 0 {
+		if hasExpiry && !expiry.IsZero() {
+			return !expiry.After(now)
+		}
+		return false
+	}
+	if hasExpiry && !expiry.IsZero() {
+		return expiry.Sub(now) <= *lead
+	}
+	if !lastRefresh.IsZero() {
+		return now.Sub(lastRefresh) >= *lead
+	}
+	return false
+}
+
+func authHasRefreshToken(a *Auth) bool {
+	if a == nil || len(a.Metadata) == 0 {
+		return false
+	}
+	refreshToken, _ := a.Metadata["refresh_token"].(string)
+	return strings.TrimSpace(refreshToken) != ""
 }
 
 func authPreferredInterval(a *Auth) time.Duration {

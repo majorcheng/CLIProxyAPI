@@ -4,6 +4,7 @@ import (
 	"container/list"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"sync"
 
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
@@ -77,21 +78,27 @@ func requestBodyHash(payload []byte) (string, bool) {
 	if len(payload) == 0 {
 		return "", false
 	}
+	// 对 JSON 请求体先做规范化编码，避免仅字段顺序不同却被判成不同请求。
+	var value any
+	if err := json.Unmarshal(payload, &value); err == nil {
+		if encoded, err := json.Marshal(value); err == nil && len(encoded) > 0 {
+			sum := sha256.Sum256(encoded)
+			return hex.EncodeToString(sum[:]), true
+		}
+	}
 	sum := sha256.Sum256(payload)
 	return hex.EncodeToString(sum[:]), true
 }
 
 func requestBodyHashFromOptions(opts cliproxyexecutor.Options) (cliproxyexecutor.Options, string, bool) {
 	if analysis, ok := requestBodyAnalysisFromMetadata(opts.Metadata); ok {
-		if len(analysis.canonicalJSON) > 0 {
-			hash, ok := requestBodyHash(analysis.canonicalJSON)
-			return opts, hash, ok
+		if analysis.requestHash != "" {
+			return opts, analysis.requestHash, true
 		}
 	}
 	updated, analysis, ok := ensureRequestBodyAnalysisMetadata(opts)
-	if ok && analysis != nil && len(analysis.canonicalJSON) > 0 {
-		hash, ok := requestBodyHash(analysis.canonicalJSON)
-		return updated, hash, ok
+	if ok && analysis != nil && analysis.requestHash != "" {
+		return updated, analysis.requestHash, true
 	}
 	hash, ok := requestBodyHash(opts.OriginalRequest)
 	return updated, hash, ok

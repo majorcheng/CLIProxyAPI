@@ -50,12 +50,6 @@ api-keys:
 # 是否启用调试日志
 debug: false
 
-# 是否启用完整请求/响应日志落盘。
-# 开启后会记录下游请求、上游请求、上游响应和最终回包，便于排查模型调用错误。
-# 注意：它与 debug 不同。debug 只控制主日志里的摘要级别，不会自动记录完整请求/响应正文；
-# 关闭时不会记录所有请求全文，但失败请求仍会按 error-logs-max-files 保留有限的错误日志。
-request-log: false
-
 # 启用 pprof HTTP 调试服务（host:port）。出于安全考虑，请保持仅绑定 localhost。
 pprof:
   enable: false

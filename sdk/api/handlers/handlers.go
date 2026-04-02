@@ -24,7 +24,6 @@ import (
 	coreexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/config"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v6/sdk/translator"
-	log "github.com/sirupsen/logrus"
 	"golang.org/x/net/context"
 )
 
@@ -911,7 +910,10 @@ func replaceHeader(dst http.Header, src http.Header) {
 
 // WriteErrorResponse writes an error message to the response writer using the HTTP status embedded in the message.
 func (h *BaseAPIHandler) WriteErrorResponse(c *gin.Context, msg *interfaces.ErrorMessage) {
-	status, errText := errorStatusAndText(msg)
+	status := http.StatusInternalServerError
+	if msg != nil && msg.StatusCode > 0 {
+		status = msg.StatusCode
+	}
 	if msg != nil && msg.Addon != nil && PassthroughHeadersEnabled(h.Cfg) {
 		for key, values := range msg.Addon {
 			if len(values) == 0 {
@@ -924,9 +926,12 @@ func (h *BaseAPIHandler) WriteErrorResponse(c *gin.Context, msg *interfaces.Erro
 		}
 	}
 
-	// 统一在 handler 层补一条 debug 错误摘要，避免这类错误只存在于请求日志或上游 executor 分支里，
-	// 当错误在调度、校验或回包阶段生成时，debug 模式下也能直接看到 request_id、状态码和消息。
-	debugLogGinErrorResponse(c, status, errText)
+	errText := http.StatusText(status)
+	if msg != nil && msg.Error != nil {
+		if v := strings.TrimSpace(msg.Error.Error()); v != "" {
+			errText = v
+		}
+	}
 
 	body := BuildErrorResponseBody(status, errText)
 	// Append first to preserve upstream response logs, then drop duplicate payloads if already recorded.
@@ -954,7 +959,6 @@ func (h *BaseAPIHandler) WriteErrorResponse(c *gin.Context, msg *interfaces.Erro
 }
 
 func (h *BaseAPIHandler) LoggingAPIResponseError(ctx context.Context, err *interfaces.ErrorMessage) {
-	debugLogAPIResponseError(ctx, err)
 	if h.Cfg.RequestLog {
 		if ginContext, ok := ctx.Value("gin").(*gin.Context); ok {
 			if apiResponseErrors, isExist := ginContext.Get("API_RESPONSE_ERROR"); isExist {
@@ -968,60 +972,6 @@ func (h *BaseAPIHandler) LoggingAPIResponseError(ctx context.Context, err *inter
 			}
 		}
 	}
-}
-
-func debugLogGinErrorResponse(c *gin.Context, status int, errText string) {
-	if !log.IsLevelEnabled(log.DebugLevel) {
-		return
-	}
-	entry := log.NewEntry(log.StandardLogger())
-	if reqID := logging.GetGinRequestID(c); reqID != "" {
-		entry = entry.WithField("request_id", reqID)
-	}
-	entry.Debugf("returning error response, status: %d, message: %s", status, strings.TrimSpace(errText))
-}
-
-func debugLogGinStreamingTerminalError(c *gin.Context, err *interfaces.ErrorMessage) {
-	if !log.IsLevelEnabled(log.DebugLevel) {
-		return
-	}
-	status, errText := errorStatusAndText(err)
-	entry := log.NewEntry(log.StandardLogger())
-	if reqID := logging.GetGinRequestID(c); reqID != "" {
-		entry = entry.WithField("request_id", reqID)
-	}
-	entry.Debugf("streaming terminal error, status: %d, message: %s", status, strings.TrimSpace(errText))
-}
-
-func debugLogAPIResponseError(ctx context.Context, err *interfaces.ErrorMessage) {
-	if err == nil || !log.IsLevelEnabled(log.DebugLevel) {
-		return
-	}
-	status, errText := errorStatusAndText(err)
-
-	entry := log.NewEntry(log.StandardLogger())
-	if reqID := logging.GetRequestID(ctx); reqID != "" {
-		entry = entry.WithField("request_id", reqID)
-	} else if ginContext, ok := ctx.Value("gin").(*gin.Context); ok {
-		if reqID := logging.GetGinRequestID(ginContext); reqID != "" {
-			entry = entry.WithField("request_id", reqID)
-		}
-	}
-	entry.Debugf("returning error response, status: %d, message: %s", status, strings.TrimSpace(errText))
-}
-
-func errorStatusAndText(err *interfaces.ErrorMessage) (int, string) {
-	status := http.StatusInternalServerError
-	if err != nil && err.StatusCode > 0 {
-		status = err.StatusCode
-	}
-	errText := http.StatusText(status)
-	if err != nil && err.Error != nil {
-		if v := strings.TrimSpace(err.Error.Error()); v != "" {
-			errText = v
-		}
-	}
-	return status, errText
 }
 
 // APIHandlerCancelFunc is a function type for canceling an API handler's context.

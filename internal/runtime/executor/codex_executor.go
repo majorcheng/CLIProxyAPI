@@ -651,11 +651,6 @@ func applyCodexHeaders(r *http.Request, auth *cliproxyauth.Auth, token string, s
 	misc.EnsureHeader(r.Header, ginHeaders, "Session_id", uuid.NewString())
 	cfgUserAgent, _ := codexHeaderDefaults(cfg, auth)
 	ensureHeaderWithConfigPrecedence(r.Header, ginHeaders, "User-Agent", cfgUserAgent, codexUserAgent)
-	// HTTP /responses 与 websocket 路径保持一致：仅透传客户端显式声明的 beta features，
-	// 不在服务端侧额外凭空注入，避免改变默认身份画像。
-	if betaFeatures := strings.TrimSpace(ginHeaders.Get("X-Codex-Beta-Features")); betaFeatures != "" {
-		r.Header.Set("X-Codex-Beta-Features", betaFeatures)
-	}
 	misc.EnsureHeader(r.Header, ginHeaders, "X-Client-Request-Id", r.Header.Get("Session_id"))
 	ensureCodexTurnMetadata(r.Header, ginHeaders)
 

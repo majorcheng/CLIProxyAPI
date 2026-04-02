@@ -24,6 +24,7 @@ import (
 	coreexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/config"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v6/sdk/translator"
+	log "github.com/sirupsen/logrus"
 	"golang.org/x/net/context"
 )
 
@@ -910,10 +911,7 @@ func replaceHeader(dst http.Header, src http.Header) {
 
 // WriteErrorResponse writes an error message to the response writer using the HTTP status embedded in the message.
 func (h *BaseAPIHandler) WriteErrorResponse(c *gin.Context, msg *interfaces.ErrorMessage) {
-	status := http.StatusInternalServerError
-	if msg != nil && msg.StatusCode > 0 {
-		status = msg.StatusCode
-	}
+	status, errText := errorStatusAndText(msg)
 	if msg != nil && msg.Addon != nil && PassthroughHeadersEnabled(h.Cfg) {
 		for key, values := range msg.Addon {
 			if len(values) == 0 {
@@ -926,12 +924,8 @@ func (h *BaseAPIHandler) WriteErrorResponse(c *gin.Context, msg *interfaces.Erro
 		}
 	}
 
-	errText := http.StatusText(status)
-	if msg != nil && msg.Error != nil {
-		if v := strings.TrimSpace(msg.Error.Error()); v != "" {
-			errText = v
-		}
-	}
+	// 这里补的是“最终回给客户端”的统一摘要，避免错误只留在 request-log 或局部 executor 分支里。
+	debugLogGinErrorResponse(c, status, errText)
 
 	body := BuildErrorResponseBody(status, errText)
 	// Append first to preserve upstream response logs, then drop duplicate payloads if already recorded.
@@ -972,6 +966,43 @@ func (h *BaseAPIHandler) LoggingAPIResponseError(ctx context.Context, err *inter
 			}
 		}
 	}
+}
+
+func debugLogGinErrorResponse(c *gin.Context, status int, errText string) {
+	if !log.IsLevelEnabled(log.DebugLevel) {
+		return
+	}
+	entry := log.NewEntry(log.StandardLogger())
+	if reqID := logging.GetGinRequestID(c); reqID != "" {
+		entry = entry.WithField("request_id", reqID)
+	}
+	entry.Debugf("returning error response, status: %d, message: %s", status, strings.TrimSpace(errText))
+}
+
+func debugLogGinStreamingTerminalError(c *gin.Context, err *interfaces.ErrorMessage) {
+	if !log.IsLevelEnabled(log.DebugLevel) {
+		return
+	}
+	status, errText := errorStatusAndText(err)
+	entry := log.NewEntry(log.StandardLogger())
+	if reqID := logging.GetGinRequestID(c); reqID != "" {
+		entry = entry.WithField("request_id", reqID)
+	}
+	entry.Debugf("streaming terminal error, status: %d, message: %s", status, strings.TrimSpace(errText))
+}
+
+func errorStatusAndText(err *interfaces.ErrorMessage) (int, string) {
+	status := http.StatusInternalServerError
+	if err != nil && err.StatusCode > 0 {
+		status = err.StatusCode
+	}
+	errText := http.StatusText(status)
+	if err != nil && err.Error != nil {
+		if v := strings.TrimSpace(err.Error.Error()); v != "" {
+			errText = v
+		}
+	}
+	return status, errText
 }
 
 // APIHandlerCancelFunc is a function type for canceling an API handler's context.

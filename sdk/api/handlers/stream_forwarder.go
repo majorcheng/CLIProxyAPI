@@ -101,6 +101,8 @@ func (h *BaseAPIHandler) ForwardStream(c *gin.Context, flusher http.Flusher, can
 					}
 				}
 				if terminalErr != nil {
+					// 流已经向客户端输出过内容后，再失败时只剩这里能统一补主日志摘要。
+					debugLogGinStreamingTerminalError(c, terminalErr)
 					if opts.WriteTerminalError != nil {
 						opts.WriteTerminalError(terminalErr)
 					}
@@ -124,6 +126,8 @@ func (h *BaseAPIHandler) ForwardStream(c *gin.Context, flusher http.Flusher, can
 			}
 			if errMsg != nil {
 				terminalErr = errMsg
+				// 这里记录流式终止摘要，便于和客户端收到的 error event / error chunk 对上 request_id。
+				debugLogGinStreamingTerminalError(c, errMsg)
 				if opts.WriteTerminalError != nil {
 					opts.WriteTerminalError(errMsg)
 				}

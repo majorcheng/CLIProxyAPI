@@ -101,6 +101,7 @@ func (h *BaseAPIHandler) ForwardStream(c *gin.Context, flusher http.Flusher, can
 					}
 				}
 				if terminalErr != nil {
+					debugLogGinStreamingTerminalError(c, terminalErr)
 					if opts.WriteTerminalError != nil {
 						opts.WriteTerminalError(terminalErr)
 					}
@@ -124,6 +125,7 @@ func (h *BaseAPIHandler) ForwardStream(c *gin.Context, flusher http.Flusher, can
 			}
 			if errMsg != nil {
 				terminalErr = errMsg
+				debugLogGinStreamingTerminalError(c, errMsg)
 				if opts.WriteTerminalError != nil {
 					opts.WriteTerminalError(errMsg)
 				}

@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -30,6 +32,10 @@ func resetClaudeDeviceProfileCache() {
 }
 
 func newClaudeHeaderTestRequest(t *testing.T, incoming http.Header) *http.Request {
+	return newClaudeHeaderTestRequestForURL(t, "https://api.anthropic.com/v1/messages", incoming)
+}
+
+func newClaudeHeaderTestRequestForURL(t *testing.T, target string, incoming http.Header) *http.Request {
 	t.Helper()
 
 	gin.SetMode(gin.TestMode)
@@ -39,7 +45,7 @@ func newClaudeHeaderTestRequest(t *testing.T, incoming http.Header) *http.Reques
 	ginReq.Header = incoming.Clone()
 	ginCtx.Request = ginReq
 
-	req := httptest.NewRequest(http.MethodPost, "https://api.anthropic.com/v1/messages", nil)
+	req := httptest.NewRequest(http.MethodPost, target, nil)
 	return req.WithContext(context.WithValue(req.Context(), "gin", ginCtx))
 }
 
@@ -61,6 +67,36 @@ func assertClaudeFingerprint(t *testing.T, headers http.Header, userAgent, pkgVe
 	if got := headers.Get("X-Stainless-Arch"); got != arch {
 		t.Fatalf("X-Stainless-Arch = %q, want %q", got, arch)
 	}
+}
+
+func runeIndexedFingerprintForTest(messageText, version string) string {
+	indices := [3]int{4, 7, 20}
+	runes := []rune(messageText)
+	var sb strings.Builder
+	for _, idx := range indices {
+		if idx < len(runes) {
+			sb.WriteRune(runes[idx])
+		} else {
+			sb.WriteRune('0')
+		}
+	}
+	sum := sha256.Sum256([]byte(fingerprintSalt + sb.String() + version))
+	return hex.EncodeToString(sum[:])[:3]
+}
+
+func byteIndexedFingerprintForTest(messageText, version string) string {
+	indices := [3]int{4, 7, 20}
+	messageBytes := []byte(messageText)
+	buf := make([]byte, 0, len(indices))
+	for _, idx := range indices {
+		if idx < len(messageBytes) {
+			buf = append(buf, messageBytes[idx])
+		} else {
+			buf = append(buf, '0')
+		}
+	}
+	sum := sha256.Sum256([]byte(fingerprintSalt + string(buf) + version))
+	return hex.EncodeToString(sum[:])[:3]
 }
 
 func TestApplyClaudeHeaders_UsesConfiguredBaselineFingerprint(t *testing.T) {
@@ -593,6 +629,137 @@ func TestApplyClaudeHeaders_UnsetStabilizationAlsoUsesLegacyRuntimeOSArchFallbac
 	applyClaudeHeaders(req, auth, "key-unset-runtime-os-arch", false, nil, cfg)
 
 	assertClaudeFingerprint(t, req.Header, "claude-cli/2.1.60 (external, cli)", "0.70.0", "v22.0.0", mapStainlessOS(), mapStainlessArch())
+}
+
+func TestApplyClaudeHeaders_APIKeyModeAddsClaudeSessionHeaders(t *testing.T) {
+	auth := &cliproxyauth.Auth{
+		ID: "auth-api-key-mode",
+		Attributes: map[string]string{
+			"api_key": "key-session-stable",
+		},
+	}
+
+	firstReq := newClaudeHeaderTestRequest(t, http.Header{})
+	applyClaudeHeaders(firstReq, auth, "key-session-stable", false, nil, &config.Config{})
+
+	firstSessionID := firstReq.Header.Get("X-Claude-Code-Session-Id")
+	firstRequestID := firstReq.Header.Get("x-client-request-id")
+	if firstSessionID == "" {
+		t.Fatal("expected X-Claude-Code-Session-Id to be populated")
+	}
+	if firstRequestID == "" {
+		t.Fatal("expected x-client-request-id to be populated for first-party Anthropic host")
+	}
+	if got := firstReq.Header.Get("x-api-key"); got != "key-session-stable" {
+		t.Fatalf("x-api-key = %q, want %q", got, "key-session-stable")
+	}
+	if got := firstReq.Header.Get("Authorization"); got != "" {
+		t.Fatalf("Authorization should be cleared in api_key mode, got %q", got)
+	}
+	if got := firstReq.Header.Get("Anthropic-Dangerous-Direct-Browser-Access"); got != "true" {
+		t.Fatalf("Anthropic-Dangerous-Direct-Browser-Access = %q, want %q", got, "true")
+	}
+
+	betas := firstReq.Header.Get("Anthropic-Beta")
+	for _, flag := range []string{
+		"structured-outputs-2025-12-15",
+		"fast-mode-2026-02-01",
+		"redact-thinking-2026-02-12",
+		"token-efficient-tools-2026-03-28",
+	} {
+		if !strings.Contains(betas, flag) {
+			t.Fatalf("Anthropic-Beta missing %q: %q", flag, betas)
+		}
+	}
+
+	secondReq := newClaudeHeaderTestRequest(t, http.Header{})
+	applyClaudeHeaders(secondReq, auth, "key-session-stable", false, nil, &config.Config{})
+
+	if got := secondReq.Header.Get("X-Claude-Code-Session-Id"); got != firstSessionID {
+		t.Fatalf("session id should remain stable for same api key, got %q want %q", got, firstSessionID)
+	}
+	if got := secondReq.Header.Get("x-client-request-id"); got == "" || got == firstRequestID {
+		t.Fatalf("request id should be regenerated per request, got %q after first %q", got, firstRequestID)
+	}
+}
+
+func TestApplyClaudeHeaders_OAuthModeSkipsBrowserAccessHeader(t *testing.T) {
+	auth := &cliproxyauth.Auth{
+		ID:       "auth-oauth-mode",
+		Metadata: map[string]any{"access_token": "sk-ant-oat-test"},
+	}
+
+	req := newClaudeHeaderTestRequest(t, http.Header{})
+	applyClaudeHeaders(req, auth, "sk-ant-oat-test", false, nil, &config.Config{})
+
+	if got := req.Header.Get("Authorization"); got != "Bearer sk-ant-oat-test" {
+		t.Fatalf("Authorization = %q, want %q", got, "Bearer sk-ant-oat-test")
+	}
+	if got := req.Header.Get("x-api-key"); got != "" {
+		t.Fatalf("x-api-key should be empty in oauth mode, got %q", got)
+	}
+	if got := req.Header.Get("Anthropic-Dangerous-Direct-Browser-Access"); got != "" {
+		t.Fatalf("oauth mode should not send browser access header, got %q", got)
+	}
+	if got := req.Header.Get("X-Claude-Code-Session-Id"); got == "" {
+		t.Fatal("expected oauth mode to also carry a stable Claude session id")
+	}
+}
+
+func TestApplyClaudeHeaders_ThirdPartyBaseSkipsFirstPartyOnlyRequestID(t *testing.T) {
+	auth := &cliproxyauth.Auth{
+		ID: "auth-third-party-base",
+		Attributes: map[string]string{
+			"api_key": "key-third-party-base",
+		},
+	}
+
+	req := newClaudeHeaderTestRequestForURL(t, "https://claude.example/v1/messages", http.Header{})
+	applyClaudeHeaders(req, auth, "key-third-party-base", false, nil, &config.Config{})
+
+	if got := req.Header.Get("x-client-request-id"); got != "" {
+		t.Fatalf("third-party base should not receive first-party request id, got %q", got)
+	}
+	if got := req.Header.Get("Authorization"); got != "Bearer key-third-party-base" {
+		t.Fatalf("third-party base should stay on bearer auth, got %q", got)
+	}
+}
+
+func TestComputeFingerprint_UsesRuneIndexesForUnicode(t *testing.T) {
+	messageText := "零一二三四五六七八九十十一十二十三十四十五十六十七十八十九二十"
+	version := "2.1.88"
+
+	got := computeFingerprint(messageText, version)
+	want := runeIndexedFingerprintForTest(messageText, version)
+	if got != want {
+		t.Fatalf("computeFingerprint() = %q, want %q", got, want)
+	}
+	if got == byteIndexedFingerprintForTest(messageText, version) {
+		t.Fatalf("expected rune-indexed fingerprint to differ from byte-indexed fallback for multibyte input")
+	}
+}
+
+func TestCheckSystemInstructionsWithBillingContext_InjectsEntrypointAndWorkload(t *testing.T) {
+	payload := []byte(`{"system":"你是一个助手。","messages":[{"role":"user","content":"hi"}]}`)
+	version := "2.1.88"
+	entrypoint := "vscode"
+	workload := "agent"
+
+	out := checkSystemInstructionsWithBillingContext(payload, false, version, entrypoint, workload)
+	billingText := gjson.GetBytes(out, "system.0.text").String()
+
+	if !strings.Contains(billingText, "cc_version="+version+".") {
+		t.Fatalf("billing header missing version: %q", billingText)
+	}
+	if !strings.Contains(billingText, "cc_entrypoint="+entrypoint+";") {
+		t.Fatalf("billing header missing entrypoint: %q", billingText)
+	}
+	if !strings.Contains(billingText, "cc_workload="+workload+";") {
+		t.Fatalf("billing header missing workload: %q", billingText)
+	}
+	if !strings.Contains(billingText, "."+computeFingerprint("你是一个助手。", version)+";") {
+		t.Fatalf("billing header missing expected fingerprint suffix: %q", billingText)
+	}
 }
 
 func TestClaudeDeviceProfileStabilizationEnabled_DefaultFalse(t *testing.T) {

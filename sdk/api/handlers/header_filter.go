@@ -5,6 +5,17 @@ import (
 	"strings"
 )
 
+// gatewayHeaderPrefixes 列出常见 AI 网关会额外注入的响应头前缀。
+// Claude Code 前端会据此识别网关类型，因此这里在透传前统一清洗。
+var gatewayHeaderPrefixes = []string{
+	"x-litellm-",
+	"helicone-",
+	"x-portkey-",
+	"cf-aig-",
+	"x-kong-",
+	"x-bt-",
+}
+
 // hopByHopHeaders lists RFC 7230 Section 6.1 hop-by-hop headers that MUST NOT
 // be forwarded by proxies, plus security-sensitive headers that should not leak.
 var hopByHopHeaders = map[string]struct{}{
@@ -38,6 +49,17 @@ func FilterUpstreamHeaders(src http.Header) http.Header {
 			continue
 		}
 		if _, scoped := connectionScoped[canonicalKey]; scoped {
+			continue
+		}
+		lowerKey := strings.ToLower(key)
+		gatewayMatch := false
+		for _, prefix := range gatewayHeaderPrefixes {
+			if strings.HasPrefix(lowerKey, prefix) {
+				gatewayMatch = true
+				break
+			}
+		}
+		if gatewayMatch {
 			continue
 		}
 		dst[key] = values

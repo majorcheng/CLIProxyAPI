@@ -53,3 +53,34 @@ func TestFilterUpstreamHeaders_ReturnsNilWhenAllHeadersBlocked(t *testing.T) {
 		t.Fatalf("expected nil when all headers are filtered, got %#v", filtered)
 	}
 }
+
+func TestFilterUpstreamHeaders_RemovesGatewayFingerprintHeaders(t *testing.T) {
+	src := http.Header{}
+	src.Set("x-litellm-model-id", "claude")
+	src.Set("Helicone-Auth", "secret")
+	src.Set("x-portkey-request-id", "req-1")
+	src.Set("cf-aig-cache-status", "hit")
+	src.Set("x-kong-upstream-latency", "1")
+	src.Set("x-bt-trace-id", "trace")
+	src.Set("X-Request-Id", "keep-me")
+
+	filtered := FilterUpstreamHeaders(src)
+	if filtered == nil {
+		t.Fatalf("expected filtered headers, got nil")
+	}
+	if got := filtered.Get("X-Request-Id"); got != "keep-me" {
+		t.Fatalf("expected non-gateway header to survive, got %q", got)
+	}
+	for _, key := range []string{
+		"x-litellm-model-id",
+		"Helicone-Auth",
+		"x-portkey-request-id",
+		"cf-aig-cache-status",
+		"x-kong-upstream-latency",
+		"x-bt-trace-id",
+	} {
+		if value := filtered.Get(key); value != "" {
+			t.Fatalf("expected %s to be removed, got %q", key, value)
+		}
+	}
+}

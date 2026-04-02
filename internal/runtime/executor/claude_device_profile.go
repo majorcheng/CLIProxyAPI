@@ -344,6 +344,16 @@ func applyClaudeDeviceProfileHeaders(r *http.Request, profile claudeDeviceProfil
 	r.Header.Set("X-Stainless-Arch", profile.Arch)
 }
 
+// defaultClaudeVersion 从当前基线设备画像里提取 Claude CLI 版本号，
+// 供 billing header 生成 cc_version 时复用。
+func defaultClaudeVersion(cfg *config.Config) string {
+	profile := defaultClaudeDeviceProfile(cfg)
+	if version, ok := parseClaudeCLIVersion(profile.UserAgent); ok {
+		return strconv.Itoa(version.major) + "." + strconv.Itoa(version.minor) + "." + strconv.Itoa(version.patch)
+	}
+	return "2.1.63"
+}
+
 func applyClaudeLegacyDeviceHeaders(r *http.Request, ginHeaders http.Header, cfg *config.Config) {
 	if r == nil {
 		return

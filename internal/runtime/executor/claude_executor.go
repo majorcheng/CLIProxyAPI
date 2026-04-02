@@ -6,7 +6,6 @@ import (
 	"compress/flate"
 	"compress/gzip"
 	"context"
-	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -18,6 +17,7 @@ import (
 	"time"
 
 	"github.com/andybalholm/brotli"
+	"github.com/google/uuid"
 	"github.com/klauspost/compress/zstd"
 	claudeauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/claude"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
@@ -91,7 +91,7 @@ func (e *ClaudeExecutor) HttpRequest(ctx context.Context, auth *cliproxyauth.Aut
 	if err := e.PrepareRequest(httpReq, auth); err != nil {
 		return nil, err
 	}
-	httpClient := newProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
+	httpClient := newUtlsHTTPClient(e.cfg, auth, 0)
 	return httpClient.Do(httpReq)
 }
 
@@ -184,7 +184,7 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 		AuthValue: authValue,
 	})
 
-	httpClient := newProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
+	httpClient := newUtlsHTTPClient(e.cfg, auth, 0)
 	httpResp, err := httpClient.Do(httpReq)
 	if err != nil {
 		recordAPIResponseError(ctx, e.cfg, err)
@@ -348,7 +348,7 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		AuthValue: authValue,
 	})
 
-	httpClient := newProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
+	httpClient := newUtlsHTTPClient(e.cfg, auth, 0)
 	httpResp, err := httpClient.Do(httpReq)
 	if err != nil {
 		recordAPIResponseError(ctx, e.cfg, err)
@@ -515,7 +515,7 @@ func (e *ClaudeExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Aut
 		AuthValue: authValue,
 	})
 
-	httpClient := newProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
+	httpClient := newUtlsHTTPClient(e.cfg, auth, 0)
 	resp, err := httpClient.Do(httpReq)
 	if err != nil {
 		recordAPIResponseError(ctx, e.cfg, err)
@@ -830,7 +830,7 @@ func applyClaudeHeaders(r *http.Request, auth *cliproxyauth.Auth, apiKey string,
 		deviceProfile = resolveClaudeDeviceProfile(auth, apiKey, ginHeaders, cfg)
 	}
 
-	baseBetas := "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,context-management-2025-06-27,prompt-caching-scope-2026-01-05"
+	baseBetas := "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,context-management-2025-06-27,prompt-caching-scope-2026-01-05,structured-outputs-2025-12-15,fast-mode-2026-02-01,redact-thinking-2026-02-12,token-efficient-tools-2026-03-28"
 	if val := strings.TrimSpace(ginHeaders.Get("Anthropic-Beta")); val != "" {
 		baseBetas = val
 		if !strings.Contains(val, "oauth") {
@@ -868,13 +868,22 @@ func applyClaudeHeaders(r *http.Request, auth *cliproxyauth.Auth, apiKey string,
 	r.Header.Set("Anthropic-Beta", baseBetas)
 
 	misc.EnsureHeader(r.Header, ginHeaders, "Anthropic-Version", "2023-06-01")
-	misc.EnsureHeader(r.Header, ginHeaders, "Anthropic-Dangerous-Direct-Browser-Access", "true")
+	// 仅在 API Key 模式下保留浏览器直连标记，OAuth 形态的真实 Claude Code 不会带这个头。
+	if useAPIKey {
+		misc.EnsureHeader(r.Header, ginHeaders, "Anthropic-Dangerous-Direct-Browser-Access", "true")
+	}
 	misc.EnsureHeader(r.Header, ginHeaders, "X-App", "cli")
 	// Values below match Claude Code 2.1.63 / @anthropic-ai/sdk 0.74.0 (updated 2026-02-28).
 	misc.EnsureHeader(r.Header, ginHeaders, "X-Stainless-Retry-Count", "0")
 	misc.EnsureHeader(r.Header, ginHeaders, "X-Stainless-Runtime", "node")
 	misc.EnsureHeader(r.Header, ginHeaders, "X-Stainless-Lang", "js")
 	misc.EnsureHeader(r.Header, ginHeaders, "X-Stainless-Timeout", hdrDefault(hd.Timeout, "600"))
+	// 对同一 apiKey 维持稳定的 session id，更贴近 Claude Code 的会话行为。
+	misc.EnsureHeader(r.Header, ginHeaders, "X-Claude-Code-Session-Id", cachedSessionID(apiKey))
+	// 仅在 Anthropic 官方域名上注入首方请求 id，避免误伤自定义兼容端点。
+	if isAnthropicBase {
+		misc.EnsureHeader(r.Header, ginHeaders, "x-client-request-id", uuid.New().String())
+	}
 	r.Header.Set("Connection", "keep-alive")
 	if stream {
 		r.Header.Set("Accept", "text/event-stream")
@@ -1119,6 +1128,35 @@ func getClientUserAgent(ctx context.Context) string {
 	return ""
 }
 
+// parseEntrypointFromUA 从 Claude Code 的 User-Agent 中提取入口名。
+// 例如 "claude-cli/2.1.88 (external, vscode)" 会提取为 "vscode"；
+// 如果不是 Claude Code 风格或解析失败，则保守回退为 "cli"。
+func parseEntrypointFromUA(userAgent string) string {
+	start := strings.Index(userAgent, "(")
+	end := strings.LastIndex(userAgent, ")")
+	if start < 0 || end <= start {
+		return "cli"
+	}
+	inner := userAgent[start+1 : end]
+	parts := strings.Split(inner, ",")
+	if len(parts) >= 2 {
+		entrypoint := strings.TrimSpace(parts[1])
+		if entrypoint != "" {
+			return entrypoint
+		}
+	}
+	return "cli"
+}
+
+// getWorkloadFromContext 从入站请求头中读取 workload 标识。
+// 这里只透传 CPA 自己约定的头，避免把任意上游字段误注入到 billing header。
+func getWorkloadFromContext(ctx context.Context) string {
+	if ginCtx, ok := ctx.Value("gin").(*gin.Context); ok && ginCtx != nil && ginCtx.Request != nil {
+		return strings.TrimSpace(ginCtx.GetHeader("X-CPA-Claude-Workload"))
+	}
+	return ""
+}
+
 // getCloakConfigFromAuth extracts cloak configuration from auth attributes.
 // Returns (cloakMode, strictMode, sensitiveWords, cacheUserID).
 func getCloakConfigFromAuth(auth *cliproxyauth.Auth) (string, bool, []string, bool) {
@@ -1198,49 +1236,79 @@ func injectFakeUserID(payload []byte, apiKey string, useCache bool) []byte {
 	return payload
 }
 
+// fingerprintSalt 是 Claude Code 用于构造 cc_version build 指纹的固定盐值。
+const fingerprintSalt = "59cf53e54c78"
+
+// computeFingerprint 计算 billing header 里的 3 位 build 指纹。
+// 这里必须按 rune 下标取第 4/7/20 个字符，避免多字节字符导致索引错位。
+func computeFingerprint(messageText, version string) string {
+	indices := [3]int{4, 7, 20}
+	runes := []rune(messageText)
+	var sb strings.Builder
+	for _, idx := range indices {
+		if idx < len(runes) {
+			sb.WriteRune(runes[idx])
+		} else {
+			sb.WriteRune('0')
+		}
+	}
+	input := fingerprintSalt + sb.String() + version
+	h := sha256.Sum256([]byte(input))
+	return hex.EncodeToString(h[:])[:3]
+}
+
 // generateBillingHeader creates the x-anthropic-billing-header text block that
 // real Claude Code prepends to every system prompt array.
-// Format: x-anthropic-billing-header: cc_version=<ver>.<build>; cc_entrypoint=cli; cch=<hash>;
-func generateBillingHeader(payload []byte) string {
-	// Generate a deterministic cch hash from the payload content (system + messages + tools).
-	// Real Claude Code uses a 5-char hex hash that varies per request.
+// Format: x-anthropic-billing-header: cc_version=<ver>.<build>; cc_entrypoint=<ep>; cch=<hash>; [cc_workload=<wl>;]
+func generateBillingHeader(payload []byte, version, messageText, entrypoint, workload string) string {
+	if strings.TrimSpace(version) == "" {
+		version = "2.1.63"
+	}
+	if entrypoint == "" {
+		entrypoint = "cli"
+	}
+
+	buildHash := computeFingerprint(messageText, version)
 	h := sha256.Sum256(payload)
 	cch := hex.EncodeToString(h[:])[:5]
 
-	// Build hash: 3-char hex, matches the pattern seen in real requests (e.g. "a43")
-	buildBytes := make([]byte, 2)
-	_, _ = rand.Read(buildBytes)
-	buildHash := hex.EncodeToString(buildBytes)[:3]
+	workloadPart := ""
+	if workload != "" {
+		workloadPart = fmt.Sprintf(" cc_workload=%s;", workload)
+	}
 
-	return fmt.Sprintf("x-anthropic-billing-header: cc_version=2.1.63.%s; cc_entrypoint=cli; cch=%s;", buildHash, cch)
+	return fmt.Sprintf("x-anthropic-billing-header: cc_version=%s.%s; cc_entrypoint=%s; cch=%s;%s", version, buildHash, entrypoint, cch, workloadPart)
 }
 
-// checkSystemInstructionsWithMode injects Claude Code-style system blocks:
-//
-//	system[0]: billing header (no cache_control)
-//	system[1]: agent identifier (no cache_control)
-//	system[2..]: user system messages (cache_control added when missing)
-func checkSystemInstructionsWithMode(payload []byte, strictMode bool) []byte {
+// checkSystemInstructionsWithBillingContext 注入 Claude Code 风格的 system block，
+// 并把 billing header 的版本、入口和 workload 画像一起带上。
+func checkSystemInstructionsWithBillingContext(payload []byte, strictMode bool, version, entrypoint, workload string) []byte {
 	system := gjson.GetBytes(payload, "system")
 
-	billingText := generateBillingHeader(payload)
+	// 取原始 system 首个 text 片段作为 build 指纹的消息源，避免把注入后的 billing block 再次计入。
+	messageText := ""
+	if system.IsArray() {
+		system.ForEach(func(_, part gjson.Result) bool {
+			if part.Get("type").String() == "text" {
+				messageText = part.Get("text").String()
+				return false
+			}
+			return true
+		})
+	} else if system.Type == gjson.String {
+		messageText = system.String()
+	}
+
+	billingText := generateBillingHeader(payload, version, messageText, entrypoint, workload)
 	billingBlock := fmt.Sprintf(`{"type":"text","text":"%s"}`, billingText)
-	// No cache_control on the agent block. It is a cloaking artifact with zero cache
-	// value (the last system block is what actually triggers caching of all system content).
-	// Including any cache_control here creates an intra-system TTL ordering violation
-	// when the client's system blocks use ttl='1h' (prompt-caching-scope-2026-01-05 beta
-	// forbids 1h blocks after 5m blocks, and a no-TTL block defaults to 5m).
 	agentBlock := `{"type":"text","text":"You are a Claude agent, built on Anthropic's Claude Agent SDK."}`
 
 	if strictMode {
-		// Strict mode: billing header + agent identifier only
 		result := "[" + billingBlock + "," + agentBlock + "]"
 		payload, _ = sjson.SetRawBytes(payload, "system", []byte(result))
 		return payload
 	}
 
-	// Non-strict mode: billing header + agent identifier + user system messages
-	// Skip if already injected
 	firstText := gjson.GetBytes(payload, "system.0.text").String()
 	if strings.HasPrefix(firstText, "x-anthropic-billing-header:") {
 		return payload
@@ -1250,12 +1318,10 @@ func checkSystemInstructionsWithMode(payload []byte, strictMode bool) []byte {
 	if system.IsArray() {
 		system.ForEach(func(_, part gjson.Result) bool {
 			if part.Get("type").String() == "text" {
-				// Add cache_control to user system messages if not present.
-				// Do NOT add ttl — let it inherit the default (5m) to avoid
-				// TTL ordering violations with the prompt-caching-scope-2026-01-05 beta.
 				partJSON := part.Raw
 				if !part.Get("cache_control").Exists() {
-					partJSON, _ = sjson.Set(partJSON, "cache_control.type", "ephemeral")
+					updated, _ := sjson.SetBytes([]byte(partJSON), "cache_control.type", "ephemeral")
+					partJSON = string(updated)
 				}
 				result += "," + partJSON
 			}
@@ -1263,13 +1329,23 @@ func checkSystemInstructionsWithMode(payload []byte, strictMode bool) []byte {
 		})
 	} else if system.Type == gjson.String && system.String() != "" {
 		partJSON := `{"type":"text","cache_control":{"type":"ephemeral"}}`
-		partJSON, _ = sjson.Set(partJSON, "text", system.String())
+		updated, _ := sjson.SetBytes([]byte(partJSON), "text", system.String())
+		partJSON = string(updated)
 		result += "," + partJSON
 	}
 	result += "]"
 
 	payload, _ = sjson.SetRawBytes(payload, "system", []byte(result))
 	return payload
+}
+
+// checkSystemInstructionsWithMode injects Claude Code-style system blocks:
+//
+//	system[0]: billing header (no cache_control)
+//	system[1]: agent identifier (no cache_control)
+//	system[2..]: user system messages (cache_control added when missing)
+func checkSystemInstructionsWithMode(payload []byte, strictMode bool) []byte {
+	return checkSystemInstructionsWithBillingContext(payload, strictMode, "2.1.63", "", "")
 }
 
 // applyCloaking applies cloaking transformations to the payload based on config and client.
@@ -1320,7 +1396,10 @@ func applyCloaking(ctx context.Context, cfg *config.Config, auth *cliproxyauth.A
 
 	// Skip system instructions for claude-3-5-haiku models
 	if !strings.HasPrefix(model, "claude-3-5-haiku") {
-		payload = checkSystemInstructionsWithMode(payload, strictMode)
+		billingVersion := defaultClaudeVersion(cfg)
+		entrypoint := parseEntrypointFromUA(clientUserAgent)
+		workload := getWorkloadFromContext(ctx)
+		payload = checkSystemInstructionsWithBillingContext(payload, strictMode, billingVersion, entrypoint, workload)
 	}
 
 	// Inject fake user ID

@@ -668,8 +668,14 @@ func applyCodexHeaders(r *http.Request, auth *cliproxyauth.Auth, token string, s
 			isAPIKey = true
 		}
 	}
+	// 优先透传客户端显式声明的 Originator，避免把真实客户端身份头统一抹平成默认画像。
+	if originator := strings.TrimSpace(ginHeaders.Get("Originator")); originator != "" {
+		r.Header.Set("Originator", originator)
+	}
 	if !isAPIKey {
-		r.Header.Set("Originator", codexOriginator)
+		if strings.TrimSpace(r.Header.Get("Originator")) == "" {
+			r.Header.Set("Originator", codexOriginator)
+		}
 		if auth != nil && auth.Metadata != nil {
 			if accountID, ok := auth.Metadata["account_id"].(string); ok {
 				r.Header.Set("Chatgpt-Account-Id", accountID)

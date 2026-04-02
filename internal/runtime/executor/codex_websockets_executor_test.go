@@ -60,7 +60,7 @@ func TestApplyCodexWebsocketHeadersDefaultsToCurrentResponsesBeta(t *testing.T) 
 	}
 }
 
-func TestApplyCodexWebsocketHeadersUsesCodexOriginatorWhilePassingThroughIdentityMetadata(t *testing.T) {
+func TestApplyCodexWebsocketHeadersPassesThroughClientOriginatorWhileKeepingIdentityMetadata(t *testing.T) {
 	auth := &cliproxyauth.Auth{
 		Provider: "codex",
 		Metadata: map[string]any{"email": "user@example.com"},
@@ -74,8 +74,8 @@ func TestApplyCodexWebsocketHeadersUsesCodexOriginatorWhilePassingThroughIdentit
 
 	headers := applyCodexWebsocketHeaders(ctx, http.Header{}, auth, "", nil)
 
-	if got := headers.Get("Originator"); got != codexOriginator {
-		t.Fatalf("Originator = %s, want %s", got, codexOriginator)
+	if got := headers.Get("Originator"); got != "Codex Desktop" {
+		t.Fatalf("Originator = %s, want %s", got, "Codex Desktop")
 	}
 	if got := headers.Get("Version"); got != "0.115.0-alpha.27" {
 		t.Fatalf("Version = %s, want %s", got, "0.115.0-alpha.27")
@@ -344,7 +344,7 @@ func TestCodexAutoExecutorExecuteStream_WebsocketStripsPrefixedModelFromOutbound
 	}
 }
 
-func TestApplyCodexHeadersUsesCodexOriginatorWhilePassingThroughIdentityMetadata(t *testing.T) {
+func TestApplyCodexHeadersPassesThroughClientOriginatorWhileKeepingIdentityMetadata(t *testing.T) {
 	req, err := http.NewRequest(http.MethodPost, "https://example.com/responses", nil)
 	if err != nil {
 		t.Fatalf("NewRequest() error = %v", err)
@@ -362,8 +362,8 @@ func TestApplyCodexHeadersUsesCodexOriginatorWhilePassingThroughIdentityMetadata
 
 	applyCodexHeaders(req, auth, "oauth-token", true, nil)
 
-	if got := req.Header.Get("Originator"); got != codexOriginator {
-		t.Fatalf("Originator = %s, want %s", got, codexOriginator)
+	if got := req.Header.Get("Originator"); got != "Codex Desktop" {
+		t.Fatalf("Originator = %s, want %s", got, "Codex Desktop")
 	}
 	if got := req.Header.Get("Version"); got != "0.115.0-alpha.27" {
 		t.Fatalf("Version = %s, want %s", got, "0.115.0-alpha.27")

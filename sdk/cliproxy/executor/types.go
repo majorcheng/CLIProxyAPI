@@ -21,6 +21,8 @@ const (
 	ExecutionSessionMetadataKey = "execution_session_id"
 	// RequestSimHashMetadataKey stores the normalized request SimHash for simhash routing.
 	RequestSimHashMetadataKey = "request_simhash"
+	// DisallowPriorityZeroAuthMetadataKey 表示本次请求禁止命中 priority=0 auth。
+	DisallowPriorityZeroAuthMetadataKey = "disallow_priority_zero_auth"
 )
 
 // Request encapsulates the translated payload that will be sent to a provider executor.

@@ -776,6 +776,9 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	// Normalize global OAuth model name aliases.
 	cfg.SanitizeOAuthModelAlias()
 
+	// 规范化“禁止命中 priority=0”的 client api-key 列表。
+	cfg.SanitizePriorityZeroDisabledAPIKeys()
+
 	// Validate raw payload rules and drop invalid entries.
 	cfg.SanitizePayloadRules()
 
@@ -813,6 +816,38 @@ func normalizeAuthMaintenanceStatusCodes(codes []int) []int {
 		}
 		seen[code] = struct{}{}
 		out = append(out, code)
+	}
+	return out
+}
+
+// SanitizePriorityZeroDisabledAPIKeys 负责清理“禁止命中 priority=0”的
+// client api-key 列表，统一做 trim 与去重。
+func (cfg *Config) SanitizePriorityZeroDisabledAPIKeys() {
+	if cfg == nil {
+		return
+	}
+	cfg.PriorityZeroDisabledAPIKeys = normalizeUniqueTrimmedStrings(cfg.PriorityZeroDisabledAPIKeys)
+}
+
+func normalizeUniqueTrimmedStrings(values []string) []string {
+	if len(values) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(values))
+	seen := make(map[string]struct{}, len(values))
+	for _, value := range values {
+		trimmed := strings.TrimSpace(value)
+		if trimmed == "" {
+			continue
+		}
+		if _, ok := seen[trimmed]; ok {
+			continue
+		}
+		seen[trimmed] = struct{}{}
+		out = append(out, trimmed)
+	}
+	if len(out) == 0 {
+		return nil
 	}
 	return out
 }

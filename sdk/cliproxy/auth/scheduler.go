@@ -232,6 +232,9 @@ func (s *authScheduler) pickSingle(ctx context.Context, provider, model string, 
 		if entry == nil || entry.auth == nil {
 			return false
 		}
+		if shouldSkipPriorityZeroAuth(opts.Metadata, entry.auth) {
+			return false
+		}
 		if pinnedAuthID != "" && entry.auth.ID != pinnedAuthID {
 			return false
 		}
@@ -279,6 +282,9 @@ func (s *authScheduler) pickMixed(ctx context.Context, providers []string, model
 			if entry == nil || entry.auth == nil || entry.auth.ID != pinnedAuthID {
 				return false
 			}
+			if shouldSkipPriorityZeroAuth(opts.Metadata, entry.auth) {
+				return false
+			}
 			if len(tried) == 0 {
 				return true
 			}
@@ -292,13 +298,13 @@ func (s *authScheduler) pickMixed(ctx context.Context, providers []string, model
 	}
 
 	predicate := triedPredicate(tried)
-	if priorityZeroOAuthSkipped(opts.Metadata) {
+	if priorityZeroDisallowedByClientPolicy(opts.Metadata) || priorityZeroOAuthSkipped(opts.Metadata) {
 		basePredicate := predicate
 		predicate = func(entry *scheduledAuth) bool {
 			if !basePredicate(entry) {
 				return false
 			}
-			return !shouldSkipPriorityZeroOAuthAuth(opts.Metadata, entry.auth)
+			return !shouldSkipPriorityZeroAuth(opts.Metadata, entry.auth)
 		}
 	}
 	candidateShards := make([]*modelScheduler, len(normalized))

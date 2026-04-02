@@ -19,6 +19,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
 	chatcompletions "github.com/router-for-me/CLIProxyAPI/v6/internal/translator/codex/openai/chat-completions"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
+	sdkaccess "github.com/router-for-me/CLIProxyAPI/v6/sdk/access"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	coreexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/config"
@@ -210,6 +211,56 @@ func requestExecutionMetadata(ctx context.Context) map[string]any {
 		meta[coreexecutor.ExecutionSessionMetadataKey] = executionSessionID
 	}
 	return meta
+}
+
+// applyClientRoutingPolicyMetadata 将入站 client api-key 的路由限制收口成
+// execution metadata，避免把原始 key 继续透传到 scheduler/auth 层。
+func applyClientRoutingPolicyMetadata(meta map[string]any, ctx context.Context, cfg *config.SDKConfig) {
+	if len(meta) == 0 || !clientAPIKeyDisallowsPriorityZero(ctx, cfg) {
+		return
+	}
+	meta[coreexecutor.DisallowPriorityZeroAuthMetadataKey] = true
+}
+
+func clientAPIKeyDisallowsPriorityZero(ctx context.Context, cfg *config.SDKConfig) bool {
+	if ctx == nil || cfg == nil || len(cfg.PriorityZeroDisabledAPIKeys) == 0 {
+		return false
+	}
+	ginCtx, ok := ctx.Value("gin").(*gin.Context)
+	if !ok || ginCtx == nil {
+		return false
+	}
+	if accessProvider := strings.TrimSpace(stringValueFromGin(ginCtx, "accessProvider")); accessProvider != sdkaccess.DefaultAccessProviderName {
+		return false
+	}
+	clientAPIKey := strings.TrimSpace(stringValueFromGin(ginCtx, "apiKey"))
+	if clientAPIKey == "" {
+		return false
+	}
+	for _, candidate := range cfg.PriorityZeroDisabledAPIKeys {
+		if strings.TrimSpace(candidate) == clientAPIKey {
+			return true
+		}
+	}
+	return false
+}
+
+func stringValueFromGin(c *gin.Context, key string) string {
+	if c == nil || strings.TrimSpace(key) == "" {
+		return ""
+	}
+	value, exists := c.Get(key)
+	if !exists {
+		return ""
+	}
+	switch typed := value.(type) {
+	case string:
+		return typed
+	case fmt.Stringer:
+		return typed.String()
+	default:
+		return fmt.Sprint(typed)
+	}
 }
 
 func pinnedAuthIDFromContext(ctx context.Context) string {
@@ -476,6 +527,7 @@ func (h *BaseAPIHandler) ExecuteWithAuthManager(ctx context.Context, handlerType
 	}
 	primeRequestTranslationCache(handlerType, rawJSON)
 	reqMeta := requestExecutionMetadata(ctx)
+	applyClientRoutingPolicyMetadata(reqMeta, ctx, h.Cfg)
 	reqMeta[coreexecutor.RequestedModelMetadataKey] = normalizedModel
 	payload := rawJSON
 	if len(payload) == 0 {
@@ -523,6 +575,7 @@ func (h *BaseAPIHandler) ExecuteCountWithAuthManager(ctx context.Context, handle
 	}
 	primeRequestTranslationCache(handlerType, rawJSON)
 	reqMeta := requestExecutionMetadata(ctx)
+	applyClientRoutingPolicyMetadata(reqMeta, ctx, h.Cfg)
 	reqMeta[coreexecutor.RequestedModelMetadataKey] = normalizedModel
 	payload := rawJSON
 	if len(payload) == 0 {
@@ -574,6 +627,7 @@ func (h *BaseAPIHandler) ExecuteStreamWithAuthManager(ctx context.Context, handl
 	}
 	primeRequestTranslationCache(handlerType, rawJSON)
 	reqMeta := requestExecutionMetadata(ctx)
+	applyClientRoutingPolicyMetadata(reqMeta, ctx, h.Cfg)
 	reqMeta[coreexecutor.RequestedModelMetadataKey] = normalizedModel
 	payload := rawJSON
 	if len(payload) == 0 {

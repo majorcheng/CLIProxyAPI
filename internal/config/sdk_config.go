@@ -23,6 +23,10 @@ type SDKConfig struct {
 	// APIKeys is a list of keys for authenticating clients to this proxy server.
 	APIKeys []string `yaml:"api-keys" json:"api-keys"`
 
+	// PriorityZeroDisabledAPIKeys 列出禁止命中 priority=0 auth 的 client api-key。
+	// 这些 key 仍可访问代理，但请求选路时会直接跳过 priority=0 候选。
+	PriorityZeroDisabledAPIKeys []string `yaml:"priority-zero-disabled-api-keys,omitempty" json:"priority-zero-disabled-api-keys,omitempty"`
+
 	// PassthroughHeaders controls whether upstream response headers are forwarded to downstream clients.
 	// Default is false (disabled).
 	PassthroughHeaders bool `yaml:"passthrough-headers" json:"passthrough-headers"`

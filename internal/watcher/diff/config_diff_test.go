@@ -190,7 +190,8 @@ func TestBuildConfigChangeDetails_NilSafe(t *testing.T) {
 func TestBuildConfigChangeDetails_SecretsAndCounts(t *testing.T) {
 	oldCfg := &config.Config{
 		SDKConfig: sdkconfig.SDKConfig{
-			APIKeys: []string{"a"},
+			APIKeys:                     []string{"a"},
+			PriorityZeroDisabledAPIKeys: []string{"a"},
 		},
 		AmpCode: config.AmpCode{
 			UpstreamAPIKey: "",
@@ -201,7 +202,8 @@ func TestBuildConfigChangeDetails_SecretsAndCounts(t *testing.T) {
 	}
 	newCfg := &config.Config{
 		SDKConfig: sdkconfig.SDKConfig{
-			APIKeys: []string{"a", "b", "c"},
+			APIKeys:                     []string{"a", "b", "c"},
+			PriorityZeroDisabledAPIKeys: []string{"a", "b"},
 		},
 		AmpCode: config.AmpCode{
 			UpstreamAPIKey: "new-key",
@@ -213,8 +215,25 @@ func TestBuildConfigChangeDetails_SecretsAndCounts(t *testing.T) {
 
 	details := BuildConfigChangeDetails(oldCfg, newCfg)
 	expectContains(t, details, "api-keys count: 1 -> 3")
+	expectContains(t, details, "priority-zero-disabled-api-keys count: 1 -> 2")
 	expectContains(t, details, "ampcode.upstream-api-key: added")
 	expectContains(t, details, "remote-management.secret-key: created")
+}
+
+func TestBuildConfigChangeDetails_PriorityZeroDisabledAPIKeysRedacted(t *testing.T) {
+	oldCfg := &config.Config{
+		SDKConfig: sdkconfig.SDKConfig{
+			PriorityZeroDisabledAPIKeys: []string{"a", "b"},
+		},
+	}
+	newCfg := &config.Config{
+		SDKConfig: sdkconfig.SDKConfig{
+			PriorityZeroDisabledAPIKeys: []string{"a", "c"},
+		},
+	}
+
+	details := BuildConfigChangeDetails(oldCfg, newCfg)
+	expectContains(t, details, "priority-zero-disabled-api-keys: values updated (count unchanged, redacted)")
 }
 
 func TestBuildConfigChangeDetails_FlagsAndKeys(t *testing.T) {

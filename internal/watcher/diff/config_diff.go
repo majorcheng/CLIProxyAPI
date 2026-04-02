@@ -100,6 +100,11 @@ func BuildConfigChangeDetails(oldCfg, newCfg *config.Config) []string {
 	} else if !reflect.DeepEqual(trimStrings(oldCfg.APIKeys), trimStrings(newCfg.APIKeys)) {
 		changes = append(changes, "api-keys: values updated (count unchanged, redacted)")
 	}
+	if len(oldCfg.PriorityZeroDisabledAPIKeys) != len(newCfg.PriorityZeroDisabledAPIKeys) {
+		changes = append(changes, fmt.Sprintf("priority-zero-disabled-api-keys count: %d -> %d", len(oldCfg.PriorityZeroDisabledAPIKeys), len(newCfg.PriorityZeroDisabledAPIKeys)))
+	} else if !reflect.DeepEqual(trimStrings(oldCfg.PriorityZeroDisabledAPIKeys), trimStrings(newCfg.PriorityZeroDisabledAPIKeys)) {
+		changes = append(changes, "priority-zero-disabled-api-keys: values updated (count unchanged, redacted)")
+	}
 	if len(oldCfg.GeminiKey) != len(newCfg.GeminiKey) {
 		changes = append(changes, fmt.Sprintf("gemini-api-key count: %d -> %d", len(oldCfg.GeminiKey), len(newCfg.GeminiKey)))
 	} else {

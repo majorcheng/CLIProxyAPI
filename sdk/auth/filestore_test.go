@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -18,6 +19,65 @@ type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
 	return f(req)
+}
+
+func projectHydrationProxyString(t *testing.T, client *http.Client) string {
+	t.Helper()
+	transport, ok := client.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("client transport type = %T, want *http.Transport", client.Transport)
+	}
+	if transport.Proxy == nil {
+		return ""
+	}
+	targetURL, errParse := url.Parse("https://example.com")
+	if errParse != nil {
+		t.Fatalf("url.Parse() error = %v", errParse)
+	}
+	proxyURL, errProxy := transport.Proxy(&http.Request{URL: targetURL})
+	if errProxy != nil {
+		t.Fatalf("transport.Proxy() error = %v", errProxy)
+	}
+	if proxyURL == nil {
+		return ""
+	}
+	return proxyURL.String()
+}
+
+func TestFileTokenStoreProjectHydrationHTTPClientPrefersAuthProxyURL(t *testing.T) {
+	t.Parallel()
+
+	store := NewFileTokenStore()
+	store.SetGlobalProxyURL("http://global-proxy.example.com:8080")
+	client := store.projectHydrationHTTPClient(map[string]any{"proxy_url": "http://auth-proxy.example.com:8080"})
+
+	if got := projectHydrationProxyString(t, client); got != "http://auth-proxy.example.com:8080" {
+		t.Fatalf("proxy = %q, want %q", got, "http://auth-proxy.example.com:8080")
+	}
+}
+
+func TestFileTokenStoreProjectHydrationHTTPClientDirectBypassesGlobalProxy(t *testing.T) {
+	t.Parallel()
+
+	store := NewFileTokenStore()
+	store.SetGlobalProxyURL("http://global-proxy.example.com:8080")
+	client := store.projectHydrationHTTPClient(map[string]any{"proxy_url": "direct"})
+
+	if got := projectHydrationProxyString(t, client); got != "" {
+		t.Fatalf("proxy = %q, want direct no-proxy transport", got)
+	}
+}
+
+func TestFileTokenStoreProjectHydrationHTTPClientInvalidAuthProxyFallsBackToGlobalProxy(t *testing.T) {
+	t.Parallel()
+
+	store := NewFileTokenStore()
+	store.SetGlobalProxyURL("http://global-proxy.example.com:8080")
+	client := store.projectHydrationHTTPClient(map[string]any{"proxy_url": "://bad-proxy"})
+
+	if got := projectHydrationProxyString(t, client); got != "http://global-proxy.example.com:8080" {
+		t.Fatalf("proxy = %q, want %q", got, "http://global-proxy.example.com:8080")
+	}
 }
 
 func TestExtractAccessToken(t *testing.T) {
@@ -242,7 +302,7 @@ func TestFileTokenStoreSaveAndListRoundTripRuntimeState(t *testing.T) {
 	store := NewFileTokenStore()
 	store.SetBaseDir(tempDir)
 
-	next := time.Date(2026, 4, 1, 9, 45, 0, 0, time.UTC)
+	next := time.Date(2030, 4, 1, 9, 45, 0, 0, time.UTC)
 	auth := &cliproxyauth.Auth{
 		ID:             "codex.json",
 		FileName:       "codex.json",
@@ -341,5 +401,65 @@ func TestFileTokenStoreSaveAndListRoundTripRuntimeState(t *testing.T) {
 	}
 	if !state.NextRetryAfter.Equal(next) {
 		t.Fatalf("got model NextRetryAfter = %v, want %v", state.NextRetryAfter, next)
+	}
+}
+
+func TestFileTokenStoreReadAuthFileRestoresProxyURLFromMetadata(t *testing.T) {
+	t.Parallel()
+
+	tempDir := t.TempDir()
+	authPath := filepath.Join(tempDir, "codex-auth.json")
+	if err := os.WriteFile(authPath, []byte(`{
+		"type":"codex",
+		"email":"user@example.com",
+		"proxy_url":"http://proxy.local:8080"
+	}`), 0o600); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	store := NewFileTokenStore()
+	auth, err := store.readAuthFile(authPath, tempDir)
+	if err != nil {
+		t.Fatalf("readAuthFile() error = %v", err)
+	}
+	if auth == nil {
+		t.Fatal("readAuthFile() returned nil auth")
+	}
+	if auth.ProxyURL != "http://proxy.local:8080" {
+		t.Fatalf("auth.ProxyURL = %q, want %q", auth.ProxyURL, "http://proxy.local:8080")
+	}
+}
+
+func TestFileTokenStoreSavePersistsProxyURL(t *testing.T) {
+	t.Parallel()
+
+	tempDir := t.TempDir()
+	store := NewFileTokenStore()
+	store.SetBaseDir(tempDir)
+	auth := &cliproxyauth.Auth{
+		ID:       "codex.json",
+		FileName: "codex.json",
+		Provider: "codex",
+		ProxyURL: "http://proxy.local:8080",
+		Metadata: map[string]any{
+			"type":  "codex",
+			"email": "user@example.com",
+		},
+	}
+
+	path, err := store.Save(context.Background(), auth)
+	if err != nil {
+		t.Fatalf("Save() error = %v", err)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile() error = %v", err)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		t.Fatalf("Unmarshal() error = %v", err)
+	}
+	if got := payload["proxy_url"]; got != "http://proxy.local:8080" {
+		t.Fatalf("persisted proxy_url = %v, want %q", got, "http://proxy.local:8080")
 	}
 }

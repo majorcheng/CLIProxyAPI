@@ -1004,6 +1004,9 @@ func (s *Server) UpdateClients(cfg *config.Config) {
 	if dirSetter, ok := tokenStore.(interface{ SetBaseDir(string) }); ok {
 		dirSetter.SetBaseDir(cfg.AuthDir)
 	}
+	if proxySetter, ok := tokenStore.(interface{ SetGlobalProxyURL(string) }); ok {
+		proxySetter.SetGlobalProxyURL(cfg.ProxyURL)
+	}
 	authEntries := util.CountAuthFiles(context.Background(), tokenStore)
 	geminiAPIKeyCount := len(cfg.GeminiKey)
 	claudeAPIKeyCount := len(cfg.ClaudeKey)

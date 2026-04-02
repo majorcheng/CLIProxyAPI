@@ -18,13 +18,17 @@ import (
 	"time"
 
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
+	"github.com/router-for-me/CLIProxyAPI/v6/sdk/proxyutil"
+	log "github.com/sirupsen/logrus"
 )
 
 // FileTokenStore persists token records and auth metadata using the filesystem as backing storage.
 type FileTokenStore struct {
-	dirLock sync.RWMutex
-	baseDir string
-	pathMu  [64]sync.Mutex
+	dirLock   sync.RWMutex
+	baseDir   string
+	proxyLock sync.RWMutex
+	proxyURL  string
+	pathMu    [64]sync.Mutex
 }
 
 var (
@@ -43,6 +47,13 @@ func (s *FileTokenStore) SetBaseDir(dir string) {
 	s.dirLock.Lock()
 	s.baseDir = strings.TrimSpace(dir)
 	s.dirLock.Unlock()
+}
+
+// SetGlobalProxyURL configures the default proxy used when an auth file itself does not declare proxy_url.
+func (s *FileTokenStore) SetGlobalProxyURL(proxyURL string) {
+	s.proxyLock.Lock()
+	s.proxyURL = strings.TrimSpace(proxyURL)
+	s.proxyLock.Unlock()
 }
 
 // Save persists token storage and metadata to the resolved auth file path.
@@ -77,6 +88,14 @@ func (s *FileTokenStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (str
 		SetMetadata(map[string]any)
 	}
 	metadata := cliproxyauth.MetadataWithPersistedRuntimeState(auth)
+	if proxyURL := strings.TrimSpace(auth.ProxyURL); proxyURL != "" {
+		if metadata == nil {
+			metadata = make(map[string]any, 1)
+		}
+		metadata["proxy_url"] = proxyURL
+	} else if metadata != nil {
+		delete(metadata, "proxy_url")
+	}
 
 	switch {
 	case auth.Storage != nil:
@@ -226,6 +245,7 @@ func (s *FileTokenStore) readAuthFile(path, baseDir string) (*cliproxyauth.Auth,
 		Label:            s.labelFor(metadata),
 		Status:           status,
 		Disabled:         disabled,
+		ProxyURL:         metadataProxyURL(metadata),
 		Attributes:       map[string]string{"path": path},
 		Metadata:         metadata,
 		CreatedAt:        info.ModTime(),
@@ -254,10 +274,11 @@ func (s *FileTokenStore) hydrateProjectID(path, provider string, metadata map[st
 		return
 	}
 
+	httpClient := s.projectHydrationHTTPClient(metadata)
 	accessToken := extractAccessToken(metadata)
 	if provider == "gemini" {
 		if tokenMap, ok := metadata["token"].(map[string]any); ok {
-			if refreshed, errRefresh := refreshGeminiAccessToken(tokenMap, fileTokenStoreHTTPClient); errRefresh == nil {
+			if refreshed, errRefresh := refreshGeminiAccessToken(tokenMap, httpClient); errRefresh == nil {
 				accessToken = refreshed
 			}
 		}
@@ -266,7 +287,7 @@ func (s *FileTokenStore) hydrateProjectID(path, provider string, metadata map[st
 		return
 	}
 
-	projectID, err := fileTokenStoreFetchProjectIDFn(context.Background(), accessToken, fileTokenStoreHTTPClient)
+	projectID, err := fileTokenStoreFetchProjectIDFn(context.Background(), accessToken, httpClient)
 	if err != nil {
 		return
 	}
@@ -356,6 +377,50 @@ func (s *FileTokenStore) baseDirSnapshot() string {
 	s.dirLock.RLock()
 	defer s.dirLock.RUnlock()
 	return s.baseDir
+}
+
+func (s *FileTokenStore) globalProxyURLSnapshot() string {
+	s.proxyLock.RLock()
+	defer s.proxyLock.RUnlock()
+	return s.proxyURL
+}
+
+// projectHydrationHTTPClient 为 auth 文件加载阶段的补 project_id / 刷新 token 复用现有代理优先级：
+// 先看 auth JSON 自身 proxy_url，再回落到全局 proxy-url；direct/none 也在这里生效。
+func (s *FileTokenStore) projectHydrationHTTPClient(metadata map[string]any) *http.Client {
+	baseClient := fileTokenStoreHTTPClient
+	if baseClient == nil {
+		baseClient = http.DefaultClient
+	}
+	proxyCandidates := []string{metadataProxyURL(metadata), s.globalProxyURLSnapshot()}
+	for _, proxyURL := range proxyCandidates {
+		proxyURL = strings.TrimSpace(proxyURL)
+		if proxyURL == "" {
+			continue
+		}
+		transport, _, errBuild := proxyutil.BuildHTTPTransport(proxyURL)
+		if errBuild != nil {
+			log.WithError(errBuild).Debug("auth filestore: build proxy transport failed during project hydration")
+			continue
+		}
+		if transport == nil {
+			continue
+		}
+		clone := *baseClient
+		clone.Transport = transport
+		return &clone
+	}
+	return baseClient
+}
+
+func metadataProxyURL(metadata map[string]any) string {
+	if metadata == nil {
+		return ""
+	}
+	if proxyURL, ok := metadata["proxy_url"].(string); ok {
+		return strings.TrimSpace(proxyURL)
+	}
+	return ""
 }
 
 func (s *FileTokenStore) lockPath(path string) func() {

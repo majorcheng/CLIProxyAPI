@@ -230,6 +230,9 @@ func (b *Builder) Build() (*Service, error) {
 		if dirSetter, ok := tokenStore.(interface{ SetBaseDir(string) }); ok && b.cfg != nil {
 			dirSetter.SetBaseDir(b.cfg.AuthDir)
 		}
+		if proxySetter, ok := tokenStore.(interface{ SetGlobalProxyURL(string) }); ok && b.cfg != nil {
+			proxySetter.SetGlobalProxyURL(b.cfg.ProxyURL)
+		}
 
 		strategy := ""
 		if b.cfg != nil {

@@ -66,6 +66,9 @@ func (m *Manager) Login(ctx context.Context, provider string, cfg *config.Config
 		if dirSetter, ok := m.store.(interface{ SetBaseDir(string) }); ok {
 			dirSetter.SetBaseDir(cfg.AuthDir)
 		}
+		if proxySetter, ok := m.store.(interface{ SetGlobalProxyURL(string) }); ok {
+			proxySetter.SetGlobalProxyURL(cfg.ProxyURL)
+		}
 	}
 
 	savedPath, err := m.store.Save(ctx, record)

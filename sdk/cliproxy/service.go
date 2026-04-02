@@ -1520,6 +1520,9 @@ func (s *Service) deleteAuthTokenRecord(ctx context.Context, path string) error 
 		if dirSetter, ok := store.(interface{ SetBaseDir(string) }); ok {
 			dirSetter.SetBaseDir(cfg.AuthDir)
 		}
+		if proxySetter, ok := store.(interface{ SetGlobalProxyURL(string) }); ok {
+			proxySetter.SetGlobalProxyURL(cfg.ProxyURL)
+		}
 	}
 	return store.Delete(ctx, path)
 }

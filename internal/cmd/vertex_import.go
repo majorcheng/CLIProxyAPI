@@ -90,6 +90,9 @@ func DoVertexImport(cfg *config.Config, keyPath string) {
 	if setter, ok := store.(interface{ SetBaseDir(string) }); ok {
 		setter.SetBaseDir(cfg.AuthDir)
 	}
+	if setter, ok := store.(interface{ SetGlobalProxyURL(string) }); ok {
+		setter.SetGlobalProxyURL(cfg.ProxyURL)
+	}
 	path, errSave := store.Save(context.Background(), record)
 	if errSave != nil {
 		log.Errorf("vertex-import: save credential failed: %v", errSave)

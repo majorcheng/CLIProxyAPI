@@ -1363,6 +1363,9 @@ func (h *Handler) tokenStoreWithBaseDir() coreauth.Store {
 		if dirSetter, ok := store.(interface{ SetBaseDir(string) }); ok {
 			dirSetter.SetBaseDir(h.cfg.AuthDir)
 		}
+		if proxySetter, ok := store.(interface{ SetGlobalProxyURL(string) }); ok {
+			proxySetter.SetGlobalProxyURL(h.cfg.ProxyURL)
+		}
 	}
 	return store
 }

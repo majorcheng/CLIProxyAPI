@@ -383,7 +383,9 @@ func (e *CodexExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Auth
 	body, _ = sjson.DeleteBytes(body, "safety_identifier")
 	body, _ = sjson.DeleteBytes(body, "stream_options")
 	body, _ = sjson.SetBytes(body, "stream", false)
-	body = normalizeCodexInstructions(body)
+	if !gjson.GetBytes(body, "instructions").Exists() {
+		body, _ = sjson.SetBytes(body, "instructions", "")
+	}
 
 	enc, err := tokenizerForCodexModel(baseModel)
 	if err != nil {
@@ -398,14 +400,6 @@ func (e *CodexExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Auth
 	usageJSON := fmt.Sprintf(`{"response":{"usage":{"input_tokens":%d,"output_tokens":0,"total_tokens":%d}}}`, count, count)
 	translated := sdktranslator.TranslateTokenCount(ctx, to, from, count, []byte(usageJSON))
 	return cliproxyexecutor.Response{Payload: []byte(translated)}, nil
-}
-
-func normalizeCodexInstructions(body []byte) []byte {
-	instructions := gjson.GetBytes(body, "instructions")
-	if !instructions.Exists() || instructions.Type == gjson.Null {
-		body, _ = sjson.SetBytes(body, "instructions", "")
-	}
-	return body
 }
 
 func tokenizerForCodexModel(model string) (tokenizer.Codec, error) {

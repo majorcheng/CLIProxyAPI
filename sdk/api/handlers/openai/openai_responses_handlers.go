@@ -10,7 +10,6 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"io"
 	"net/http"
 
 	"github.com/gin-gonic/gin"
@@ -21,23 +20,6 @@ import (
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
-
-func writeResponsesSSEChunk(w io.Writer, chunk []byte) {
-	if w == nil || len(chunk) == 0 {
-		return
-	}
-	if _, err := w.Write(chunk); err != nil {
-		return
-	}
-	if bytes.HasSuffix(chunk, []byte("\n\n")) {
-		return
-	}
-	suffix := []byte("\n\n")
-	if bytes.HasSuffix(chunk, []byte("\n")) {
-		suffix = []byte("\n")
-	}
-	_, _ = w.Write(suffix)
-}
 
 // OpenAIResponsesAPIHandler contains the handlers for OpenAIResponses API endpoints.
 // It holds a pool of clients to interact with the backend service.
@@ -248,7 +230,11 @@ func (h *OpenAIResponsesAPIHandler) handleStreamingResponse(c *gin.Context, rawJ
 			handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
 
 			// Write first chunk logic (matching forwardResponsesStream)
-			writeResponsesSSEChunk(c.Writer, chunk)
+			if bytes.HasPrefix(chunk, []byte("event:")) {
+				_, _ = c.Writer.Write([]byte("\n"))
+			}
+			_, _ = c.Writer.Write(chunk)
+			_, _ = c.Writer.Write([]byte("\n"))
 			flusher.Flush()
 
 			// Continue
@@ -261,7 +247,11 @@ func (h *OpenAIResponsesAPIHandler) handleStreamingResponse(c *gin.Context, rawJ
 func (h *OpenAIResponsesAPIHandler) forwardResponsesStream(c *gin.Context, flusher http.Flusher, cancel func(error), data <-chan []byte, errs <-chan *interfaces.ErrorMessage) {
 	h.ForwardStream(c, flusher, cancel, data, errs, handlers.StreamForwardOptions{
 		WriteChunk: func(chunk []byte) {
-			writeResponsesSSEChunk(c.Writer, chunk)
+			if bytes.HasPrefix(chunk, []byte("event:")) {
+				_, _ = c.Writer.Write([]byte("\n"))
+			}
+			_, _ = c.Writer.Write(chunk)
+			_, _ = c.Writer.Write([]byte("\n"))
 		},
 		WriteTerminalError: func(errMsg *interfaces.ErrorMessage) {
 			if errMsg == nil {

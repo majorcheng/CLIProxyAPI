@@ -8,7 +8,6 @@ import (
 	"io"
 	"net/http"
 	"path/filepath"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -508,31 +507,6 @@ func (m *Manager) executionModelCandidates(auth *Auth, routeModel string) []stri
 	return []string{resolved}
 }
 
-func (m *Manager) selectionModelForAuth(auth *Auth, routeModel string) string {
-	requestedModel := rewriteModelForAuth(routeModel, auth)
-	if strings.TrimSpace(requestedModel) == "" {
-		requestedModel = strings.TrimSpace(routeModel)
-	}
-	resolvedModel := m.applyOAuthModelAlias(auth, requestedModel)
-	if strings.TrimSpace(resolvedModel) == "" {
-		resolvedModel = requestedModel
-	}
-	return resolvedModel
-}
-
-func (m *Manager) selectionModelKeyForAuth(auth *Auth, routeModel string) string {
-	return canonicalModelKey(m.selectionModelForAuth(auth, routeModel))
-}
-
-func (m *Manager) stateModelForExecution(auth *Auth, routeModel, upstreamModel string, pooled bool) string {
-	stateModel := executionResultModel(routeModel, upstreamModel, pooled)
-	selectionModel := m.selectionModelForAuth(auth, routeModel)
-	if canonicalModelKey(selectionModel) == canonicalModelKey(upstreamModel) && strings.TrimSpace(selectionModel) != "" {
-		return strings.TrimSpace(upstreamModel)
-	}
-	return stateModel
-}
-
 func executionResultModel(routeModel, upstreamModel string, pooled bool) string {
 	if pooled {
 		if resolved := strings.TrimSpace(upstreamModel); resolved != "" {
@@ -545,14 +519,14 @@ func executionResultModel(routeModel, upstreamModel string, pooled bool) string 
 	return strings.TrimSpace(upstreamModel)
 }
 
-func (m *Manager) filterExecutionModels(auth *Auth, routeModel string, candidates []string, pooled bool) []string {
+func filterExecutionModels(auth *Auth, routeModel string, candidates []string, pooled bool) []string {
 	if len(candidates) == 0 {
 		return nil
 	}
 	now := time.Now()
 	out := make([]string, 0, len(candidates))
 	for _, upstreamModel := range candidates {
-		stateModel := m.stateModelForExecution(auth, routeModel, upstreamModel, pooled)
+		stateModel := executionResultModel(routeModel, upstreamModel, pooled)
 		blocked, _, _ := isAuthBlockedForModel(auth, stateModel, now)
 		if blocked {
 			continue
@@ -565,89 +539,12 @@ func (m *Manager) filterExecutionModels(auth *Auth, routeModel string, candidate
 func (m *Manager) preparedExecutionModels(auth *Auth, routeModel string) ([]string, bool) {
 	candidates := m.executionModelCandidates(auth, routeModel)
 	pooled := len(candidates) > 1
-	return m.filterExecutionModels(auth, routeModel, candidates, pooled), pooled
+	return filterExecutionModels(auth, routeModel, candidates, pooled), pooled
 }
 
 func (m *Manager) prepareExecutionModels(auth *Auth, routeModel string) []string {
 	models, _ := m.preparedExecutionModels(auth, routeModel)
 	return models
-}
-
-func (m *Manager) availableAuthsForRouteModel(auths []*Auth, provider, routeModel string, now time.Time) ([]*Auth, error) {
-	if len(auths) == 0 {
-		return nil, &Error{Code: "auth_not_found", Message: "no auth candidates"}
-	}
-
-	availableByPriority := make(map[int][]*Auth)
-	cooldownCount := 0
-	var earliest time.Time
-	for _, candidate := range auths {
-		checkModel := m.selectionModelForAuth(candidate, routeModel)
-		blocked, reason, next := isAuthBlockedForModel(candidate, checkModel, now)
-		if !blocked {
-			priority := authPriority(candidate)
-			availableByPriority[priority] = append(availableByPriority[priority], candidate)
-			continue
-		}
-		if reason == blockReasonCooldown {
-			cooldownCount++
-			if !next.IsZero() && (earliest.IsZero() || next.Before(earliest)) {
-				earliest = next
-			}
-		}
-	}
-
-	if len(availableByPriority) == 0 {
-		if cooldownCount == len(auths) && !earliest.IsZero() {
-			providerForError := provider
-			if providerForError == "mixed" {
-				providerForError = ""
-			}
-			resetIn := earliest.Sub(now)
-			if resetIn < 0 {
-				resetIn = 0
-			}
-			return nil, newModelCooldownError(routeModel, providerForError, resetIn)
-		}
-		return nil, &Error{Code: "auth_unavailable", Message: "no auth available"}
-	}
-
-	bestPriority := 0
-	found := false
-	for priority := range availableByPriority {
-		if !found || priority > bestPriority {
-			bestPriority = priority
-			found = true
-		}
-	}
-
-	available := availableByPriority[bestPriority]
-	if len(available) > 1 {
-		sort.Slice(available, func(i, j int) bool { return available[i].ID < available[j].ID })
-	}
-	return available, nil
-}
-
-func (m *Manager) authSupportsRouteModel(registryRef *registry.ModelRegistry, auth *Auth, routeModel string) bool {
-	if registryRef == nil || auth == nil {
-		return true
-	}
-	routeKey := canonicalModelKey(routeModel)
-	if routeKey == "" {
-		return true
-	}
-	if registryRef.ClientSupportsModel(auth.ID, routeKey) {
-		return true
-	}
-	selectionKey := m.selectionModelKeyForAuth(auth, routeModel)
-	return selectionKey != "" && selectionKey != routeKey && registryRef.ClientSupportsModel(auth.ID, selectionKey)
-}
-
-func selectionArgForSelector(selector Selector, routeModel string) string {
-	if isBuiltInSelector(selector) {
-		return ""
-	}
-	return routeModel
 }
 
 func discardStreamChunks(ch <-chan cliproxyexecutor.StreamChunk) {
@@ -838,7 +735,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 	}
 	var lastErr error
 	for idx, execModel := range execModels {
-		resultModel := m.stateModelForExecution(auth, routeModel, execModel, pooled)
+		resultModel := executionResultModel(routeModel, execModel, pooled)
 		execReq := req
 		execReq.Model = execModel
 		audit.SetAttempt(ctx, provider, execModel, auth.ID, auth.Label, auth.FileName, auditAuthPath(auth))
@@ -1419,7 +1316,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 		attempted[auth.ID] = struct{}{}
 		var authErr error
 		for _, upstreamModel := range models {
-			resultModel := m.stateModelForExecution(auth, routeModel, upstreamModel, pooled)
+			resultModel := executionResultModel(routeModel, upstreamModel, pooled)
 			execReq := req
 			execReq.Model = upstreamModel
 			audit.SetAttempt(execCtx, provider, upstreamModel, auth.ID, auth.Label, auth.FileName, auditAuthPath(auth))
@@ -1531,7 +1428,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 		attempted[auth.ID] = struct{}{}
 		var authErr error
 		for _, upstreamModel := range models {
-			resultModel := m.stateModelForExecution(auth, routeModel, upstreamModel, pooled)
+			resultModel := executionResultModel(routeModel, upstreamModel, pooled)
 			execReq := req
 			execReq.Model = upstreamModel
 			audit.SetAttempt(execCtx, provider, upstreamModel, auth.ID, auth.Label, auth.FileName, auditAuthPath(auth))
@@ -2997,13 +2894,6 @@ func shouldRetrySchedulerPick(err error) bool {
 	return authErr.Code == "auth_not_found" || authErr.Code == "auth_unavailable"
 }
 
-func (m *Manager) routeAwareSelectionRequired(auth *Auth, routeModel string) bool {
-	if auth == nil || strings.TrimSpace(routeModel) == "" {
-		return false
-	}
-	return m.selectionModelKeyForAuth(auth, routeModel) != canonicalModelKey(routeModel)
-}
-
 func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Auth, ProviderExecutor, error) {
 	pinnedAuthID := pinnedAuthIDFromMetadata(opts.Metadata)
 
@@ -3036,7 +2926,7 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 		if _, used := tried[candidate.ID]; used {
 			continue
 		}
-		if modelKey != "" && !m.authSupportsRouteModel(registryRef, candidate, model) {
+		if modelKey != "" && registryRef != nil && !registryRef.ClientSupportsModel(candidate.ID, modelKey) {
 			continue
 		}
 		candidates = append(candidates, candidate)
@@ -3045,12 +2935,7 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 		m.mu.RUnlock()
 		return nil, nil, &Error{Code: "auth_not_found", Message: "no auth available"}
 	}
-	available, errAvailable := m.availableAuthsForRouteModel(candidates, provider, model, time.Now())
-	if errAvailable != nil {
-		m.mu.RUnlock()
-		return nil, nil, errAvailable
-	}
-	selected, errPick := m.selector.Pick(ctx, provider, selectionArgForSelector(m.selector, model), opts, available)
+	selected, errPick := m.selector.Pick(ctx, provider, model, opts, candidates)
 	if errPick != nil {
 		m.mu.RUnlock()
 		return nil, nil, errPick
@@ -3067,22 +2952,6 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 func (m *Manager) pickNext(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Auth, ProviderExecutor, error) {
 	if !m.useSchedulerFastPath() {
 		return m.pickNextLegacy(ctx, provider, model, opts, tried)
-	}
-	if strings.TrimSpace(model) != "" {
-		m.mu.RLock()
-		for _, candidate := range m.auths {
-			if candidate == nil || candidate.Provider != provider || candidate.Disabled {
-				continue
-			}
-			if _, used := tried[candidate.ID]; used {
-				continue
-			}
-			if m.routeAwareSelectionRequired(candidate, model) {
-				m.mu.RUnlock()
-				return m.pickNextLegacy(ctx, provider, model, opts, tried)
-			}
-		}
-		m.mu.RUnlock()
 	}
 	executor, okExecutor := m.Executor(provider)
 	if !okExecutor {
@@ -3151,7 +3020,7 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 		if _, ok := m.executors[providerKey]; !ok {
 			continue
 		}
-		if modelKey != "" && !m.authSupportsRouteModel(registryRef, candidate, model) {
+		if modelKey != "" && registryRef != nil && !registryRef.ClientSupportsModel(candidate.ID, modelKey) {
 			continue
 		}
 		candidates = append(candidates, candidate)
@@ -3160,12 +3029,7 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 		m.mu.RUnlock()
 		return nil, nil, "", &Error{Code: "auth_not_found", Message: "no auth available"}
 	}
-	available, errAvailable := m.availableAuthsForRouteModel(candidates, "mixed", model, time.Now())
-	if errAvailable != nil {
-		m.mu.RUnlock()
-		return nil, nil, "", errAvailable
-	}
-	selected, errPick := m.selector.Pick(ctx, "mixed", selectionArgForSelector(m.selector, model), opts, available)
+	selected, errPick := m.selector.Pick(ctx, "mixed", model, opts, candidates)
 	if errPick != nil {
 		m.mu.RUnlock()
 		return nil, nil, "", errPick
@@ -3208,29 +3072,6 @@ func (m *Manager) pickNextMixed(ctx context.Context, providers []string, model s
 	}
 	if len(eligibleProviders) == 0 {
 		return nil, nil, "", &Error{Code: "auth_not_found", Message: "no auth available"}
-	}
-	if strings.TrimSpace(model) != "" {
-		providerSet := make(map[string]struct{}, len(eligibleProviders))
-		for _, providerKey := range eligibleProviders {
-			providerSet[providerKey] = struct{}{}
-		}
-		m.mu.RLock()
-		for _, candidate := range m.auths {
-			if candidate == nil || candidate.Disabled {
-				continue
-			}
-			if _, ok := providerSet[strings.TrimSpace(strings.ToLower(candidate.Provider))]; !ok {
-				continue
-			}
-			if _, used := tried[candidate.ID]; used {
-				continue
-			}
-			if m.routeAwareSelectionRequired(candidate, model) {
-				m.mu.RUnlock()
-				return m.pickNextMixedLegacy(ctx, providers, model, opts, tried)
-			}
-		}
-		m.mu.RUnlock()
 	}
 
 	selected, providerKey, errPick := m.scheduler.pickMixed(ctx, eligibleProviders, model, opts, tried)

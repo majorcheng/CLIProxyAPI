@@ -1317,25 +1317,12 @@ func (m *modelScheduler) highestReadyPriorityLocked(preferWebsocket bool, predic
 	if m == nil {
 		return 0, false
 	}
-	if preferWebsocket {
-		// downstream 是 websocket 时，优先挑真正支持 websocket 的凭证；
-		// 即使它们处在更低的 priority，也比高优先级的 HTTP-only 凭证更符合当前传输语义。
-		for _, priority := range m.priorityOrder {
-			bucket := m.readyByPriority[priority]
-			if bucket == nil {
-				continue
-			}
-			if bucket.ws.pickFirst(predicate) != nil {
-				return priority, true
-			}
-		}
-	}
 	for _, priority := range m.priorityOrder {
 		bucket := m.readyByPriority[priority]
 		if bucket == nil {
 			continue
 		}
-		if bucket.all.pickFirst(predicate) != nil {
+		if bucketHasMatchingReadyEntry(bucket, preferWebsocket, predicate) {
 			return priority, true
 		}
 	}

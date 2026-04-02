@@ -380,17 +380,8 @@ func ConvertCodexResponseToOpenAINonStream(_ context.Context, _ string, original
 	if statusResult := responseResult.Get("status"); statusResult.Exists() {
 		status := statusResult.String()
 		if status == "completed" {
-			finishReason := "stop"
-			if outputResult.IsArray() {
-				for _, outputItem := range outputResult.Array() {
-					if outputItem.Get("type").String() == "function_call" {
-						finishReason = "tool_calls"
-						break
-					}
-				}
-			}
-			template, _ = sjson.Set(template, "choices.0.finish_reason", finishReason)
-			template, _ = sjson.Set(template, "choices.0.native_finish_reason", finishReason)
+			template, _ = sjson.Set(template, "choices.0.finish_reason", "stop")
+			template, _ = sjson.Set(template, "choices.0.native_finish_reason", "stop")
 		}
 	}
 

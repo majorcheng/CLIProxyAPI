@@ -90,3 +90,40 @@ func TestConvertCodexResponseToOpenAI_ToolCallArgumentsDeltaOmitsNullContentFiel
 		t.Fatalf("expected tool call arguments delta to exist, got %s", out[0])
 	}
 }
+
+func TestConvertCodexResponseToOpenAINonStream_UsesToolCallsFinishReason(t *testing.T) {
+	out := ConvertCodexResponseToOpenAINonStream(
+		context.Background(),
+		"gpt-5.4",
+		nil,
+		nil,
+		[]byte(`{
+			"type":"response.completed",
+			"response":{
+				"id":"resp_123",
+				"created_at":1700000000,
+				"model":"gpt-5.4",
+				"status":"completed",
+				"output":[
+					{
+						"type":"function_call",
+						"call_id":"call_1",
+						"name":"lookup_weather",
+						"arguments":"{\"city\":\"Hong Kong\"}"
+					}
+				]
+			}
+		}`),
+		nil,
+	)
+
+	if out == "" {
+		t.Fatal("expected non-stream output")
+	}
+	if got := gjson.Get(out, "choices.0.finish_reason").String(); got != "tool_calls" {
+		t.Fatalf("finish_reason = %q, want %q. output=%s", got, "tool_calls", out)
+	}
+	if got := gjson.Get(out, "choices.0.native_finish_reason").String(); got != "tool_calls" {
+		t.Fatalf("native_finish_reason = %q, want %q. output=%s", got, "tool_calls", out)
+	}
+}

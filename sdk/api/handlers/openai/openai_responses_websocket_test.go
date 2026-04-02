@@ -545,6 +545,63 @@ func TestRecordResponsesWebsocketToolCallsFromPayloadWithCache(t *testing.T) {
 	}
 }
 
+func TestResponsesWebsocketToolRepairConcurrentCacheAccess(t *testing.T) {
+	outputCache := newWebsocketToolOutputCache(time.Minute, 32)
+	callCache := newWebsocketToolOutputCache(time.Minute, 32)
+	sessionKey := "session-concurrent"
+
+	const workers = 16
+	const iterations = 200
+
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func(worker int) {
+			defer wg.Done()
+			<-start
+			for j := 0; j < iterations; j++ {
+				callID := fmt.Sprintf("call-%d", j%8)
+				callPayload := []byte(fmt.Sprintf(`{"type":"function_call","call_id":"%s","name":"tool_%d"}`, callID, worker))
+				outputPayload := []byte(fmt.Sprintf(`{"type":"function_call_output","call_id":"%s","output":"ok"}`, callID))
+				requestPayload := []byte(fmt.Sprintf(`{"input":[{"type":"function_call_output","call_id":"%s","output":"ok"},{"type":"message","id":"msg-%d-%d"}]}`, callID, worker, j))
+
+				callCache.record(sessionKey, callID, callPayload)
+				outputCache.record(sessionKey, callID, outputPayload)
+
+				repaired := repairResponsesWebsocketToolCallsWithCaches(outputCache, callCache, sessionKey, requestPayload)
+				input := gjson.GetBytes(repaired, "input").Array()
+				if len(input) == 0 {
+					t.Errorf("repaired input unexpectedly empty: %s", repaired)
+					return
+				}
+
+				if cachedCall, ok := callCache.get(sessionKey, callID); !ok || gjson.GetBytes(cachedCall, "call_id").String() != callID {
+					t.Errorf("cached call missing for %s", callID)
+					return
+				}
+				if cachedOutput, ok := outputCache.get(sessionKey, callID); !ok || gjson.GetBytes(cachedOutput, "call_id").String() != callID {
+					t.Errorf("cached output missing for %s", callID)
+					return
+				}
+			}
+		}(i)
+	}
+	close(start)
+
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("concurrent websocket tool repair cache access timed out")
+	}
+}
+
 func TestForwardResponsesWebsocketPreservesCompletedEvent(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 

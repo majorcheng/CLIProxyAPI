@@ -376,6 +376,22 @@ func TestApplyCodexHeadersPassesThroughClientOriginatorWhileKeepingIdentityMetad
 	}
 }
 
+func TestApplyCodexHeadersPassesThroughBetaFeaturesHeader(t *testing.T) {
+	req, err := http.NewRequest(http.MethodPost, "https://example.com/responses", nil)
+	if err != nil {
+		t.Fatalf("NewRequest() error = %v", err)
+	}
+	req = req.WithContext(contextWithGinHeaders(map[string]string{
+		"X-Codex-Beta-Features": "tool-streaming,v2",
+	}))
+
+	applyCodexHeaders(req, nil, "oauth-token", true, nil)
+
+	if got := req.Header.Get("X-Codex-Beta-Features"); got != "tool-streaming,v2" {
+		t.Fatalf("X-Codex-Beta-Features = %q, want %q", got, "tool-streaming,v2")
+	}
+}
+
 func TestApplyCodexHeadersGeneratesTurnMetadataByDefault(t *testing.T) {
 	req, err := http.NewRequest(http.MethodPost, "https://example.com/responses", nil)
 	if err != nil {

@@ -427,6 +427,47 @@ func TestScanAuthMaintenanceCandidates_StatusMessageUsageLimitJSONQueuesDelete(t
 	}
 }
 
+func TestScanAuthMaintenanceCandidates_429DoesNotQueueDeleteWithoutExplicitQuotaDeleteConfig(t *testing.T) {
+	authDir := t.TempDir()
+	service := &Service{
+		cfg: &config.Config{
+			AuthDir: authDir,
+			AuthMaintenance: config.AuthMaintenanceConfig{
+				Enable:               true,
+				DeleteStatusCodes:    []int{401, 402, 403, 404},
+				DeleteQuotaExceeded:  false,
+				QuotaStrikeThreshold: 6,
+			},
+		},
+		coreManager: coreauth.NewManager(nil, nil, nil),
+	}
+
+	filePath := filepath.Join(authDir, "status-json-429-default-safe.json")
+	auth := &coreauth.Auth{
+		ID:         "status-json-429-default-safe",
+		FileName:   filepath.Base(filePath),
+		Provider:   "codex",
+		Status:     coreauth.StatusError,
+		LastError:  &coreauth.Error{HTTPStatus: 429, Message: "quota"},
+		Attributes: map[string]string{"path": filePath},
+		Quota: coreauth.QuotaState{
+			Exceeded:    true,
+			Reason:      "quota",
+			StrikeCount: 99,
+		},
+		UpdatedAt:   timeNowForTest(),
+		Unavailable: true,
+	}
+	if _, err := service.coreManager.Register(context.Background(), auth); err != nil {
+		t.Fatalf("failed to register auth: %v", err)
+	}
+
+	candidates := service.scanAuthMaintenanceCandidates(timeNowForTest(), service.cfg.AuthMaintenance, authDir)
+	if len(candidates) != 0 {
+		t.Fatalf("expected no maintenance candidate for 429 when config does not explicitly enable quota deletion, got %#v", candidates)
+	}
+}
+
 func TestDeleteAuthMaintenanceCandidate_RemovesFileAndDisablesAllAuths(t *testing.T) {
 	authDir := t.TempDir()
 	filePath := filepath.Join(authDir, "shared.json")

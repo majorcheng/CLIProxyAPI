@@ -66,6 +66,8 @@ pprof:
 #   enable: true
 #   scan-interval-seconds: 30
 #   delete-interval-seconds: 5
+#   # 如果省略 delete-status-codes，默认只会把 401/402/403/404 视为立即删除信号。
+#   # 429（包括 team/free 周限这类可恢复额度状态）不会因为缺省配置被自动删除。
 #   # 这里列出的任意状态码都会被视为“立即删除”信号。
 #   # 例如：如果包含 429，则一次 429 响应就足以立刻禁用该 auth，
 #   # 并将文件加入删除队列。quota-strike-threshold 不会延迟这条路径。
@@ -73,6 +75,7 @@ pprof:
 #   # 为重复额度失败启用第二条删除路径。
 #   # 这主要适用于 delete-status-codes 中不包含 429，且你希望 429
 #   # 不是立刻删除，而是在多次命中后再删除的场景。
+#   # 如果省略该项，默认是 false；也就是说 429 不会仅靠默认配置累计删除。
 #   delete-quota-exceeded: true
 #   # 上述 quota-exceeded 路径所需的最小 429 次数。
 #   quota-strike-threshold: 6

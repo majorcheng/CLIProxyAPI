@@ -645,8 +645,8 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	cfg.SharedExitPriorityZeroOAuthNetworkJitterFallback = false
 	cfg.AuthMaintenance.ScanIntervalSeconds = 30
 	cfg.AuthMaintenance.DeleteIntervalSeconds = 5
-	cfg.AuthMaintenance.DeleteStatusCodes = []int{401, 402, 403, 404, 429}
-	cfg.AuthMaintenance.DeleteQuotaExceeded = true
+	cfg.AuthMaintenance.DeleteStatusCodes = []int{401, 402, 403, 404}
+	cfg.AuthMaintenance.DeleteQuotaExceeded = false
 	cfg.AuthMaintenance.QuotaStrikeThreshold = 6
 	cfg.Pprof.Enable = false
 	cfg.Pprof.Addr = DefaultPprofAddr

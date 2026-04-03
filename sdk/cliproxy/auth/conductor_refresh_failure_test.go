@@ -7,12 +7,14 @@ import (
 	"testing"
 	"time"
 
+	internalconfig "github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 )
 
 type refreshFailureTestExecutor struct {
 	provider string
 	err      error
+	after    func(*Auth)
 }
 
 func (e refreshFailureTestExecutor) Identifier() string { return e.provider }
@@ -26,6 +28,9 @@ func (e refreshFailureTestExecutor) ExecuteStream(context.Context, *Auth, clipro
 }
 
 func (e refreshFailureTestExecutor) Refresh(_ context.Context, auth *Auth) (*Auth, error) {
+	if e.after != nil {
+		e.after(auth)
+	}
 	return auth, e.err
 }
 
@@ -147,5 +152,56 @@ func TestManagerRefreshAuth_DoesNotMarkTransientRefreshStatusForMaintenance(t *t
 	}
 	if updated.Unavailable {
 		t.Fatal("expected transient refresh failure to avoid blocking scheduler")
+	}
+}
+
+func TestManagerTriggerCodexInitialRefreshOnLoadIfNeeded_RefreshesFreshLookingTokenOnce(t *testing.T) {
+	ctx := context.Background()
+	calls := make(chan string, 2)
+	manager := NewManager(nil, nil, nil)
+	manager.SetConfig(&internalconfig.Config{
+		SDKConfig: internalconfig.SDKConfig{
+			CodexInitialRefreshOnLoad: true,
+		},
+	})
+	manager.RegisterExecutor(refreshFailureTestExecutor{
+		provider: "codex",
+		after: func(auth *Auth) {
+			if auth != nil {
+				calls <- auth.ID
+			}
+		},
+	})
+
+	now := time.Date(2026, 4, 1, 12, 0, 0, 0, time.UTC)
+	auth := &Auth{
+		ID:       "initial-force-refresh",
+		Provider: "codex",
+		Status:   StatusActive,
+		Metadata: map[string]any{
+			"refresh_token": "refresh-token",
+			"last_refresh":  now.Add(-time.Minute).Format(time.RFC3339),
+			"expired":       now.Add(30 * 24 * time.Hour).Format(time.RFC3339),
+		},
+	}
+	if _, err := manager.Register(ctx, auth); err != nil {
+		t.Fatalf("register auth: %v", err)
+	}
+
+	manager.TriggerCodexInitialRefreshOnLoadIfNeeded(ctx, auth.ID)
+	select {
+	case got := <-calls:
+		if got != auth.ID {
+			t.Fatalf("initial refresh auth id = %q, want %q", got, auth.ID)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected initial refresh trigger to call executor")
+	}
+
+	manager.TriggerCodexInitialRefreshOnLoadIfNeeded(ctx, auth.ID)
+	select {
+	case got := <-calls:
+		t.Fatalf("unexpected second initial refresh for %q", got)
+	case <-time.After(150 * time.Millisecond):
 	}
 }

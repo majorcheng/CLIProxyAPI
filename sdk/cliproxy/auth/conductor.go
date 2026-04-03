@@ -3,6 +3,8 @@ package auth
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io"
@@ -184,6 +186,10 @@ type Manager struct {
 	// Auto refresh state
 	refreshCancel    context.CancelFunc
 	refreshSemaphore chan struct{}
+	// codexInitialRefreshSeen 只记录当前 manager 生命周期内已经触发过
+	// “首读强制刷新”的 Codex token，避免同一 refresh_token 在失败回退后
+	// 又被重复当成“首次读取”。
+	codexInitialRefreshSeen map[string]struct{}
 
 	// Async persistence state for high-frequency runtime updates.
 	persistStartOnce sync.Once
@@ -201,15 +207,16 @@ func NewManager(store Store, selector Selector, hook Hook) *Manager {
 		hook = NoopHook{}
 	}
 	manager := &Manager{
-		store:            store,
-		executors:        make(map[string]ProviderExecutor),
-		selector:         selector,
-		blockedRequests:  newBlockedRequestLRU(1000),
-		auths:            make(map[string]*Auth),
-		providerOffsets:  make(map[string]int),
-		inflightPerAuth:  make(map[string]int),
-		modelPoolOffsets: make(map[string]int),
-		refreshSemaphore: make(chan struct{}, refreshMaxConcurrency),
+		store:                   store,
+		executors:               make(map[string]ProviderExecutor),
+		selector:                selector,
+		blockedRequests:         newBlockedRequestLRU(1000),
+		auths:                   make(map[string]*Auth),
+		providerOffsets:         make(map[string]int),
+		inflightPerAuth:         make(map[string]int),
+		modelPoolOffsets:        make(map[string]int),
+		refreshSemaphore:        make(chan struct{}, refreshMaxConcurrency),
+		codexInitialRefreshSeen: make(map[string]struct{}),
 	}
 	manager.hookValue.Store(hookState{hook: hook})
 	// atomic.Value requires non-nil initial value.
@@ -344,6 +351,14 @@ func (m *Manager) sharedExitPriorityZeroOAuthNetworkJitterFallbackEnabled() bool
 	}
 	cfg, _ := m.runtimeConfig.Load().(*internalconfig.Config)
 	return sharedExitPriorityZeroOAuthNetworkJitterFallbackEnabled(cfg)
+}
+
+func (m *Manager) codexInitialRefreshOnLoadEnabled() bool {
+	if m == nil {
+		return false
+	}
+	cfg, _ := m.runtimeConfig.Load().(*internalconfig.Config)
+	return cfg != nil && cfg.CodexInitialRefreshOnLoad
 }
 
 func (m *Manager) lookupAPIKeyUpstreamModel(authID, requestedModel string) string {
@@ -3187,6 +3202,24 @@ func (m *Manager) StartAutoRefresh(parent context.Context, interval time.Duratio
 	}()
 }
 
+// TriggerCodexInitialRefreshOnLoadIfNeeded 会在 auth 首次被当前 manager 读到后，
+// 按配置决定是否立即发起一次后台 refresh。
+// 该触发只针对 Codex 且要求 refresh_token 非空，并且同一 refresh_token
+// 在当前 manager 生命周期内最多只会触发一次。
+func (m *Manager) TriggerCodexInitialRefreshOnLoadIfNeeded(ctx context.Context, id string) {
+	if m == nil || strings.TrimSpace(id) == "" {
+		return
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	now := time.Now()
+	if !m.markCodexInitialRefreshPending(id, now) {
+		return
+	}
+	go m.refreshAuthWithLimit(ctx, id)
+}
+
 // StopAutoRefresh cancels the background refresh loop, if running.
 func (m *Manager) StopAutoRefresh() {
 	if m.refreshCancel != nil {
@@ -3293,7 +3326,7 @@ func (m *Manager) shouldRefresh(a *Auth, now time.Time) bool {
 	// 只有 token JSON 明确表明需要刷新（已过期、临近过期、last_refresh 足够旧）才触发。
 	// 若缺少 refresh_token 或缺少关键时间字段，则默认不主动打上游，避免刚启动/刚入池就做探测式 refresh。
 	if provider == "codex" {
-		return shouldRefreshCodexFromTokenJSON(a, now, lastRefresh, expiry, hasExpiry)
+		return m.shouldRefreshCodexFromTokenJSON(a, now, lastRefresh, expiry, hasExpiry)
 	}
 
 	if interval := authPreferredInterval(a); interval > 0 {
@@ -3330,9 +3363,12 @@ func (m *Manager) shouldRefresh(a *Auth, now time.Time) bool {
 	return true
 }
 
-func shouldRefreshCodexFromTokenJSON(a *Auth, now, lastRefresh, expiry time.Time, hasExpiry bool) bool {
+func (m *Manager) shouldRefreshCodexFromTokenJSON(a *Auth, now, lastRefresh, expiry time.Time, hasExpiry bool) bool {
 	if !authHasRefreshToken(a) {
 		return false
+	}
+	if m.shouldTriggerCodexInitialRefreshOnLoad(a) {
+		return true
 	}
 
 	if interval := authPreferredInterval(a); interval > 0 {
@@ -3375,6 +3411,44 @@ func authHasRefreshToken(a *Auth) bool {
 	}
 	refreshToken, _ := a.Metadata["refresh_token"].(string)
 	return strings.TrimSpace(refreshToken) != ""
+}
+
+// shouldTriggerCodexInitialRefreshOnLoad 只在显式开启配置时，
+// 对“首次读到且 refresh_token 非空”的 Codex auth 放开一次强制刷新。
+// 这个“一次”只在当前 manager 生命周期内生效，不落盘；
+// 首刷完成后，后续仍回到常规保守门控。
+func (m *Manager) shouldTriggerCodexInitialRefreshOnLoad(a *Auth) bool {
+	if m == nil || a == nil || !m.codexInitialRefreshOnLoadEnabled() {
+		return false
+	}
+	attemptKey, ok := codexInitialRefreshAttemptKey(a)
+	if !ok {
+		return false
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, seen := m.codexInitialRefreshSeen[attemptKey]; seen {
+		return false
+	}
+	m.codexInitialRefreshSeen[attemptKey] = struct{}{}
+	return true
+}
+
+func codexInitialRefreshAttemptKey(a *Auth) (string, bool) {
+	if a == nil {
+		return "", false
+	}
+	authID := strings.TrimSpace(a.ID)
+	if authID == "" || len(a.Metadata) == 0 {
+		return "", false
+	}
+	refreshToken, _ := a.Metadata["refresh_token"].(string)
+	refreshToken = strings.TrimSpace(refreshToken)
+	if refreshToken == "" {
+		return "", false
+	}
+	sum := sha256.Sum256([]byte(refreshToken))
+	return authID + ":" + hex.EncodeToString(sum[:]), true
 }
 
 func authPreferredInterval(a *Auth) time.Duration {
@@ -3537,6 +3611,32 @@ func (m *Manager) markRefreshPending(id string, now time.Time) bool {
 	if !auth.NextRefreshAfter.IsZero() && now.Before(auth.NextRefreshAfter) {
 		return false
 	}
+	auth.NextRefreshAfter = now.Add(refreshPendingBackoff)
+	m.auths[id] = auth
+	return true
+}
+
+func (m *Manager) markCodexInitialRefreshPending(id string, now time.Time) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	auth, ok := m.auths[id]
+	if !ok || auth == nil || auth.Disabled {
+		return false
+	}
+	if !m.codexInitialRefreshOnLoadEnabled() || !strings.EqualFold(strings.TrimSpace(auth.Provider), "codex") {
+		return false
+	}
+	attemptKey, ok := codexInitialRefreshAttemptKey(auth)
+	if !ok {
+		return false
+	}
+	if _, seen := m.codexInitialRefreshSeen[attemptKey]; seen {
+		return false
+	}
+	if !auth.NextRefreshAfter.IsZero() && now.Before(auth.NextRefreshAfter) {
+		return false
+	}
+	m.codexInitialRefreshSeen[attemptKey] = struct{}{}
 	auth.NextRefreshAfter = now.Add(refreshPendingBackoff)
 	m.auths[id] = auth
 	return true

@@ -627,6 +627,10 @@ func (s *Service) applyCoreAuthAddOrUpdate(ctx context.Context, auth *coreauth.A
 		auth = current
 	}
 
+	// 对启用了“首读强刷”的 Codex token，在 auth 首次进入 manager 后
+	// 立即发起一次后台 refresh，避免只依赖下一轮周期 auto-refresh。
+	s.coreManager.TriggerCodexInitialRefreshOnLoadIfNeeded(ctx, auth.ID)
+
 	// Register models after auth is updated in coreManager.
 	// This operation may block on network calls, but the auth configuration
 	// is already effective at this point.

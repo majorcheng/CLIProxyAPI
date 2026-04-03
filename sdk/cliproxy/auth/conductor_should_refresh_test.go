@@ -4,12 +4,13 @@ import (
 	"context"
 	"testing"
 	"time"
+
+	internalconfig "github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 )
 
 func TestManagerShouldRefresh_CodexUsesConservativeTokenJSONGate(t *testing.T) {
 	t.Parallel()
 
-	manager := NewManager(nil, nil, nil)
 	now := time.Date(2026, 4, 1, 12, 0, 0, 0, time.UTC)
 	lead := 5 * 24 * time.Hour
 
@@ -142,10 +143,40 @@ func TestManagerShouldRefresh_CodexUsesConservativeTokenJSONGate(t *testing.T) {
 		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
+			manager := NewManager(nil, nil, nil)
 			if got := manager.shouldRefresh(tt.auth, now); got != tt.want {
 				t.Fatalf("shouldRefresh() = %v, want %v", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestManagerShouldRefresh_CodexInitialRefreshOnLoadForcesFreshLookingTokenOnce(t *testing.T) {
+	t.Parallel()
+
+	manager := NewManager(nil, nil, nil)
+	manager.SetConfig(&internalconfig.Config{
+		SDKConfig: internalconfig.SDKConfig{
+			CodexInitialRefreshOnLoad: true,
+		},
+	})
+	now := time.Date(2026, 4, 1, 12, 0, 0, 0, time.UTC)
+	auth := &Auth{
+		ID:       "codex-initial-refresh-once",
+		Provider: "codex",
+		Runtime:  staticRefreshLeadRuntime(5 * 24 * time.Hour),
+		Metadata: map[string]any{
+			"refresh_token": "refresh-token",
+			"last_refresh":  now.Add(-time.Minute).Format(time.RFC3339),
+			"expired":       now.Add(30 * 24 * time.Hour).Format(time.RFC3339),
+		},
+	}
+
+	if got := manager.shouldRefresh(auth, now); !got {
+		t.Fatal("shouldRefresh() = false, want initial forced refresh when config enabled")
+	}
+	if got := manager.shouldRefresh(auth, now.Add(time.Hour)); got {
+		t.Fatal("shouldRefresh() = true after initial forced refresh, want one-shot behavior within the same manager lifecycle")
 	}
 }
 
@@ -188,6 +219,45 @@ func TestManagerCollectRefreshTargets_SkipsCodexWithUnknownTokenTiming(t *testin
 	}
 	if !containsRefreshTarget(targets, "claude-unknown") {
 		t.Fatalf("collectRefreshTargets() = %v, want claude account to retain legacy behavior", targets)
+	}
+}
+
+func TestManagerCollectRefreshTargets_CodexInitialRefreshOnLoadSchedulesFreshLookingTokenOnce(t *testing.T) {
+	t.Parallel()
+
+	manager := NewManager(nil, nil, nil)
+	manager.SetConfig(&internalconfig.Config{
+		SDKConfig: internalconfig.SDKConfig{
+			CodexInitialRefreshOnLoad: true,
+		},
+	})
+	manager.RegisterExecutor(refreshFailureTestExecutor{provider: "codex"})
+	now := time.Date(2026, 4, 1, 12, 0, 0, 0, time.UTC)
+
+	ctx := context.Background()
+	if _, err := manager.Register(ctx, &Auth{
+		ID:       "codex-initial-unknown",
+		Provider: "codex",
+		Runtime:  staticRefreshLeadRuntime(5 * 24 * time.Hour),
+		Status:   StatusActive,
+		Metadata: map[string]any{
+			"email":         "codex@example.com",
+			"refresh_token": "refresh-token",
+			"last_refresh":  now.Add(-time.Minute).Format(time.RFC3339),
+			"expired":       now.Add(30 * 24 * time.Hour).Format(time.RFC3339),
+		},
+	}); err != nil {
+		t.Fatalf("register codex auth: %v", err)
+	}
+
+	first := manager.collectRefreshTargets(now)
+	if !containsRefreshTarget(first, "codex-initial-unknown") {
+		t.Fatalf("collectRefreshTargets() = %v, want initial forced refresh target", first)
+	}
+
+	second := manager.collectRefreshTargets(now.Add(time.Hour))
+	if containsRefreshTarget(second, "codex-initial-unknown") {
+		t.Fatalf("collectRefreshTargets() = %v, want one-shot forced refresh scheduling", second)
 	}
 }
 

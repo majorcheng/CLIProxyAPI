@@ -9,6 +9,12 @@ type SDKConfig struct {
 	// ProxyURL is the URL of an optional proxy server to use for outbound requests.
 	ProxyURL string `yaml:"proxy-url" json:"proxy-url"`
 
+	// CodexInitialRefreshOnLoad 控制 Codex 文件型/OAuth auth 在当前服务
+	// 首次读到该 token 时，是否只要 refresh_token 非空就先强制 refresh 一次，
+	// 以优先校准 access_token / expired / last_refresh 等运行字段。
+	// 默认 false，保持现有保守门控不变。
+	CodexInitialRefreshOnLoad bool `yaml:"codex-initial-refresh-on-load" json:"codex-initial-refresh-on-load"`
+
 	// ForceModelPrefix requires explicit model prefixes (e.g., "teamA/gemini-3-pro-preview")
 	// to target prefixed credentials. When false, unprefixed model requests may use prefixed
 	// credentials as well.

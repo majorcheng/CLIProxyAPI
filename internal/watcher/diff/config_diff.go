@@ -93,6 +93,9 @@ func BuildConfigChangeDetails(oldCfg, newCfg *config.Config) []string {
 	if oldCfg.Routing.Strategy != newCfg.Routing.Strategy {
 		changes = append(changes, fmt.Sprintf("routing.strategy: %s -> %s", oldCfg.Routing.Strategy, newCfg.Routing.Strategy))
 	}
+	if oldCfg.Routing.PriorityZeroStrategy != newCfg.Routing.PriorityZeroStrategy {
+		changes = append(changes, fmt.Sprintf("routing.priority-zero-strategy: %s -> %s", oldCfg.Routing.PriorityZeroStrategy, newCfg.Routing.PriorityZeroStrategy))
+	}
 
 	// API keys (redacted) and counts
 	if len(oldCfg.APIKeys) != len(newCfg.APIKeys) {

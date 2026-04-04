@@ -245,6 +245,9 @@ type RoutingConfig struct {
 	// Strategy selects the credential selection strategy.
 	// Supported values: "round-robin" (default), "fill-first", "success-rate", "simhash".
 	Strategy string `yaml:"strategy,omitempty" json:"strategy,omitempty"`
+	// PriorityZeroStrategy 仅在当前命中的最高 ready priority bucket 为 0 时覆盖 Strategy。
+	// Supported values: "" (follow Strategy), "round-robin", "fill-first".
+	PriorityZeroStrategy string `yaml:"priority-zero-strategy,omitempty" json:"priority-zero-strategy,omitempty"`
 	// MaxInflightPerAuth 限制单个 auth 同时允许的进行中请求数。
 	// 0 表示不限制；该限制只作用于运行态，不会把 auth 标成 unavailable。
 	MaxInflightPerAuth int `yaml:"max-inflight-per-auth,omitempty" json:"max-inflight-per-auth,omitempty"`
@@ -733,6 +736,7 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 
 	// Sanitize routing config.
 	cfg.Routing.Strategy = strings.TrimSpace(cfg.Routing.Strategy)
+	cfg.Routing.PriorityZeroStrategy = normalizePriorityZeroRoutingStrategy(cfg.Routing.PriorityZeroStrategy)
 	if cfg.Routing.MaxInflightPerAuth < 0 {
 		cfg.Routing.MaxInflightPerAuth = 0
 	}
@@ -818,6 +822,21 @@ func normalizeAuthMaintenanceStatusCodes(codes []int) []int {
 		out = append(out, code)
 	}
 	return out
+}
+
+func normalizePriorityZeroRoutingStrategy(strategy string) string {
+	switch strings.ToLower(strings.TrimSpace(strategy)) {
+	case "":
+		return ""
+	case "round-robin", "roundrobin", "rr":
+		return "round-robin"
+	case "fill-first", "fillfirst", "ff":
+		return "fill-first"
+	default:
+		// 这里按“跟随全局 strategy”收口，避免因为拼写错误把 priority=0
+		// 路由切到不可预期的自定义语义。
+		return ""
+	}
 }
 
 // SanitizePriorityZeroDisabledAPIKeys 负责清理“禁止命中 priority=0”的

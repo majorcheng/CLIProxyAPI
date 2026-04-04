@@ -236,6 +236,24 @@ func TestBuildConfigChangeDetails_PriorityZeroDisabledAPIKeysRedacted(t *testing
 	expectContains(t, details, "priority-zero-disabled-api-keys: values updated (count unchanged, redacted)")
 }
 
+func TestBuildConfigChangeDetails_PriorityZeroRoutingStrategy(t *testing.T) {
+	oldCfg := &config.Config{
+		Routing: config.RoutingConfig{
+			Strategy:             "round-robin",
+			PriorityZeroStrategy: "",
+		},
+	}
+	newCfg := &config.Config{
+		Routing: config.RoutingConfig{
+			Strategy:             "round-robin",
+			PriorityZeroStrategy: "fill-first",
+		},
+	}
+
+	details := BuildConfigChangeDetails(oldCfg, newCfg)
+	expectContains(t, details, "routing.priority-zero-strategy:  -> fill-first")
+}
+
 func TestBuildConfigChangeDetails_FlagsAndKeys(t *testing.T) {
 	oldCfg := &config.Config{
 		Port:                                  1000,

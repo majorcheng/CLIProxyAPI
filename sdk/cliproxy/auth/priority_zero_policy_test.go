@@ -5,6 +5,7 @@ import (
 	"errors"
 	"testing"
 
+	internalconfig "github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 )
 
@@ -125,5 +126,103 @@ func TestManagerCustomSelector_PriorityZeroPolicyFiltersLegacyCandidates(t *test
 	}
 	if got.ID != "fallback" {
 		t.Fatalf("pickNext() auth.ID = %q, want %q", got.ID, "fallback")
+	}
+}
+
+func TestManagerBuiltInScheduler_PriorityZeroRoutingStrategyUsesFillFirstWithinZeroBucket(t *testing.T) {
+	t.Parallel()
+
+	manager := NewManager(nil, &RoundRobinSelector{}, nil)
+	manager.executors["gemini"] = schedulerTestExecutor{}
+	manager.SetConfig(&internalconfig.Config{
+		Routing: internalconfig.RoutingConfig{
+			PriorityZeroStrategy: "fill-first",
+		},
+	})
+	if _, errRegister := manager.Register(context.Background(), &Auth{ID: "zero-old", Provider: "gemini", Attributes: map[string]string{"priority": "0"}}); errRegister != nil {
+		t.Fatalf("Register(zero-old) error = %v", errRegister)
+	}
+	if _, errRegister := manager.Register(context.Background(), &Auth{ID: "zero-new", Provider: "gemini", Attributes: map[string]string{"priority": "0"}}); errRegister != nil {
+		t.Fatalf("Register(zero-new) error = %v", errRegister)
+	}
+
+	for index := 0; index < 2; index++ {
+		got, _, errPick := manager.pickNext(context.Background(), "gemini", "", cliproxyexecutor.Options{}, nil)
+		if errPick != nil {
+			t.Fatalf("pickNext() #%d error = %v", index, errPick)
+		}
+		if got == nil {
+			t.Fatalf("pickNext() #%d auth = nil", index)
+		}
+		if got.ID != "zero-old" {
+			t.Fatalf("pickNext() #%d auth.ID = %q, want %q", index, got.ID, "zero-old")
+		}
+	}
+}
+
+func TestManagerBuiltInScheduler_PriorityZeroRoutingStrategyDoesNotAffectNonZeroBucket(t *testing.T) {
+	t.Parallel()
+
+	manager := NewManager(nil, &RoundRobinSelector{}, nil)
+	manager.executors["gemini"] = schedulerTestExecutor{}
+	manager.SetConfig(&internalconfig.Config{
+		Routing: internalconfig.RoutingConfig{
+			PriorityZeroStrategy: "fill-first",
+		},
+	})
+	if _, errRegister := manager.Register(context.Background(), &Auth{ID: "high-b", Provider: "gemini", Attributes: map[string]string{"priority": "1"}}); errRegister != nil {
+		t.Fatalf("Register(high-b) error = %v", errRegister)
+	}
+	if _, errRegister := manager.Register(context.Background(), &Auth{ID: "high-a", Provider: "gemini", Attributes: map[string]string{"priority": "1"}}); errRegister != nil {
+		t.Fatalf("Register(high-a) error = %v", errRegister)
+	}
+
+	want := []string{"high-a", "high-b"}
+	for index, wantID := range want {
+		got, _, errPick := manager.pickNext(context.Background(), "gemini", "", cliproxyexecutor.Options{}, nil)
+		if errPick != nil {
+			t.Fatalf("pickNext() #%d error = %v", index, errPick)
+		}
+		if got == nil {
+			t.Fatalf("pickNext() #%d auth = nil", index)
+		}
+		if got.ID != wantID {
+			t.Fatalf("pickNext() #%d auth.ID = %q, want %q", index, got.ID, wantID)
+		}
+	}
+}
+
+func TestManagerBuiltInScheduler_PriorityZeroRoutingStrategyAppliesToMixedProviderSelection(t *testing.T) {
+	t.Parallel()
+
+	manager := NewManager(nil, &RoundRobinSelector{}, nil)
+	manager.executors["gemini"] = schedulerTestExecutor{}
+	manager.executors["claude"] = schedulerTestExecutor{}
+	manager.SetConfig(&internalconfig.Config{
+		Routing: internalconfig.RoutingConfig{
+			PriorityZeroStrategy: "fill-first",
+		},
+	})
+	if _, errRegister := manager.Register(context.Background(), &Auth{ID: "gemini-zero", Provider: "gemini", Attributes: map[string]string{"priority": "0"}}); errRegister != nil {
+		t.Fatalf("Register(gemini-zero) error = %v", errRegister)
+	}
+	if _, errRegister := manager.Register(context.Background(), &Auth{ID: "claude-zero", Provider: "claude", Attributes: map[string]string{"priority": "0"}}); errRegister != nil {
+		t.Fatalf("Register(claude-zero) error = %v", errRegister)
+	}
+
+	for index := 0; index < 2; index++ {
+		got, _, provider, errPick := manager.pickNextMixed(context.Background(), []string{"gemini", "claude"}, "", cliproxyexecutor.Options{}, nil)
+		if errPick != nil {
+			t.Fatalf("pickNextMixed() #%d error = %v", index, errPick)
+		}
+		if provider != "gemini" {
+			t.Fatalf("pickNextMixed() #%d provider = %q, want %q", index, provider, "gemini")
+		}
+		if got == nil {
+			t.Fatalf("pickNextMixed() #%d auth = nil", index)
+		}
+		if got.ID != "gemini-zero" {
+			t.Fatalf("pickNextMixed() #%d auth.ID = %q, want %q", index, got.ID, "gemini-zero")
+		}
 	}
 }

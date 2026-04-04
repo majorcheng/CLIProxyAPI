@@ -342,6 +342,9 @@ func (m *Manager) SetConfig(cfg *internalconfig.Config) {
 		cfg = &internalconfig.Config{}
 	}
 	m.runtimeConfig.Store(cfg)
+	if m.scheduler != nil {
+		m.scheduler.setPriorityZeroStrategy(cfg.Routing.PriorityZeroStrategy)
+	}
 	m.rebuildAPIKeyModelAliasFromRuntimeConfig()
 }
 

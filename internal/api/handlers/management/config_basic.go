@@ -346,6 +346,20 @@ func normalizeRoutingStrategy(strategy string) (string, bool) {
 	}
 }
 
+func normalizePriorityZeroRoutingStrategy(strategy string) (string, bool) {
+	normalized := strings.ToLower(strings.TrimSpace(strategy))
+	switch normalized {
+	case "":
+		return "", true
+	case "round-robin", "roundrobin", "rr":
+		return "round-robin", true
+	case "fill-first", "fillfirst", "ff":
+		return "fill-first", true
+	default:
+		return "", false
+	}
+}
+
 // RoutingStrategy
 func (h *Handler) GetRoutingStrategy(c *gin.Context) {
 	strategy, ok := normalizeRoutingStrategy(h.cfg.Routing.Strategy)
@@ -369,6 +383,33 @@ func (h *Handler) PutRoutingStrategy(c *gin.Context) {
 		return
 	}
 	h.cfg.Routing.Strategy = normalized
+	h.persist(c)
+}
+
+// PriorityZeroRoutingStrategy
+func (h *Handler) GetPriorityZeroRoutingStrategy(c *gin.Context) {
+	strategy, ok := normalizePriorityZeroRoutingStrategy(h.cfg.Routing.PriorityZeroStrategy)
+	if !ok {
+		c.JSON(200, gin.H{"priority-zero-strategy": strings.TrimSpace(h.cfg.Routing.PriorityZeroStrategy)})
+		return
+	}
+	c.JSON(200, gin.H{"priority-zero-strategy": strategy})
+}
+
+func (h *Handler) PutPriorityZeroRoutingStrategy(c *gin.Context) {
+	var body struct {
+		Value *string `json:"value"`
+	}
+	if errBindJSON := c.ShouldBindJSON(&body); errBindJSON != nil || body.Value == nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body"})
+		return
+	}
+	normalized, ok := normalizePriorityZeroRoutingStrategy(*body.Value)
+	if !ok {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid strategy"})
+		return
+	}
+	h.cfg.Routing.PriorityZeroStrategy = normalized
 	h.persist(c)
 }
 

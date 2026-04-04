@@ -32,11 +32,13 @@ const (
 
 // authScheduler keeps the incremental provider/model scheduling state used by Manager.
 type authScheduler struct {
-	mu            sync.Mutex
-	strategy      schedulerStrategy
-	providers     map[string]*providerScheduler
-	authProviders map[string]string
-	mixedCursors  map[string]int
+	mu                         sync.Mutex
+	strategy                   schedulerStrategy
+	priorityZeroStrategy       schedulerStrategy
+	priorityZeroStrategyActive bool
+	providers                  map[string]*providerScheduler
+	authProviders              map[string]string
+	mixedCursors               map[string]int
 }
 
 // providerScheduler stores auth metadata and model shards for a single provider.
@@ -128,6 +130,36 @@ func (s *authScheduler) setSelector(selector Selector) {
 	defer s.mu.Unlock()
 	s.strategy = selectorStrategy(selector)
 	clear(s.mixedCursors)
+}
+
+func parsePriorityZeroSchedulerStrategy(strategy string) (schedulerStrategy, bool) {
+	switch strings.ToLower(strings.TrimSpace(strategy)) {
+	case "round-robin", "roundrobin", "rr":
+		return schedulerStrategyRoundRobin, true
+	case "fill-first", "fillfirst", "ff":
+		return schedulerStrategyFillFirst, true
+	default:
+		return schedulerStrategyRoundRobin, false
+	}
+}
+
+func (s *authScheduler) setPriorityZeroStrategy(strategy string) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	parsed, ok := parsePriorityZeroSchedulerStrategy(strategy)
+	s.priorityZeroStrategy = parsed
+	s.priorityZeroStrategyActive = ok
+	clear(s.mixedCursors)
+}
+
+func (s *authScheduler) strategyForPriorityLocked(priority int) schedulerStrategy {
+	if priority == 0 && s.priorityZeroStrategyActive {
+		return s.priorityZeroStrategy
+	}
+	return s.strategy
 }
 
 // rebuild recreates the complete scheduler state from an auth snapshot.
@@ -245,7 +277,7 @@ func (s *authScheduler) pickSingle(ctx context.Context, provider, model string, 
 		}
 		return true
 	}
-	if picked := shard.pickReadyLocked(preferWebsocket, s.strategy, predicate); picked != nil {
+	if picked := shard.pickReadyWithStrategyForPriorityLocked(preferWebsocket, s.strategyForPriorityLocked, predicate); picked != nil {
 		return picked.Clone(), nil
 	}
 	return nil, shard.unavailableErrorLocked(provider, model, predicate)
@@ -291,7 +323,7 @@ func (s *authScheduler) pickMixed(ctx context.Context, providers []string, model
 			_, ok := tried[pinnedAuthID]
 			return !ok
 		}
-		if picked := shard.pickReadyLocked(false, s.strategy, predicate); picked != nil {
+		if picked := shard.pickReadyWithStrategyForPriorityLocked(false, s.strategyForPriorityLocked, predicate); picked != nil {
 			return picked.Clone(), providerKey, nil
 		}
 		return nil, "", shard.unavailableErrorLocked("mixed", model, predicate)
@@ -334,13 +366,14 @@ func (s *authScheduler) pickMixed(ctx context.Context, providers []string, model
 		return nil, "", s.mixedUnavailableErrorLocked(normalized, model, tried)
 	}
 
-	if s.strategy == schedulerStrategyFillFirst {
+	bestStrategy := s.strategyForPriorityLocked(bestPriority)
+	if bestStrategy == schedulerStrategyFillFirst {
 		for providerIndex, providerKey := range normalized {
 			shard := candidateShards[providerIndex]
 			if shard == nil {
 				continue
 			}
-			picked := shard.pickReadyAtPriorityLocked(preferWebsocketForProvider(providerKey), bestPriority, s.strategy, predicate)
+			picked := shard.pickReadyAtPriorityLocked(preferWebsocketForProvider(providerKey), bestPriority, bestStrategy, predicate)
 			if picked != nil {
 				return picked.Clone(), providerKey, nil
 			}
@@ -394,7 +427,7 @@ func (s *authScheduler) pickMixed(ctx context.Context, providers []string, model
 		if shard == nil {
 			continue
 		}
-		picked := shard.pickReadyAtPriorityLocked(preferWebsocketForProvider(providerKey), bestPriority, schedulerStrategyRoundRobin, predicate)
+		picked := shard.pickReadyAtPriorityLocked(preferWebsocketForProvider(providerKey), bestPriority, bestStrategy, predicate)
 		if picked == nil {
 			continue
 		}
@@ -1302,6 +1335,14 @@ func blockedEntryLess(left, right *scheduledAuth) bool {
 
 // pickReadyLocked selects the next ready auth from the highest available priority bucket.
 func (m *modelScheduler) pickReadyLocked(preferWebsocket bool, strategy schedulerStrategy, predicate func(*scheduledAuth) bool) *Auth {
+	return m.pickReadyWithStrategyForPriorityLocked(preferWebsocket, func(int) schedulerStrategy {
+		return strategy
+	}, predicate)
+}
+
+// pickReadyWithStrategyForPriorityLocked 允许调用方按 priority bucket 决定具体选路语义，
+// 用于支持 priority=0 这类特殊桶的局部覆盖，而不影响其他 priority 的默认策略。
+func (m *modelScheduler) pickReadyWithStrategyForPriorityLocked(preferWebsocket bool, strategyForPriority func(int) schedulerStrategy, predicate func(*scheduledAuth) bool) *Auth {
 	if m == nil {
 		return nil
 	}
@@ -1310,7 +1351,12 @@ func (m *modelScheduler) pickReadyLocked(preferWebsocket bool, strategy schedule
 	if !okPriority {
 		return nil
 	}
-	return m.pickReadyAtPriorityLocked(preferWebsocket, priorityReady, strategy, predicate)
+	if strategyForPriority == nil {
+		strategyForPriority = func(int) schedulerStrategy {
+			return schedulerStrategyRoundRobin
+		}
+	}
+	return m.pickReadyAtPriorityLocked(preferWebsocket, priorityReady, strategyForPriority(priorityReady), predicate)
 }
 
 // highestReadyPriorityLocked returns the highest priority bucket that still has a matching ready auth.

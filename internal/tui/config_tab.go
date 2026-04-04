@@ -352,9 +352,11 @@ func (m configTabModel) parseConfig(cfg map[string]any) []configField {
 	// Routing
 	if routing, ok := cfg["routing"].(map[string]any); ok {
 		fields = append(fields, configField{"Routing Strategy", "routing/strategy", "string", getString(routing, "strategy"), nil})
+		fields = append(fields, configField{"Priority-0 Routing Strategy", "routing/priority-zero-strategy", "string", getString(routing, "priority-zero-strategy"), nil})
 		fields = append(fields, configField{"Routing Max Inflight/Auth", "routing/max-inflight-per-auth", "int", fmt.Sprintf("%.0f", getFloat(routing, "max-inflight-per-auth")), nil})
 	} else {
 		fields = append(fields, configField{"Routing Strategy", "routing/strategy", "string", "", nil})
+		fields = append(fields, configField{"Priority-0 Routing Strategy", "routing/priority-zero-strategy", "string", "", nil})
 		fields = append(fields, configField{"Routing Max Inflight/Auth", "routing/max-inflight-per-auth", "int", "0", nil})
 	}
 

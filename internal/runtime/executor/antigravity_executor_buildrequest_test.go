@@ -24,6 +24,12 @@ func TestAntigravityBuildRequest_SanitizesGeminiToolSchema(t *testing.T) {
 	assertSchemaSanitizedAndPropertyPreserved(t, params)
 }
 
+func TestDefaultAntigravityAgentVersion(t *testing.T) {
+	if got, want := defaultAntigravityAgent, "antigravity/1.21.9 darwin/arm64"; got != want {
+		t.Fatalf("defaultAntigravityAgent = %q, want %q", got, want)
+	}
+}
+
 func TestAntigravityBuildRequest_SanitizesAntigravityToolSchema(t *testing.T) {
 	body := buildRequestBodyFromPayload(t, "claude-opus-4-6")
 

@@ -94,6 +94,10 @@ pprof:
 # 为 true 时，禁用高开销 HTTP 中间件特性，以降低高并发下的单请求内存开销。
 commercial-mode: false
 
+# 为 true 时，启用 Gemini CLI 内部端点（/v1internal:*）。
+# 默认 false，更安全；只有明确需要本机 Gemini CLI 透传时再打开。
+enable-gemini-cli-endpoint: false
+
 # 为 true 时，将应用日志写入滚动文件而不是 stdout
 logging-to-file: false
 

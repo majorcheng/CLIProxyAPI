@@ -9,6 +9,10 @@ type SDKConfig struct {
 	// ProxyURL is the URL of an optional proxy server to use for outbound requests.
 	ProxyURL string `yaml:"proxy-url" json:"proxy-url"`
 
+	// EnableGeminiCLIEndpoint 控制 Gemini CLI 内部端点（/v1internal:*）是否可用。
+	// 默认 false，避免未预期地暴露仅供本机 CLI 使用的内部入口。
+	EnableGeminiCLIEndpoint bool `yaml:"enable-gemini-cli-endpoint" json:"enable-gemini-cli-endpoint"`
+
 	// CodexInitialRefreshOnLoad 控制 Codex 文件型/OAuth auth 在当前服务
 	// 首次读到该 token 时，是否只要 refresh_token 非空就先强制 refresh 一次，
 	// 以优先校准 access_token / expired / last_refresh 等运行字段。

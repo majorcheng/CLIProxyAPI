@@ -44,6 +44,8 @@ var (
 	schedulerOnce       sync.Once
 	schedulerConfigPath atomic.Value
 	sfGroup             singleflight.Group
+	fetchLatestAssetFn  = fetchLatestAsset
+	downloadAssetFn     = downloadAsset
 )
 
 // SetCurrentConfig stores the latest configuration snapshot for management asset decisions.
@@ -232,8 +234,14 @@ func EnsureLatestManagementHTML(ctx context.Context, staticDir string, proxyURL 
 			localHash = ""
 		}
 
-		asset, remoteHash, err := fetchLatestAsset(ctx, client, releaseURL)
+		asset, remoteHash, err := fetchLatestAssetFn(ctx, client, releaseURL)
 		if err != nil {
+			// GitHub Releases API 很容易被匿名限流，但同一仓库的 latest/download 直链通常仍可访问。
+			// 这里优先退到“当前配置仓库”的 release 直链，尽量让用户配置的面板源继续生效，而不是直接沿用旧缓存。
+			log.WithError(err).Warn("failed to fetch latest management release information, trying direct release asset")
+			if ensureDirectReleaseManagementHTML(ctx, client, localPath, panelRepository) {
+				return nil, nil
+			}
 			if localFileMissing {
 				log.WithError(err).Warn("failed to fetch latest management release information, trying fallback page")
 				if ensureFallbackManagementHTML(ctx, client, localPath) {
@@ -250,8 +258,14 @@ func EnsureLatestManagementHTML(ctx context.Context, staticDir string, proxyURL 
 			return nil, nil
 		}
 
-		data, downloadedHash, err := downloadAsset(ctx, client, asset.BrowserDownloadURL)
+		data, downloadedHash, err := downloadAssetFn(ctx, client, asset.BrowserDownloadURL)
 		if err != nil {
+			// release API 已确认该仓库存在面板资产时，仍优先尝试 latest/download 直链，
+			// 避免 browser_download_url 的临时问题或 API 侧抖动把本地面板卡死在旧版本。
+			log.WithError(err).Warn("failed to download management asset, trying direct release asset")
+			if ensureDirectReleaseManagementHTML(ctx, client, localPath, panelRepository) {
+				return nil, nil
+			}
 			if localFileMissing {
 				log.WithError(err).Warn("failed to download management asset, trying fallback page")
 				if ensureFallbackManagementHTML(ctx, client, localPath) {
@@ -281,8 +295,31 @@ func EnsureLatestManagementHTML(ctx context.Context, staticDir string, proxyURL 
 	return err == nil
 }
 
+func ensureDirectReleaseManagementHTML(ctx context.Context, client *http.Client, localPath string, panelRepository string) bool {
+	downloadURL := resolveDirectDownloadURL(panelRepository)
+	if strings.TrimSpace(downloadURL) == "" {
+		return false
+	}
+
+	data, downloadedHash, err := downloadAssetFn(ctx, client, downloadURL)
+	if err != nil {
+		log.WithError(err).Warnf("failed to download management asset from direct release URL: %s", downloadURL)
+		return false
+	}
+
+	log.Warnf("management asset downloaded from direct release URL without digest verification (hash=%s, url=%s)", downloadedHash, downloadURL)
+
+	if err = atomicWriteFile(localPath, data); err != nil {
+		log.WithError(err).Warn("failed to persist management control panel page from direct release URL")
+		return false
+	}
+
+	log.Infof("management asset updated from direct release URL successfully (hash=%s)", downloadedHash)
+	return true
+}
+
 func ensureFallbackManagementHTML(ctx context.Context, client *http.Client, localPath string) bool {
-	data, downloadedHash, err := downloadAsset(ctx, client, defaultManagementFallbackURL)
+	data, downloadedHash, err := downloadAssetFn(ctx, client, defaultManagementFallbackURL)
 	if err != nil {
 		log.WithError(err).Warn("failed to download fallback management control panel page")
 		return false
@@ -330,6 +367,39 @@ func resolveReleaseURL(repo string) string {
 	}
 
 	return defaultManagementReleaseURL
+}
+
+func resolveDirectDownloadURL(repo string) string {
+	repo = strings.TrimSpace(repo)
+	if repo == "" {
+		return "https://github.com/router-for-me/Cli-Proxy-API-Management-Center/releases/latest/download/" + managementAssetName
+	}
+
+	parsed, err := url.Parse(repo)
+	if err != nil || parsed.Host == "" {
+		return "https://github.com/router-for-me/Cli-Proxy-API-Management-Center/releases/latest/download/" + managementAssetName
+	}
+
+	host := strings.ToLower(parsed.Host)
+	parsed.Path = strings.TrimSuffix(parsed.Path, "/")
+
+	if host == "github.com" {
+		parts := strings.Split(strings.Trim(parsed.Path, "/"), "/")
+		if len(parts) >= 2 && parts[0] != "" && parts[1] != "" {
+			repoName := strings.TrimSuffix(parts[1], ".git")
+			return fmt.Sprintf("https://github.com/%s/%s/releases/latest/download/%s", parts[0], repoName, managementAssetName)
+		}
+	}
+
+	if host == "api.github.com" {
+		parts := strings.Split(strings.Trim(parsed.Path, "/"), "/")
+		if len(parts) >= 3 && strings.EqualFold(parts[0], "repos") && parts[1] != "" && parts[2] != "" {
+			repoName := strings.TrimSuffix(parts[2], ".git")
+			return fmt.Sprintf("https://github.com/%s/%s/releases/latest/download/%s", parts[1], repoName, managementAssetName)
+		}
+	}
+
+	return "https://github.com/router-for-me/Cli-Proxy-API-Management-Center/releases/latest/download/" + managementAssetName
 }
 
 func fetchLatestAsset(ctx context.Context, client *http.Client, releaseURL string) (*releaseAsset, string, error) {

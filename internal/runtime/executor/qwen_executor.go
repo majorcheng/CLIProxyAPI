@@ -28,6 +28,8 @@ const (
 	qwenRateLimitWindow = time.Minute // sliding window duration
 )
 
+var qwenDefaultSystemMessage = []byte(`{"role":"system","content":[{"type":"text","text":"","cache_control":{"type":"ephemeral"}}]}`)
+
 // qwenBeijingLoc caches the Beijing timezone to avoid repeated LoadLocation syscalls.
 var qwenBeijingLoc = func() *time.Location {
 	loc, err := time.LoadLocation("Asia/Shanghai")
@@ -168,6 +170,42 @@ func timeUntilNextDay() time.Duration {
 	return tomorrow.Sub(now)
 }
 
+// ensureQwenSystemMessage 在 messages 中没有 system 角色时补一个默认 system block。
+func ensureQwenSystemMessage(payload []byte) ([]byte, error) {
+	messages := gjson.GetBytes(payload, "messages")
+	if messages.Exists() && messages.IsArray() {
+		for _, msg := range messages.Array() {
+			if strings.EqualFold(msg.Get("role").String(), "system") {
+				return payload, nil
+			}
+		}
+
+		var buf bytes.Buffer
+		buf.WriteByte('[')
+		buf.Write(qwenDefaultSystemMessage)
+		for _, msg := range messages.Array() {
+			buf.WriteByte(',')
+			buf.WriteString(msg.Raw)
+		}
+		buf.WriteByte(']')
+		updated, errSet := sjson.SetRawBytes(payload, "messages", buf.Bytes())
+		if errSet != nil {
+			return nil, fmt.Errorf("qwen executor: set default system message failed: %w", errSet)
+		}
+		return updated, nil
+	}
+
+	var buf bytes.Buffer
+	buf.WriteByte('[')
+	buf.Write(qwenDefaultSystemMessage)
+	buf.WriteByte(']')
+	updated, errSet := sjson.SetRawBytes(payload, "messages", buf.Bytes())
+	if errSet != nil {
+		return nil, fmt.Errorf("qwen executor: set default system message failed: %w", errSet)
+	}
+	return updated, nil
+}
+
 // QwenExecutor is a stateless executor for Qwen Code using OpenAI-compatible chat completions.
 // If access token is unavailable, it falls back to legacy via ClientAdapter.
 type QwenExecutor struct {
@@ -249,6 +287,10 @@ func (e *QwenExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req
 
 	requestedModel := payloadRequestedModel(opts, req.Model)
 	body = applyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", body, originalTranslated, requestedModel)
+	body, err = ensureQwenSystemMessage(body)
+	if err != nil {
+		return resp, err
+	}
 
 	url := strings.TrimSuffix(baseURL, "/") + "/chat/completions"
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
@@ -359,6 +401,10 @@ func (e *QwenExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 	body, _ = sjson.SetBytes(body, "stream_options.include_usage", true)
 	requestedModel := payloadRequestedModel(opts, req.Model)
 	body = applyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", body, originalTranslated, requestedModel)
+	body, err = ensureQwenSystemMessage(body)
+	if err != nil {
+		return nil, err
+	}
 
 	url := strings.TrimSuffix(baseURL, "/") + "/chat/completions"
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))

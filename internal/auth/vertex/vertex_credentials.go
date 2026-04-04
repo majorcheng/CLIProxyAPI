@@ -30,6 +30,9 @@ type VertexCredentialStorage struct {
 
 	// Type is the provider identifier stored alongside credentials. Always "vertex".
 	Type string `json:"type"`
+
+	// Prefix 可选地为该 Vertex 凭证提供模型命名空间前缀，避免多份凭证之间冲突。
+	Prefix string `json:"prefix,omitempty"`
 }
 
 // SaveTokenToFile writes the credential payload to the given file path in JSON format.

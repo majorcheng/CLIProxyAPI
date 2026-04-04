@@ -20,7 +20,7 @@ import (
 // DoVertexImport imports a Google Cloud service account key JSON and persists
 // it as a "vertex" provider credential. The file content is embedded in the auth
 // file to allow portable deployment across stores.
-func DoVertexImport(cfg *config.Config, keyPath string) {
+func DoVertexImport(cfg *config.Config, keyPath string, prefix string) {
 	if cfg == nil {
 		cfg = &config.Config{}
 	}
@@ -59,16 +59,22 @@ func DoVertexImport(cfg *config.Config, keyPath string) {
 		// Keep empty email but warn
 		log.Warn("vertex-import: client_email missing in service account json")
 	}
+	normalizedPrefix, errPrefix := normalizeVertexImportPrefix(prefix)
+	if errPrefix != nil {
+		log.Errorf("vertex-import: %v", errPrefix)
+		return
+	}
 	// Default location if not provided by user. Can be edited in the saved file later.
 	location := "us-central1"
 
-	fileName := fmt.Sprintf("vertex-%s.json", sanitizeFilePart(projectID))
+	fileName := vertexImportFileName(normalizedPrefix, projectID)
 	// Build auth record
 	storage := &vertex.VertexCredentialStorage{
 		ServiceAccount: sa,
 		ProjectID:      projectID,
 		Email:          email,
 		Location:       location,
+		Prefix:         normalizedPrefix,
 	}
 	metadata := map[string]any{
 		"service_account": sa,
@@ -76,6 +82,7 @@ func DoVertexImport(cfg *config.Config, keyPath string) {
 		"email":           email,
 		"location":        location,
 		"type":            "vertex",
+		"prefix":          normalizedPrefix,
 		"label":           labelForVertex(projectID, email),
 	}
 	record := &coreauth.Auth{
@@ -99,6 +106,22 @@ func DoVertexImport(cfg *config.Config, keyPath string) {
 		return
 	}
 	fmt.Printf("Vertex credentials imported: %s\n", path)
+}
+
+func normalizeVertexImportPrefix(prefix string) (string, error) {
+	out := strings.Trim(strings.TrimSpace(prefix), "/")
+	if strings.Contains(out, "/") {
+		return "", fmt.Errorf("vertex-import: prefix %q must not contain \"/\"", prefix)
+	}
+	return out, nil
+}
+
+func vertexImportFileName(prefix, projectID string) string {
+	projectPart := sanitizeFilePart(projectID)
+	if prefix == "" {
+		return fmt.Sprintf("vertex-%s.json", projectPart)
+	}
+	return fmt.Sprintf("vertex-%s-%s.json", sanitizeFilePart(prefix), projectPart)
 }
 
 func sanitizeFilePart(s string) string {

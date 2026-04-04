@@ -78,3 +78,49 @@ func TestConvertClaudeRequestToGemini_ImageContent(t *testing.T) {
 		t.Fatalf("Expected image data 'aGVsbG8=', got '%s'", got)
 	}
 }
+
+func TestConvertClaudeRequestToGemini_CleansToolSchemaAndDropsEagerInputStreaming(t *testing.T) {
+	inputJSON := []byte(`{
+		"model": "gemini-3-flash-preview",
+		"messages": [
+			{
+				"role": "user",
+				"content": [{"type": "text", "text": "hi"}]
+			}
+		],
+		"tools": [
+			{
+				"name": "fetch_url",
+				"description": "Fetch a URL",
+				"eager_input_streaming": true,
+				"input_schema": {
+					"type": "object",
+					"properties": {
+						"url": {
+							"type": "string",
+							"format": "uri"
+						}
+					},
+					"required": ["url"]
+				}
+			}
+		]
+	}`)
+
+	output := ConvertClaudeRequestToGemini("gemini-3-flash-preview", inputJSON, false)
+
+	tool := gjson.GetBytes(output, "tools.0.functionDeclarations.0")
+	if !tool.Exists() {
+		t.Fatalf("expected translated tool declaration, got %s", string(output))
+	}
+	if tool.Get("eager_input_streaming").Exists() {
+		t.Fatalf("expected eager_input_streaming to be removed, got %s", tool.Raw)
+	}
+	schema := tool.Get("parametersJsonSchema")
+	if !schema.Exists() {
+		t.Fatalf("expected parametersJsonSchema, got %s", tool.Raw)
+	}
+	if schema.Get("properties.url.format").Exists() {
+		t.Fatalf("expected format=uri to be stripped from Gemini schema, got %s", schema.Raw)
+	}
+}

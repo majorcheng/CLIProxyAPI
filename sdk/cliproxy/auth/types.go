@@ -76,6 +76,9 @@ type Auth struct {
 	Quota QuotaState `json:"quota"`
 	// LastError stores the last failure encountered while executing or refreshing.
 	LastError *Error `json:"last_error,omitempty"`
+	// FailureHTTPStatus 仅保留允许跨重启恢复的精确失败状态码。
+	// 它不会直接落到 auth 根 JSON，而是通过 cli_proxy_runtime_state 编解码。
+	FailureHTTPStatus int `json:"-"`
 	// CreatedAt is the creation timestamp in UTC.
 	CreatedAt time.Time `json:"created_at"`
 	// UpdatedAt is the last modification timestamp in UTC.
@@ -126,6 +129,8 @@ type ModelState struct {
 	NextRetryAfter time.Time `json:"next_retry_after"`
 	// LastError records the latest error observed for this model.
 	LastError *Error `json:"last_error,omitempty"`
+	// FailureHTTPStatus 仅保留允许跨重启恢复的精确失败状态码。
+	FailureHTTPStatus int `json:"-"`
 	// Quota retains quota information if this model hit rate limits.
 	Quota QuotaState `json:"quota"`
 	// UpdatedAt tracks the last update timestamp for this model state.

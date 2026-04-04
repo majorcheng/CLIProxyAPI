@@ -15,6 +15,7 @@ const PersistedRuntimeStateMetadataKey = "cli_proxy_runtime_state"
 type persistedRuntimeState struct {
 	Status         Status                         `json:"status,omitempty"`
 	StatusMessage  string                         `json:"status_message,omitempty"`
+	HTTPStatus     int                            `json:"http_status,omitempty"`
 	Unavailable    bool                           `json:"unavailable,omitempty"`
 	NextRetryAfter time.Time                      `json:"next_retry_after,omitempty"`
 	Quota          QuotaState                     `json:"quota,omitempty"`
@@ -24,9 +25,21 @@ type persistedRuntimeState struct {
 type persistedModelState struct {
 	Status         Status     `json:"status,omitempty"`
 	StatusMessage  string     `json:"status_message,omitempty"`
+	HTTPStatus     int        `json:"http_status,omitempty"`
 	Unavailable    bool       `json:"unavailable,omitempty"`
 	NextRetryAfter time.Time  `json:"next_retry_after,omitempty"`
 	Quota          QuotaState `json:"quota,omitempty"`
+}
+
+// NormalizePersistableFailureHTTPStatus 把状态码收口到允许跨重启恢复的白名单。
+// 目前只保留用户明确要求的 401/402/403/404/429，其他 1 分钟瞬态失败不持久化。
+func NormalizePersistableFailureHTTPStatus(statusCode int) int {
+	switch statusCode {
+	case 401, 402, 403, 404, 429:
+		return statusCode
+	default:
+		return 0
+	}
 }
 
 // MetadataWithPersistedRuntimeState 返回一份可安全落盘的 metadata 副本。
@@ -53,8 +66,8 @@ func MetadataWithPersistedRuntimeState(auth *Auth) map[string]any {
 }
 
 // RestorePersistedRuntimeState 从 metadata 中恢复 runtime state。
-// 这里故意忽略 last_error：用户明确只需要 cooldown / quota / next_retry 等
-// 能影响调度与展示的状态，不希望把一次性的错误细节长期保存在磁盘里。
+// 这里仍然故意忽略 last_error 详情本身：我们只恢复精确状态码与 cooldown / quota /
+// next_retry 等能影响调度与展示的状态，不把一次性的错误正文长期保存在磁盘里。
 func RestorePersistedRuntimeState(auth *Auth, now time.Time) {
 	if auth == nil || auth.Metadata == nil {
 		return
@@ -78,6 +91,7 @@ func RestorePersistedRuntimeState(auth *Auth, now time.Time) {
 
 	auth.Status = state.Status
 	auth.StatusMessage = strings.TrimSpace(state.StatusMessage)
+	auth.FailureHTTPStatus = NormalizePersistableFailureHTTPStatus(state.HTTPStatus)
 	auth.Unavailable = state.Unavailable
 	auth.NextRetryAfter = state.NextRetryAfter
 	auth.Quota = state.Quota
@@ -94,24 +108,32 @@ func buildPersistedRuntimeState(auth *Auth) (persistedRuntimeState, bool) {
 
 	state := persistedRuntimeState{}
 	hasState := false
+	statusCode := currentPersistableFailureHTTPStatus(auth)
+	shouldPersistAuth := shouldPersistFailureRuntimeState(statusCode, auth.NextRetryAfter, auth.Quota, time.Now())
 
-	if auth.Status != "" && auth.Status != StatusActive {
+	if shouldPersistAuth && auth.Status != "" && auth.Status != StatusActive {
 		state.Status = auth.Status
 		hasState = true
 	}
-	if message := strings.TrimSpace(auth.StatusMessage); message != "" {
-		state.StatusMessage = message
+	if shouldPersistAuth {
+		state.HTTPStatus = statusCode
 		hasState = true
 	}
-	if auth.Unavailable {
+	if shouldPersistAuth {
+		if message := strings.TrimSpace(auth.StatusMessage); message != "" {
+			state.StatusMessage = message
+			hasState = true
+		}
+	}
+	if shouldPersistAuth && auth.Unavailable {
 		state.Unavailable = true
 		hasState = true
 	}
-	if !auth.NextRetryAfter.IsZero() {
+	if shouldPersistAuth && !auth.NextRetryAfter.IsZero() {
 		state.NextRetryAfter = auth.NextRetryAfter
 		hasState = true
 	}
-	if quotaHasPersistedState(auth.Quota) {
+	if shouldPersistAuth && statusCode == 429 && quotaHasPersistedState(auth.Quota) {
 		state.Quota = auth.Quota
 		hasState = true
 	}
@@ -144,23 +166,31 @@ func buildPersistedModelState(state *ModelState) (persistedModelState, bool) {
 
 	result := persistedModelState{}
 	hasState := false
-	if state.Status != "" && state.Status != StatusActive {
+	statusCode := currentPersistableModelFailureHTTPStatus(state)
+	shouldPersistState := shouldPersistFailureRuntimeState(statusCode, state.NextRetryAfter, state.Quota, time.Now())
+	if shouldPersistState && state.Status != "" && state.Status != StatusActive {
 		result.Status = state.Status
 		hasState = true
 	}
-	if message := strings.TrimSpace(state.StatusMessage); message != "" {
-		result.StatusMessage = message
+	if shouldPersistState {
+		result.HTTPStatus = statusCode
 		hasState = true
 	}
-	if state.Unavailable {
+	if shouldPersistState {
+		if message := strings.TrimSpace(state.StatusMessage); message != "" {
+			result.StatusMessage = message
+			hasState = true
+		}
+	}
+	if shouldPersistState && state.Unavailable {
 		result.Unavailable = true
 		hasState = true
 	}
-	if !state.NextRetryAfter.IsZero() {
+	if shouldPersistState && !state.NextRetryAfter.IsZero() {
 		result.NextRetryAfter = state.NextRetryAfter
 		hasState = true
 	}
-	if quotaHasPersistedState(state.Quota) {
+	if shouldPersistState && statusCode == 429 && quotaHasPersistedState(state.Quota) {
 		result.Quota = state.Quota
 		hasState = true
 	}
@@ -177,11 +207,12 @@ func hydratePersistedModelStates(states map[string]persistedModelState) map[stri
 			continue
 		}
 		result[modelName] = &ModelState{
-			Status:         state.Status,
-			StatusMessage:  strings.TrimSpace(state.StatusMessage),
-			Unavailable:    state.Unavailable,
-			NextRetryAfter: state.NextRetryAfter,
-			Quota:          state.Quota,
+			Status:            state.Status,
+			StatusMessage:     strings.TrimSpace(state.StatusMessage),
+			FailureHTTPStatus: NormalizePersistableFailureHTTPStatus(state.HTTPStatus),
+			Unavailable:       state.Unavailable,
+			NextRetryAfter:    state.NextRetryAfter,
+			Quota:             state.Quota,
 		}
 	}
 	if len(result) == 0 {
@@ -201,12 +232,60 @@ func cloneMetadataMap(metadata map[string]any) map[string]any {
 	return cloned
 }
 
+func currentPersistableFailureHTTPStatus(auth *Auth) int {
+	if auth == nil {
+		return 0
+	}
+	if statusCode := NormalizePersistableFailureHTTPStatus(auth.FailureHTTPStatus); statusCode > 0 {
+		return statusCode
+	}
+	if auth.LastError != nil {
+		return NormalizePersistableFailureHTTPStatus(auth.LastError.HTTPStatus)
+	}
+	return 0
+}
+
+func currentPersistableModelFailureHTTPStatus(state *ModelState) int {
+	if state == nil {
+		return 0
+	}
+	if statusCode := NormalizePersistableFailureHTTPStatus(state.FailureHTTPStatus); statusCode > 0 {
+		return statusCode
+	}
+	if state.LastError != nil {
+		return NormalizePersistableFailureHTTPStatus(state.LastError.HTTPStatus)
+	}
+	return 0
+}
+
 func quotaHasPersistedState(quota QuotaState) bool {
 	return quota.Exceeded ||
 		strings.TrimSpace(quota.Reason) != "" ||
 		!quota.NextRecoverAt.IsZero() ||
 		quota.BackoffLevel != 0 ||
 		quota.StrikeCount != 0
+}
+
+func shouldPersistFailureRuntimeState(statusCode int, nextRetryAfter time.Time, quota QuotaState, now time.Time) bool {
+	statusCode = NormalizePersistableFailureHTTPStatus(statusCode)
+	if statusCode == 0 {
+		return false
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	switch statusCode {
+	case 429:
+		if !nextRetryAfter.IsZero() {
+			return nextRetryAfter.After(now)
+		}
+		if !quota.NextRecoverAt.IsZero() {
+			return quota.NextRecoverAt.After(now)
+		}
+		return quotaHasPersistedState(quota)
+	default:
+		return !nextRetryAfter.IsZero() && nextRetryAfter.After(now)
+	}
 }
 
 func normalizeRestoredRuntimeState(auth *Auth, now time.Time) {
@@ -231,6 +310,7 @@ func normalizeRestoredRuntimeState(auth *Auth, now time.Time) {
 		}
 		if auth.Disabled || auth.Status == StatusDisabled {
 			auth.Status = StatusDisabled
+			auth.FailureHTTPStatus = 0
 			return
 		}
 		updateAggregatedAvailability(auth, now)
@@ -245,5 +325,6 @@ func normalizeRestoredRuntimeState(auth *Auth, now time.Time) {
 	auth.LastError = nil
 	if auth.Disabled {
 		auth.Status = StatusDisabled
+		auth.FailureHTTPStatus = 0
 	}
 }

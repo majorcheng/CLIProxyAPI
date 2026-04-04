@@ -900,6 +900,7 @@ func syncAggregatedAuthStateFromModelStates(auth *Auth, now time.Time) {
 		auth.Unavailable = true
 		auth.NextRetryAfter = time.Time{}
 		auth.Quota = QuotaState{}
+		auth.FailureHTTPStatus = 0
 		return
 	}
 	if len(auth.ModelStates) == 0 {
@@ -913,6 +914,7 @@ func syncAggregatedAuthStateFromModelStates(auth *Auth, now time.Time) {
 	auth.Status = StatusActive
 	auth.StatusMessage = ""
 	auth.LastError = nil
+	auth.FailureHTTPStatus = 0
 }
 
 // removeEntryLocked deletes one auth entry and rebuilds the shard indexes if needed.

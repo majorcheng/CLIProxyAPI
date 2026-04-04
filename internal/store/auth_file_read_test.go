@@ -71,6 +71,7 @@ func testTokenStoreReadAuthFileRestoresRuntimeState(t *testing.T, newReader func
   "cli_proxy_runtime_state": {
     "status": "error",
     "status_message": "quota exhausted",
+    "http_status": 429,
     "unavailable": true,
     "next_retry_after": "` + next.Format(time.RFC3339) + `",
     "quota": {
@@ -84,6 +85,7 @@ func testTokenStoreReadAuthFileRestoresRuntimeState(t *testing.T, newReader func
       "gpt-5.4": {
         "status": "error",
         "status_message": "model quota",
+        "http_status": 429,
         "unavailable": true,
         "next_retry_after": "` + next.Format(time.RFC3339) + `",
         "quota": {
@@ -117,6 +119,9 @@ func testTokenStoreReadAuthFileRestoresRuntimeState(t *testing.T, newReader func
 	if auth.LastError != nil {
 		t.Fatalf("auth.LastError = %#v, want nil", auth.LastError)
 	}
+	if auth.FailureHTTPStatus != 429 {
+		t.Fatalf("auth.FailureHTTPStatus = %d, want 429", auth.FailureHTTPStatus)
+	}
 	if auth.Status != cliproxyauth.StatusError {
 		t.Fatalf("auth.Status = %q, want %q", auth.Status, cliproxyauth.StatusError)
 	}
@@ -132,6 +137,9 @@ func testTokenStoreReadAuthFileRestoresRuntimeState(t *testing.T, newReader func
 	}
 	if state.LastError != nil {
 		t.Fatalf("model LastError = %#v, want nil", state.LastError)
+	}
+	if state.FailureHTTPStatus != 429 {
+		t.Fatalf("model FailureHTTPStatus = %d, want 429", state.FailureHTTPStatus)
 	}
 	if !state.NextRetryAfter.Equal(next) {
 		t.Fatalf("model NextRetryAfter = %v, want %v", state.NextRetryAfter, next)

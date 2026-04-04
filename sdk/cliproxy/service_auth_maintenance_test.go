@@ -427,6 +427,18 @@ func TestScanAuthMaintenanceCandidates_StatusMessageUsageLimitJSONQueuesDelete(t
 	}
 }
 
+func TestAuthMaintenanceStatusCode_PrefersPersistedFailureHTTPStatusOverStatusMessageFallback(t *testing.T) {
+	auth := &coreauth.Auth{
+		Status:            coreauth.StatusError,
+		StatusMessage:     "payment_required",
+		FailureHTTPStatus: 403,
+	}
+
+	if got := authMaintenanceStatusCode(auth, nil); got != 403 {
+		t.Fatalf("authMaintenanceStatusCode() = %d, want 403", got)
+	}
+}
+
 func TestScanAuthMaintenanceCandidates_429DoesNotQueueDeleteWithoutExplicitQuotaDeleteConfig(t *testing.T) {
 	authDir := t.TempDir()
 	service := &Service{

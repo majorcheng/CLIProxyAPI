@@ -265,3 +265,57 @@ func TestListAuthFilesFromDisk_ExposesHasRefreshToken(t *testing.T) {
 		t.Fatalf("without-refresh has_refresh_token = %#v, want false", byName["without-refresh.json"]["has_refresh_token"])
 	}
 }
+
+func TestListAuthFiles_ExposesPersistedHTTPStatus(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	gin.SetMode(gin.TestMode)
+
+	authDir := t.TempDir()
+	manager := coreauth.NewManager(nil, nil, nil)
+	filePath := filepath.Join(authDir, "persisted-403.json")
+	if err := os.WriteFile(filePath, []byte(`{"type":"codex"}`), 0o600); err != nil {
+		t.Fatalf("write auth file: %v", err)
+	}
+
+	if _, err := manager.Register(context.Background(), &coreauth.Auth{
+		ID:                "persisted-403.json",
+		FileName:          "persisted-403.json",
+		Provider:          "codex",
+		Status:            coreauth.StatusError,
+		StatusMessage:     "payment_required",
+		FailureHTTPStatus: 403,
+		Unavailable:       true,
+		NextRetryAfter:    time.Now().Add(30 * time.Minute).UTC().Truncate(time.Second),
+		Attributes: map[string]string{
+			"path": filePath,
+		},
+		Metadata: map[string]any{
+			"type": "codex",
+		},
+	}); err != nil {
+		t.Fatalf("register auth: %v", err)
+	}
+
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, manager)
+	rec := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(rec)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/v0/management/auth-files", nil)
+
+	h.ListAuthFiles(ctx)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status %d, got %d body=%s", http.StatusOK, rec.Code, rec.Body.String())
+	}
+	var payload struct {
+		Files []map[string]any `json:"files"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if len(payload.Files) != 1 {
+		t.Fatalf("expected 1 file, got %d", len(payload.Files))
+	}
+	if got, ok := payload.Files[0]["http_status"].(float64); !ok || int(got) != 403 {
+		t.Fatalf("http_status = %#v, want 403", payload.Files[0]["http_status"])
+	}
+}

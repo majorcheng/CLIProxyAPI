@@ -360,6 +360,9 @@ func TestFileTokenStoreSaveAndListRoundTripRuntimeState(t *testing.T) {
 	if _, exists := runtimeState["last_error"]; exists {
 		t.Fatalf("persisted auth runtime state unexpectedly contains last_error: %#v", runtimeState)
 	}
+	if got, ok := runtimeState["http_status"].(float64); !ok || int(got) != 429 {
+		t.Fatalf("persisted auth runtime state http_status = %#v, want 429", runtimeState["http_status"])
+	}
 	modelStates, ok := runtimeState["model_states"].(map[string]any)
 	if !ok {
 		t.Fatalf("persisted model_states = %T, want map[string]any", runtimeState["model_states"])
@@ -370,6 +373,9 @@ func TestFileTokenStoreSaveAndListRoundTripRuntimeState(t *testing.T) {
 	}
 	if _, exists := modelState["last_error"]; exists {
 		t.Fatalf("persisted model runtime state unexpectedly contains last_error: %#v", modelState)
+	}
+	if got, ok := modelState["http_status"].(float64); !ok || int(got) != 429 {
+		t.Fatalf("persisted model runtime state http_status = %#v, want 429", modelState["http_status"])
 	}
 
 	auths, err := store.List(context.Background())
@@ -382,6 +388,9 @@ func TestFileTokenStoreSaveAndListRoundTripRuntimeState(t *testing.T) {
 	got := auths[0]
 	if got.LastError != nil {
 		t.Fatalf("got.LastError = %#v, want nil", got.LastError)
+	}
+	if got.FailureHTTPStatus != 429 {
+		t.Fatalf("got.FailureHTTPStatus = %d, want 429", got.FailureHTTPStatus)
 	}
 	if got.Status != cliproxyauth.StatusError {
 		t.Fatalf("got.Status = %q, want %q", got.Status, cliproxyauth.StatusError)
@@ -398,6 +407,9 @@ func TestFileTokenStoreSaveAndListRoundTripRuntimeState(t *testing.T) {
 	}
 	if state.LastError != nil {
 		t.Fatalf("got model LastError = %#v, want nil", state.LastError)
+	}
+	if state.FailureHTTPStatus != 429 {
+		t.Fatalf("got model FailureHTTPStatus = %d, want 429", state.FailureHTTPStatus)
 	}
 	if !state.NextRetryAfter.Equal(next) {
 		t.Fatalf("got model NextRetryAfter = %v, want %v", state.NextRetryAfter, next)

@@ -130,6 +130,7 @@ func TestFileSynthesizer_Synthesize_RestoresRuntimeState(t *testing.T) {
 		coreauth.PersistedRuntimeStateMetadataKey: map[string]any{
 			"status":           "error",
 			"status_message":   "quota exhausted",
+			"http_status":      429,
 			"unavailable":      true,
 			"next_retry_after": next.Format(time.RFC3339),
 			"quota": map[string]any{
@@ -143,6 +144,7 @@ func TestFileSynthesizer_Synthesize_RestoresRuntimeState(t *testing.T) {
 				"claude-sonnet": map[string]any{
 					"status":           "error",
 					"status_message":   "model quota",
+					"http_status":      429,
 					"unavailable":      true,
 					"next_retry_after": next.Format(time.RFC3339),
 					"quota": map[string]any{
@@ -182,12 +184,18 @@ func TestFileSynthesizer_Synthesize_RestoresRuntimeState(t *testing.T) {
 	if got.StatusMessage != "quota exhausted" {
 		t.Fatalf("got.StatusMessage = %q, want %q", got.StatusMessage, "quota exhausted")
 	}
+	if got.FailureHTTPStatus != 429 {
+		t.Fatalf("got.FailureHTTPStatus = %d, want 429", got.FailureHTTPStatus)
+	}
 	if !got.NextRetryAfter.Equal(next) {
 		t.Fatalf("got.NextRetryAfter = %v, want %v", got.NextRetryAfter, next)
 	}
 	state := got.ModelStates["claude-sonnet"]
 	if state == nil {
 		t.Fatal("expected restored model state for claude-sonnet")
+	}
+	if state.FailureHTTPStatus != 429 {
+		t.Fatalf("model FailureHTTPStatus = %d, want 429", state.FailureHTTPStatus)
 	}
 	if !state.NextRetryAfter.Equal(next) {
 		t.Fatalf("model NextRetryAfter = %v, want %v", state.NextRetryAfter, next)

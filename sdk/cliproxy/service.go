@@ -1390,6 +1390,9 @@ func authMaintenanceStatusCode(auth *coreauth.Auth, result *coreauth.Result) int
 	if auth.LastError != nil && auth.LastError.HTTPStatus > 0 {
 		return auth.LastError.HTTPStatus
 	}
+	if statusCode := coreauth.NormalizePersistableFailureHTTPStatus(auth.FailureHTTPStatus); statusCode > 0 {
+		return statusCode
+	}
 	switch strings.ToLower(strings.TrimSpace(auth.StatusMessage)) {
 	case "unauthorized":
 		return 401

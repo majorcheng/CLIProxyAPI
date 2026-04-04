@@ -6,10 +6,30 @@ import (
 	"time"
 )
 
+func TestNormalizePersistableFailureHTTPStatus_Whitelist(t *testing.T) {
+	t.Parallel()
+
+	cases := map[int]int{
+		0:   0,
+		401: 401,
+		402: 402,
+		403: 403,
+		404: 404,
+		429: 429,
+		500: 0,
+		503: 0,
+	}
+	for input, want := range cases {
+		if got := NormalizePersistableFailureHTTPStatus(input); got != want {
+			t.Fatalf("NormalizePersistableFailureHTTPStatus(%d) = %d, want %d", input, got, want)
+		}
+	}
+}
+
 func TestMetadataWithPersistedRuntimeState_RoundTripWithoutLastError(t *testing.T) {
 	t.Parallel()
 
-	next := time.Date(2026, 4, 1, 8, 30, 0, 0, time.UTC)
+	next := time.Now().Add(30 * time.Minute).UTC().Truncate(time.Second)
 	source := &Auth{
 		ID:             "auth-1",
 		Provider:       "codex",
@@ -65,6 +85,9 @@ func TestMetadataWithPersistedRuntimeState_RoundTripWithoutLastError(t *testing.
 	if contains := jsonContainsField(encoded, "last_error"); contains {
 		t.Fatalf("persisted runtime state should not contain last_error: %s", string(encoded))
 	}
+	if !jsonContainsField(encoded, "http_status") {
+		t.Fatalf("persisted runtime state should contain http_status: %s", string(encoded))
+	}
 
 	restored := &Auth{
 		ID:       "auth-1",
@@ -75,6 +98,9 @@ func TestMetadataWithPersistedRuntimeState_RoundTripWithoutLastError(t *testing.
 
 	if restored.LastError != nil {
 		t.Fatalf("restored.LastError = %#v, want nil", restored.LastError)
+	}
+	if restored.FailureHTTPStatus != 429 {
+		t.Fatalf("restored.FailureHTTPStatus = %d, want 429", restored.FailureHTTPStatus)
 	}
 	if restored.Status != StatusError {
 		t.Fatalf("restored.Status = %q, want %q", restored.Status, StatusError)
@@ -98,6 +124,9 @@ func TestMetadataWithPersistedRuntimeState_RoundTripWithoutLastError(t *testing.
 	if state.LastError != nil {
 		t.Fatalf("restored model LastError = %#v, want nil", state.LastError)
 	}
+	if state.FailureHTTPStatus != 429 {
+		t.Fatalf("restored model FailureHTTPStatus = %d, want 429", state.FailureHTTPStatus)
+	}
 	if !state.NextRetryAfter.Equal(next) {
 		t.Fatalf("restored model NextRetryAfter = %v, want %v", state.NextRetryAfter, next)
 	}
@@ -109,50 +138,52 @@ func TestMetadataWithPersistedRuntimeState_RoundTripWithoutLastError(t *testing.
 func TestRestorePersistedRuntimeState_ClearsExpiredCooldown(t *testing.T) {
 	t.Parallel()
 
-	now := time.Date(2026, 4, 1, 10, 0, 0, 0, time.UTC)
+	now := time.Now().UTC().Truncate(time.Second)
 	expired := now.Add(-time.Minute)
-	source := &Auth{
-		ID:             "auth-1",
-		Provider:       "codex",
-		Status:         StatusError,
-		StatusMessage:  "quota exhausted",
-		Unavailable:    true,
-		NextRetryAfter: expired,
-		Quota: QuotaState{
-			Exceeded:      true,
-			Reason:        "quota",
-			NextRecoverAt: expired,
-			BackoffLevel:  1,
-			StrikeCount:   2,
-		},
-		ModelStates: map[string]*ModelState{
-			"gpt-5.4": {
-				Status:         StatusError,
-				StatusMessage:  "quota exhausted",
-				Unavailable:    true,
-				NextRetryAfter: expired,
-				Quota: QuotaState{
-					Exceeded:      true,
-					Reason:        "quota",
-					NextRecoverAt: expired,
-					BackoffLevel:  1,
-					StrikeCount:   2,
-				},
-			},
-		},
-		Metadata: map[string]any{"type": "codex"},
-	}
-
-	metadata := MetadataWithPersistedRuntimeState(source)
 	restored := &Auth{
 		ID:       "auth-1",
 		Provider: "codex",
-		Metadata: metadata,
+		Metadata: map[string]any{
+			"type": "codex",
+			PersistedRuntimeStateMetadataKey: map[string]any{
+				"status":           StatusError,
+				"status_message":   "quota exhausted",
+				"http_status":      429,
+				"unavailable":      true,
+				"next_retry_after": expired.Format(time.RFC3339),
+				"quota": map[string]any{
+					"exceeded":        true,
+					"reason":          "quota",
+					"next_recover_at": expired.Format(time.RFC3339),
+					"backoff_level":   1,
+					"strike_count":    2,
+				},
+				"model_states": map[string]any{
+					"gpt-5.4": map[string]any{
+						"status":           StatusError,
+						"status_message":   "quota exhausted",
+						"http_status":      429,
+						"unavailable":      true,
+						"next_retry_after": expired.Format(time.RFC3339),
+						"quota": map[string]any{
+							"exceeded":        true,
+							"reason":          "quota",
+							"next_recover_at": expired.Format(time.RFC3339),
+							"backoff_level":   1,
+							"strike_count":    2,
+						},
+					},
+				},
+			},
+		},
 	}
 	RestorePersistedRuntimeState(restored, now)
 
 	if restored.Unavailable {
 		t.Fatal("restored.Unavailable = true, want false after expired cooldown")
+	}
+	if restored.FailureHTTPStatus != 0 {
+		t.Fatalf("restored.FailureHTTPStatus = %d, want 0 after expired cooldown", restored.FailureHTTPStatus)
 	}
 	if !restored.NextRetryAfter.IsZero() {
 		t.Fatalf("restored.NextRetryAfter = %v, want zero", restored.NextRetryAfter)
@@ -176,8 +207,43 @@ func TestRestorePersistedRuntimeState_ClearsExpiredCooldown(t *testing.T) {
 	if state.Unavailable {
 		t.Fatal("restored model Unavailable = true, want false")
 	}
+	if state.FailureHTTPStatus != 0 {
+		t.Fatalf("restored model FailureHTTPStatus = %d, want 0 after expired cooldown", state.FailureHTTPStatus)
+	}
 	if !state.NextRetryAfter.IsZero() {
 		t.Fatalf("restored model NextRetryAfter = %v, want zero", state.NextRetryAfter)
+	}
+}
+
+func TestMetadataWithPersistedRuntimeState_DoesNotPersistTransientRetryOnlyErrors(t *testing.T) {
+	t.Parallel()
+
+	next := time.Now().Add(time.Minute).UTC().Truncate(time.Second)
+	source := &Auth{
+		ID:                "auth-1",
+		Provider:          "codex",
+		Status:            StatusError,
+		StatusMessage:     "transient upstream error",
+		Unavailable:       true,
+		NextRetryAfter:    next,
+		FailureHTTPStatus: 0,
+		LastError:         &Error{HTTPStatus: 503, Message: "upstream unavailable"},
+		ModelStates: map[string]*ModelState{
+			"gpt-5.4": {
+				Status:            StatusError,
+				StatusMessage:     "transient upstream error",
+				Unavailable:       true,
+				NextRetryAfter:    next,
+				LastError:         &Error{HTTPStatus: 503, Message: "upstream unavailable"},
+				FailureHTTPStatus: 0,
+			},
+		},
+		Metadata: map[string]any{"type": "codex"},
+	}
+
+	metadata := MetadataWithPersistedRuntimeState(source)
+	if _, ok := metadata[PersistedRuntimeStateMetadataKey]; ok {
+		t.Fatalf("unexpected persisted runtime state for transient retry-only error: %#v", metadata[PersistedRuntimeStateMetadataKey])
 	}
 }
 

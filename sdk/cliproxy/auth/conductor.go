@@ -2151,6 +2151,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 				updateAggregatedAvailability(auth, now)
 				if !hasModelError(auth, now) {
 					auth.LastError = nil
+					auth.FailureHTTPStatus = 0
 					auth.StatusMessage = ""
 					auth.Status = StatusActive
 				}
@@ -2175,6 +2176,8 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 					}
 
 					statusCode := statusCodeFromResult(result.Error)
+					state.FailureHTTPStatus = NormalizePersistableFailureHTTPStatus(statusCode)
+					auth.FailureHTTPStatus = NormalizePersistableFailureHTTPStatus(statusCode)
 					if isModelSupportResultError(result.Error) {
 						next := now.Add(12 * time.Hour)
 						state.NextRetryAfter = next
@@ -2319,6 +2322,7 @@ func resetModelState(state *ModelState, now time.Time) {
 	state.StatusMessage = ""
 	state.NextRetryAfter = time.Time{}
 	state.LastError = nil
+	state.FailureHTTPStatus = 0
 	state.Quota = QuotaState{}
 	state.UpdatedAt = now
 }
@@ -2423,6 +2427,7 @@ func clearAuthStateOnSuccess(auth *Auth, now time.Time) {
 	auth.Quota.BackoffLevel = 0
 	auth.Quota.StrikeCount = 0
 	auth.LastError = nil
+	auth.FailureHTTPStatus = 0
 	auth.NextRetryAfter = time.Time{}
 	auth.UpdatedAt = now
 }
@@ -2755,6 +2760,7 @@ func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Durati
 		}
 	}
 	statusCode := statusCodeFromResult(resultErr)
+	auth.FailureHTTPStatus = NormalizePersistableFailureHTTPStatus(statusCode)
 	switch statusCode {
 	case 401:
 		auth.StatusMessage = "unauthorized"

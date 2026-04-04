@@ -78,6 +78,46 @@ func extractLastRefreshTimestamp(meta map[string]any) (time.Time, bool) {
 	return time.Time{}, false
 }
 
+func authFileHTTPStatus(auth *coreauth.Auth) int {
+	if auth == nil {
+		return 0
+	}
+	if auth.LastError != nil {
+		if statusCode := coreauth.NormalizePersistableFailureHTTPStatus(auth.LastError.HTTPStatus); statusCode > 0 {
+			return statusCode
+		}
+	}
+	if statusCode := coreauth.NormalizePersistableFailureHTTPStatus(auth.FailureHTTPStatus); statusCode > 0 {
+		return statusCode
+	}
+	message := strings.TrimSpace(auth.StatusMessage)
+	if message == "" {
+		return 0
+	}
+	switch strings.ToLower(message) {
+	case "unauthorized":
+		return 401
+	case "payment_required":
+		return 402
+	case "not_found":
+		return 404
+	case "quota exhausted":
+		return 429
+	}
+	if statusCode := coreauth.NormalizePersistableFailureHTTPStatus(int(gjson.Get(message, "status").Int())); statusCode > 0 {
+		return statusCode
+	}
+	if strings.EqualFold(strings.TrimSpace(gjson.Get(message, "error.type").String()), "usage_limit_reached") {
+		return 429
+	}
+	switch strings.ToLower(strings.TrimSpace(gjson.Get(message, "error.code").String())) {
+	case "token_invalidated", "token_revoked":
+		return 401
+	default:
+		return 0
+	}
+}
+
 func parseLastRefreshValue(v any) (time.Time, bool) {
 	switch val := v.(type) {
 	case string:
@@ -401,6 +441,9 @@ func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
 		"source":            "memory",
 		"size":              int64(0),
 		"has_refresh_token": authMetadataHasRefreshToken(auth.Metadata),
+	}
+	if statusCode := authFileHTTPStatus(auth); statusCode > 0 {
+		entry["http_status"] = statusCode
 	}
 	if email := authEmail(auth); email != "" {
 		entry["email"] = email

@@ -63,6 +63,49 @@ func TestFillFirstSelectorPick_FirstRegisteredAtWinsWithinSamePriority(t *testin
 	}
 }
 
+func TestFillFirstSelectorPick_PlanTypeWinsBeforeFirstRegisteredAt(t *testing.T) {
+	t.Parallel()
+
+	selector := &FillFirstSelector{}
+	older := time.Date(2026, 4, 1, 8, 0, 0, 0, time.UTC)
+	newer := older.Add(5 * time.Minute)
+	auths := []*Auth{
+		{
+			ID:       "free-older",
+			Provider: "codex",
+			Attributes: map[string]string{
+				"plan_type": "free",
+			},
+			Metadata: map[string]any{
+				"type":                       "codex",
+				FirstRegisteredAtMetadataKey: older.Format(time.RFC3339Nano),
+			},
+		},
+		{
+			ID:       "pro-newer",
+			Provider: "codex",
+			Attributes: map[string]string{
+				"plan_type": "pro",
+			},
+			Metadata: map[string]any{
+				"type":                       "codex",
+				FirstRegisteredAtMetadataKey: newer.Format(time.RFC3339Nano),
+			},
+		},
+	}
+
+	got, err := selector.Pick(context.Background(), "codex", "", cliproxyexecutor.Options{}, auths)
+	if err != nil {
+		t.Fatalf("Pick() error = %v", err)
+	}
+	if got == nil {
+		t.Fatalf("Pick() auth = nil")
+	}
+	if got.ID != "pro-newer" {
+		t.Fatalf("Pick() auth.ID = %q, want %q", got.ID, "pro-newer")
+	}
+}
+
 func TestRoundRobinSelectorPick_CyclesDeterministic(t *testing.T) {
 	t.Parallel()
 

@@ -152,6 +152,45 @@ func TestSchedulerPick_FillFirstUsesFirstRegisteredAt(t *testing.T) {
 	}
 }
 
+func TestSchedulerPick_FillFirstUsesPlanTypeBeforeFirstRegisteredAt(t *testing.T) {
+	t.Parallel()
+
+	older := time.Date(2026, 4, 1, 8, 0, 0, 0, time.UTC)
+	newer := older.Add(10 * time.Minute)
+	scheduler := newSchedulerForTest(
+		&FillFirstSelector{},
+		&Auth{
+			ID:       "free-older",
+			Provider: "codex",
+			Attributes: map[string]string{
+				"plan_type": "free",
+			},
+			Metadata: map[string]any{"type": "codex", FirstRegisteredAtMetadataKey: older.Format(time.RFC3339Nano)},
+		},
+		&Auth{
+			ID:       "pro-newer",
+			Provider: "codex",
+			Attributes: map[string]string{
+				"plan_type": "pro",
+			},
+			Metadata: map[string]any{"type": "codex", FirstRegisteredAtMetadataKey: newer.Format(time.RFC3339Nano)},
+		},
+	)
+
+	for index := 0; index < 3; index++ {
+		got, errPick := scheduler.pickSingle(context.Background(), "codex", "", cliproxyexecutor.Options{}, nil)
+		if errPick != nil {
+			t.Fatalf("pickSingle() #%d error = %v", index, errPick)
+		}
+		if got == nil {
+			t.Fatalf("pickSingle() #%d auth = nil", index)
+		}
+		if got.ID != "pro-newer" {
+			t.Fatalf("pickSingle() #%d auth.ID = %q, want %q", index, got.ID, "pro-newer")
+		}
+	}
+}
+
 func TestSchedulerPick_PromotesExpiredCooldownBeforePick(t *testing.T) {
 	t.Parallel()
 

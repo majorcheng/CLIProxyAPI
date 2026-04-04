@@ -3,6 +3,7 @@ package management
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"mime/multipart"
 	"net/http"
@@ -16,6 +17,21 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 )
+
+func fakeCodexIDTokenWithPlanType(t *testing.T, planType string) string {
+	t.Helper()
+
+	header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"none","typ":"JWT"}`))
+	payload, err := json.Marshal(map[string]any{
+		"https://api.openai.com/auth": map[string]any{
+			"chatgpt_plan_type": planType,
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal fake codex id token payload: %v", err)
+	}
+	return header + "." + base64.RawURLEncoding.EncodeToString(payload) + ".signature"
+}
 
 func TestUploadAuthFile_BatchMultipart(t *testing.T) {
 	t.Setenv("MANAGEMENT_PASSWORD", "")
@@ -322,6 +338,34 @@ func TestUploadAuthFile_BatchMultipart_PreservesFirstRegisteredAtOnSameNameUploa
 	}
 	if !storedRegisteredAt.Equal(firstRegisteredAt) {
 		t.Fatalf("stored first registered time = %s, want %s", storedRegisteredAt, firstRegisteredAt)
+	}
+}
+
+func TestBuildAuthFromFileData_CodexPlanTypeFromIDToken(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	gin.SetMode(gin.TestMode)
+
+	authDir := t.TempDir()
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, nil)
+
+	content, err := json.Marshal(map[string]any{
+		"type":     "codex",
+		"email":    "alpha@example.com",
+		"id_token": fakeCodexIDTokenWithPlanType(t, "plus"),
+	})
+	if err != nil {
+		t.Fatalf("marshal auth content: %v", err)
+	}
+
+	auth, err := h.buildAuthFromFileData(filepath.Join(authDir, "alpha.json"), content)
+	if err != nil {
+		t.Fatalf("buildAuthFromFileData() error = %v", err)
+	}
+	if auth == nil {
+		t.Fatalf("buildAuthFromFileData() auth = nil")
+	}
+	if got := auth.Attributes["plan_type"]; got != "plus" {
+		t.Fatalf("auth.Attributes[plan_type] = %q, want %q", got, "plus")
 	}
 }
 

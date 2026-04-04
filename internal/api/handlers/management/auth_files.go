@@ -387,6 +387,9 @@ func (h *Handler) listAuthFilesFromDisk(c *gin.Context) {
 			firstRegisteredAt = parsed
 		}
 		fileData["first_registered_at"] = firstRegisteredAt
+		if planType := authFileDataPlanType(typeValue, data); planType != "" {
+			fileData["plan_type"] = planType
+		}
 		if pv := gjson.GetBytes(data, "priority"); pv.Exists() {
 			switch pv.Type {
 			case gjson.Number:
@@ -456,6 +459,9 @@ func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
 			entry["account"] = account
 		}
 	}
+	if planType := coreauth.AuthChatGPTPlanType(auth); planType != "" {
+		entry["plan_type"] = planType
+	}
 	if !auth.CreatedAt.IsZero() {
 		entry["created_at"] = auth.CreatedAt
 	}
@@ -490,6 +496,13 @@ func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
 	}
 	if claims := extractCodexIDTokenClaims(auth); claims != nil {
 		entry["id_token"] = claims
+		if _, ok := entry["plan_type"]; !ok {
+			if rawPlanType, okPlanType := claims["plan_type"].(string); okPlanType {
+				if normalized := coreauth.NormalizeChatGPTPlanType(rawPlanType); normalized != "" {
+					entry["plan_type"] = normalized
+				}
+			}
+		}
 	}
 	// Expose priority from Attributes (set by synthesizer from JSON "priority" field).
 	// Fall back to Metadata for auths registered via UploadAuthFile (no synthesizer).
@@ -530,6 +543,19 @@ func sortAuthFileEntries(files []gin.H) {
 		return
 	}
 	sort.Slice(files, func(i, j int) bool {
+		leftProvider := authFileEntryProvider(files[i])
+		rightProvider := authFileEntryProvider(files[j])
+		if strings.EqualFold(leftProvider, rightProvider) {
+			leftRank, leftRankOK := coreauth.ChatGPTPlanTypeSortRank(authFileEntryPlanType(files[i]))
+			rightRank, rightRankOK := coreauth.ChatGPTPlanTypeSortRank(authFileEntryPlanType(files[j]))
+			switch {
+			case leftRankOK != rightRankOK:
+				return leftRankOK
+			case leftRankOK && rightRankOK && leftRank != rightRank:
+				return leftRank < rightRank
+			}
+		}
+
 		leftTime := authFileEntryFirstRegisteredAt(files[i])
 		rightTime := authFileEntryFirstRegisteredAt(files[j])
 		switch {
@@ -542,6 +568,43 @@ func sortAuthFileEntries(files []gin.H) {
 		nameJ := strings.ToLower(strings.TrimSpace(authFileEntryName(files[j])))
 		return nameI < nameJ
 	})
+}
+
+func authFileEntryProvider(entry gin.H) string {
+	if entry == nil {
+		return ""
+	}
+	if provider, ok := entry["provider"].(string); ok {
+		return strings.TrimSpace(provider)
+	}
+	if provider, ok := entry["type"].(string); ok {
+		return strings.TrimSpace(provider)
+	}
+	return ""
+}
+
+func authFileEntryPlanType(entry gin.H) string {
+	if entry == nil {
+		return ""
+	}
+	if rawPlanType, ok := entry["plan_type"].(string); ok {
+		return coreauth.NormalizeChatGPTPlanType(rawPlanType)
+	}
+	rawClaims, ok := entry["id_token"]
+	if !ok || rawClaims == nil {
+		return ""
+	}
+	switch claims := rawClaims.(type) {
+	case gin.H:
+		if rawPlanType, okPlanType := claims["plan_type"].(string); okPlanType {
+			return coreauth.NormalizeChatGPTPlanType(rawPlanType)
+		}
+	case map[string]any:
+		if rawPlanType, okPlanType := claims["plan_type"].(string); okPlanType {
+			return coreauth.NormalizeChatGPTPlanType(rawPlanType)
+		}
+	}
+	return ""
 }
 
 func authFileEntryFirstRegisteredAt(entry gin.H) time.Time {
@@ -592,6 +655,50 @@ func authFileDataHasRefreshToken(data []byte) bool {
 		}
 	}
 	return false
+}
+
+func authFileDataPlanType(provider string, data []byte) string {
+	if len(data) == 0 || !strings.EqualFold(strings.TrimSpace(provider), "codex") {
+		return ""
+	}
+	for _, path := range []string{"plan_type", "metadata.plan_type"} {
+		if normalized := coreauth.NormalizeChatGPTPlanType(gjson.GetBytes(data, path).String()); normalized != "" {
+			return normalized
+		}
+	}
+	for _, path := range []string{"id_token", "metadata.id_token", "token.id_token"} {
+		if normalized := codexPlanTypeFromIDToken(gjson.GetBytes(data, path).String()); normalized != "" {
+			return normalized
+		}
+	}
+	return ""
+}
+
+func codexPlanTypeFromIDToken(idToken string) string {
+	idToken = strings.TrimSpace(idToken)
+	if idToken == "" {
+		return ""
+	}
+	claims, err := codex.ParseJWTToken(idToken)
+	if err != nil || claims == nil {
+		return ""
+	}
+	return coreauth.NormalizeChatGPTPlanType(claims.CodexAuthInfo.ChatgptPlanType)
+}
+
+func codexPlanTypeFromMetadata(metadata map[string]any) string {
+	if metadata == nil {
+		return ""
+	}
+	if rawPlanType, ok := metadata["plan_type"].(string); ok {
+		if normalized := coreauth.NormalizeChatGPTPlanType(rawPlanType); normalized != "" {
+			return normalized
+		}
+	}
+	if rawIDToken, ok := metadata["id_token"].(string); ok {
+		return codexPlanTypeFromIDToken(rawIDToken)
+	}
+	return ""
 }
 
 func extractCodexIDTokenClaims(auth *coreauth.Auth) gin.H {
@@ -1152,6 +1259,9 @@ func (h *Handler) buildAuthFromFileData(path string, data []byte) (*coreauth.Aut
 	attr := map[string]string{
 		"path":   path,
 		"source": path,
+	}
+	if planType := codexPlanTypeFromMetadata(metadata); planType != "" {
+		attr["plan_type"] = planType
 	}
 	auth := &coreauth.Auth{
 		ID:         authID,

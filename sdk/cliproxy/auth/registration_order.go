@@ -2,6 +2,7 @@ package auth
 
 import (
 	"sort"
+	"strings"
 	"time"
 )
 
@@ -96,7 +97,82 @@ func ensureFirstRegisteredAtWithChanged(auth *Auth, fallback time.Time) (time.Ti
 	return fallback, true
 }
 
+// NormalizeChatGPTPlanType 统一 Codex/ChatGPT 账号计划类型写法，
+// 便于在 fill-first 中做稳定排序。
+// 目前将 business/go 视为 team 同一档位，和现有模型放行逻辑保持一致。
+func NormalizeChatGPTPlanType(raw string) string {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "pro":
+		return "pro"
+	case "plus":
+		return "plus"
+	case "team", "business", "go":
+		return "team"
+	case "free":
+		return "free"
+	default:
+		return ""
+	}
+}
+
+// ChatGPTPlanTypeSortRank 返回计划类型的排序权重：
+// pro -> plus -> team -> free。
+// 未识别的类型返回 ok=false，由调用方决定是否回退到其它排序键。
+func ChatGPTPlanTypeSortRank(raw string) (rank int, ok bool) {
+	switch NormalizeChatGPTPlanType(raw) {
+	case "pro":
+		return 0, true
+	case "plus":
+		return 1, true
+	case "team":
+		return 2, true
+	case "free":
+		return 3, true
+	default:
+		return 0, false
+	}
+}
+
+// AuthChatGPTPlanType 读取 auth 上可用的计划类型。
+// 优先使用 Attributes 中已整理好的 plan_type；若没有，再回退到 metadata。
+func AuthChatGPTPlanType(auth *Auth) string {
+	if auth == nil {
+		return ""
+	}
+	if auth.Attributes != nil {
+		if normalized := NormalizeChatGPTPlanType(auth.Attributes["plan_type"]); normalized != "" {
+			return normalized
+		}
+	}
+	if auth.Metadata != nil {
+		if raw, ok := auth.Metadata["plan_type"].(string); ok {
+			return NormalizeChatGPTPlanType(raw)
+		}
+	}
+	return ""
+}
+
+func authProviderKey(auth *Auth) string {
+	if auth == nil {
+		return ""
+	}
+	return strings.ToLower(strings.TrimSpace(auth.Provider))
+}
+
 func firstRegisteredAtLess(left, right *Auth) bool {
+	// 仅在同一 provider 内比较计划档位，避免 mixed-provider 场景被
+	// ChatGPT plan_type 扩散成跨 provider 的全局优先级。
+	if authProviderKey(left) == authProviderKey(right) {
+		leftRank, leftRankOK := ChatGPTPlanTypeSortRank(AuthChatGPTPlanType(left))
+		rightRank, rightRankOK := ChatGPTPlanTypeSortRank(AuthChatGPTPlanType(right))
+		switch {
+		case leftRankOK != rightRankOK:
+			return leftRankOK
+		case leftRankOK && rightRankOK && leftRank != rightRank:
+			return leftRank < rightRank
+		}
+	}
+
 	leftTime, leftOK := FirstRegisteredAt(left)
 	rightTime, rightOK := FirstRegisteredAt(right)
 

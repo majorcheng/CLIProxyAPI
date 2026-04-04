@@ -139,6 +139,130 @@ func TestListAuthFilesFromDisk_SortsByFirstRegisteredAt(t *testing.T) {
 	}
 }
 
+func TestListAuthFiles_SortsByPlanTypeBeforeFirstRegisteredAt(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	gin.SetMode(gin.TestMode)
+
+	authDir := t.TempDir()
+	manager := coreauth.NewManager(nil, nil, nil)
+	older := time.Date(2026, 4, 1, 8, 0, 0, 0, time.UTC)
+	newer := older.Add(10 * time.Minute)
+	freePath := filepath.Join(authDir, "free-older.json")
+	proPath := filepath.Join(authDir, "pro-newer.json")
+	if err := os.WriteFile(freePath, []byte(`{"type":"codex"}`), 0o600); err != nil {
+		t.Fatalf("write free file: %v", err)
+	}
+	if err := os.WriteFile(proPath, []byte(`{"type":"codex"}`), 0o600); err != nil {
+		t.Fatalf("write pro file: %v", err)
+	}
+
+	if _, err := manager.Register(context.Background(), &coreauth.Auth{
+		ID:        "free-older.json",
+		FileName:  "free-older.json",
+		Provider:  "codex",
+		CreatedAt: older,
+		Attributes: map[string]string{
+			"path":      freePath,
+			"plan_type": "free",
+		},
+		Metadata: map[string]any{
+			"type":                                "codex",
+			coreauth.FirstRegisteredAtMetadataKey: older.Format(time.RFC3339Nano),
+		},
+	}); err != nil {
+		t.Fatalf("register free auth: %v", err)
+	}
+	if _, err := manager.Register(context.Background(), &coreauth.Auth{
+		ID:        "pro-newer.json",
+		FileName:  "pro-newer.json",
+		Provider:  "codex",
+		CreatedAt: newer,
+		Attributes: map[string]string{
+			"path":      proPath,
+			"plan_type": "pro",
+		},
+		Metadata: map[string]any{
+			"type":                                "codex",
+			coreauth.FirstRegisteredAtMetadataKey: newer.Format(time.RFC3339Nano),
+		},
+	}); err != nil {
+		t.Fatalf("register pro auth: %v", err)
+	}
+
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, manager)
+	rec := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(rec)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/v0/management/auth-files", nil)
+
+	h.ListAuthFiles(ctx)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status %d, got %d body=%s", http.StatusOK, rec.Code, rec.Body.String())
+	}
+	var payload struct {
+		Files []map[string]any `json:"files"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if len(payload.Files) != 2 {
+		t.Fatalf("expected 2 files, got %d", len(payload.Files))
+	}
+	if got := payload.Files[0]["name"]; got != "pro-newer.json" {
+		t.Fatalf("first file name = %#v, want %q", got, "pro-newer.json")
+	}
+}
+
+func TestListAuthFilesFromDisk_SortsByPlanTypeBeforeFirstRegisteredAt(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	gin.SetMode(gin.TestMode)
+
+	authDir := t.TempDir()
+	older := time.Date(2026, 4, 1, 8, 0, 0, 0, time.UTC)
+	newer := older.Add(10 * time.Minute)
+
+	writeJSON := func(name, planType string, registeredAt time.Time) {
+		t.Helper()
+		content := map[string]any{
+			"type":                                "codex",
+			"plan_type":                           planType,
+			coreauth.FirstRegisteredAtMetadataKey: registeredAt.Format(time.RFC3339Nano),
+		}
+		data, err := json.Marshal(content)
+		if err != nil {
+			t.Fatalf("marshal %s: %v", name, err)
+		}
+		if err = os.WriteFile(filepath.Join(authDir, name), data, 0o600); err != nil {
+			t.Fatalf("write %s: %v", name, err)
+		}
+	}
+	writeJSON("free-older.json", "free", older)
+	writeJSON("pro-newer.json", "pro", newer)
+
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, nil)
+	rec := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(rec)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/v0/management/auth-files", nil)
+
+	h.ListAuthFiles(ctx)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status %d, got %d body=%s", http.StatusOK, rec.Code, rec.Body.String())
+	}
+	var payload struct {
+		Files []map[string]any `json:"files"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if len(payload.Files) != 2 {
+		t.Fatalf("expected 2 files, got %d", len(payload.Files))
+	}
+	if got := payload.Files[0]["name"]; got != "pro-newer.json" {
+		t.Fatalf("first file name = %#v, want %q", got, "pro-newer.json")
+	}
+}
+
 func TestListAuthFiles_ExposesHasRefreshToken(t *testing.T) {
 	t.Setenv("MANAGEMENT_PASSWORD", "")
 	gin.SetMode(gin.TestMode)

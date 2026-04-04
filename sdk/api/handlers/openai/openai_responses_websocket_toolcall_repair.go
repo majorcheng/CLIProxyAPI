@@ -264,15 +264,16 @@ func repairResponsesToolCallsArray(outputCache, callCache *websocketToolOutputCa
 		if len(item) == 0 {
 			continue
 		}
-		switch strings.TrimSpace(gjson.GetBytes(item, "type").String()) {
-		case "function_call_output":
+		itemType := strings.TrimSpace(gjson.GetBytes(item, "type").String())
+		switch {
+		case isResponsesToolCallOutputType(itemType):
 			callID := strings.TrimSpace(gjson.GetBytes(item, "call_id").String())
 			if callID == "" {
 				continue
 			}
 			outputPresent[callID] = struct{}{}
 			outputCache.record(sessionKey, callID, item)
-		case "function_call":
+		case isResponsesToolCallType(itemType):
 			callID := strings.TrimSpace(gjson.GetBytes(item, "call_id").String())
 			if callID == "" {
 				continue
@@ -291,9 +292,10 @@ func repairResponsesToolCallsArray(outputCache, callCache *websocketToolOutputCa
 			continue
 		}
 		itemType := strings.TrimSpace(gjson.GetBytes(item, "type").String())
-		if itemType == "function_call_output" {
+		if isResponsesToolCallOutputType(itemType) {
 			callID := strings.TrimSpace(gjson.GetBytes(item, "call_id").String())
 			if callID == "" {
+				// 上游会拒绝缺少 call_id 的 tool output，这里直接丢弃。
 				continue
 			}
 
@@ -319,15 +321,17 @@ func repairResponsesToolCallsArray(outputCache, callCache *websocketToolOutputCa
 				}
 			}
 
+			// 缺少对应 tool call 的孤儿 output 不能继续上送。
 			continue
 		}
-		if itemType != "function_call" {
+		if !isResponsesToolCallType(itemType) {
 			filtered = append(filtered, item)
 			continue
 		}
 
 		callID := strings.TrimSpace(gjson.GetBytes(item, "call_id").String())
 		if callID == "" {
+			// 上游会拒绝缺少 call_id 的 tool call，这里直接丢弃。
 			continue
 		}
 
@@ -342,6 +346,8 @@ func repairResponsesToolCallsArray(outputCache, callCache *websocketToolOutputCa
 			outputPresent[callID] = struct{}{}
 			continue
 		}
+
+		// 缺少 output 的孤儿 tool call 不能继续上送。
 	}
 
 	out, errMarshal := json.Marshal(filtered)
@@ -369,7 +375,7 @@ func recordResponsesWebsocketToolCallsFromPayloadWithCache(cache *websocketToolO
 			return
 		}
 		for _, item := range output.Array() {
-			if strings.TrimSpace(item.Get("type").String()) != "function_call" {
+			if !isResponsesToolCallType(item.Get("type").String()) {
 				continue
 			}
 			callID := strings.TrimSpace(item.Get("call_id").String())
@@ -383,7 +389,7 @@ func recordResponsesWebsocketToolCallsFromPayloadWithCache(cache *websocketToolO
 		if !item.Exists() || !item.IsObject() {
 			return
 		}
-		if strings.TrimSpace(item.Get("type").String()) != "function_call" {
+		if !isResponsesToolCallType(item.Get("type").String()) {
 			return
 		}
 		callID := strings.TrimSpace(item.Get("call_id").String())
@@ -391,5 +397,23 @@ func recordResponsesWebsocketToolCallsFromPayloadWithCache(cache *websocketToolO
 			return
 		}
 		cache.record(sessionKey, callID, json.RawMessage(item.Raw))
+	}
+}
+
+func isResponsesToolCallType(itemType string) bool {
+	switch strings.TrimSpace(itemType) {
+	case "function_call", "custom_tool_call":
+		return true
+	default:
+		return false
+	}
+}
+
+func isResponsesToolCallOutputType(itemType string) bool {
+	switch strings.TrimSpace(itemType) {
+	case "function_call_output", "custom_tool_call_output":
+		return true
+	default:
+		return false
 	}
 }

@@ -147,3 +147,33 @@ func TestLookupModelInfoReturnsCloneForStaticDefinitions(t *testing.T) {
 		t.Fatalf("expected static lookup clone, got %+v", second)
 	}
 }
+
+func TestCodexPlanStaticModelsIncludeGPT54Mini(t *testing.T) {
+	tests := []struct {
+		name   string
+		models []*ModelInfo
+	}{
+		{name: "codex-free", models: GetCodexFreeModels()},
+		{name: "codex-team", models: GetCodexTeamModels()},
+		{name: "codex-plus", models: GetCodexPlusModels()},
+		{name: "codex-pro", models: GetCodexProModels()},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			found := false
+			for _, model := range tt.models {
+				if model != nil && model.ID == "gpt-5.4-mini" {
+					found = true
+					if model.Thinking == nil || len(model.Thinking.Levels) == 0 {
+						t.Fatalf("expected gpt-5.4-mini thinking levels in %s", tt.name)
+					}
+					break
+				}
+			}
+			if !found {
+				t.Fatalf("expected gpt-5.4-mini in %s static models", tt.name)
+			}
+		})
+	}
+}

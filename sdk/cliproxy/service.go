@@ -1400,10 +1400,16 @@ func (s *Service) disableAuthMaintenanceCandidate(ctx context.Context, candidate
 }
 
 func authEligibleForMaintenanceDelete(auth *coreauth.Auth, result *coreauth.Result, cfg config.AuthMaintenanceConfig, _ time.Time) (string, bool) {
+	if auth == nil {
+		return "", false
+	}
+	if !authMaintenanceDeleteAllowed(auth, result) {
+		return "", false
+	}
 	if reason, ok := authMaintenancePendingDeleteReason(auth); ok {
 		return reason, true
 	}
-	if auth == nil || auth.Disabled || auth.Status == coreauth.StatusDisabled {
+	if auth.Disabled || auth.Status == coreauth.StatusDisabled {
 		return "", false
 	}
 	if statusCode := authMaintenanceStatusCode(auth, result); containsStatusCode(cfg.DeleteStatusCodes, statusCode) {
@@ -1440,6 +1446,47 @@ func authMaintenanceStatusCode(auth *coreauth.Auth, result *coreauth.Result) int
 	default:
 		return authMaintenanceStatusCodeFromMessage(auth.StatusMessage)
 	}
+}
+
+func authMaintenanceDeleteAllowed(auth *coreauth.Auth, result *coreauth.Result) bool {
+	if auth == nil {
+		return false
+	}
+	if !strings.EqualFold(strings.TrimSpace(auth.Provider), "codex") {
+		return true
+	}
+	return authMaintenanceDeletePlanType(auth, result) == "free"
+}
+
+func authMaintenanceDeletePlanType(auth *coreauth.Auth, result *coreauth.Result) string {
+	if normalized := coreauth.AuthChatGPTPlanType(auth); normalized != "" {
+		return normalized
+	}
+	if result != nil && result.Error != nil {
+		if normalized := authMaintenancePlanTypeFromMessage(result.Error.Message); normalized != "" {
+			return normalized
+		}
+	}
+	if auth != nil {
+		if normalized := authMaintenancePlanTypeFromMessage(auth.StatusMessage); normalized != "" {
+			return normalized
+		}
+	}
+	return ""
+}
+
+func authMaintenancePlanTypeFromMessage(message string) string {
+	message = strings.TrimSpace(message)
+	if message == "" {
+		return ""
+	}
+	if normalized := coreauth.NormalizeChatGPTPlanType(gjson.Get(message, "error.plan_type").String()); normalized != "" {
+		return normalized
+	}
+	if normalized := coreauth.NormalizeChatGPTPlanType(gjson.Get(message, "plan_type").String()); normalized != "" {
+		return normalized
+	}
+	return ""
 }
 
 func authMaintenanceStatusCodeFromResult(result *coreauth.Result) int {

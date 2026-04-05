@@ -228,7 +228,7 @@ func TestScanAuthMaintenanceCandidates_GroupsByPath(t *testing.T) {
 			Provider:    "codex",
 			Status:      coreauth.StatusError,
 			LastError:   &coreauth.Error{HTTPStatus: 401, Message: "unauthorized"},
-			Attributes:  map[string]string{"path": sharedPath},
+			Attributes:  map[string]string{"path": sharedPath, "plan_type": "free"},
 			UpdatedAt:   timeNowForTest(),
 			Unavailable: true,
 		},
@@ -245,7 +245,7 @@ func TestScanAuthMaintenanceCandidates_GroupsByPath(t *testing.T) {
 			FileName:   filepath.Base(quotaPath),
 			Provider:   "codex",
 			Status:     coreauth.StatusError,
-			Attributes: map[string]string{"path": quotaPath},
+			Attributes: map[string]string{"path": quotaPath, "plan_type": "free"},
 			Quota: coreauth.QuotaState{
 				Exceeded:    true,
 				Reason:      "quota",
@@ -363,7 +363,7 @@ func TestScanAuthMaintenanceCandidates_429StatusCodeQueuesImmediateDelete(t *tes
 		Provider:   "codex",
 		Status:     coreauth.StatusError,
 		LastError:  &coreauth.Error{HTTPStatus: 429, Message: "quota"},
-		Attributes: map[string]string{"path": quotaPath},
+		Attributes: map[string]string{"path": quotaPath, "plan_type": "free"},
 		Quota: coreauth.QuotaState{
 			Exceeded:    true,
 			Reason:      "quota",
@@ -405,7 +405,7 @@ func TestScanAuthMaintenanceCandidates_StatusMessageJSON401QueuesDelete(t *testi
 		Provider:      "codex",
 		Status:        coreauth.StatusError,
 		StatusMessage: "{\n  \"error\": {\n    \"message\": \"Your authentication token has been invalidated. Please try signing in again.\",\n    \"type\": \"invalid_request_error\",\n    \"code\": \"token_invalidated\",\n    \"param\": null\n  },\n  \"status\": 401\n}",
-		Attributes:    map[string]string{"path": filePath},
+		Attributes:    map[string]string{"path": filePath, "plan_type": "free"},
 		UpdatedAt:     timeNowForTest(),
 		Unavailable:   true,
 	}
@@ -456,6 +456,39 @@ func TestScanAuthMaintenanceCandidates_StatusMessageUsageLimitJSONQueuesDelete(t
 	}
 	if got := candidates[0].Reason; got != "http_429" {
 		t.Fatalf("expected usage_limit_reached status_message to queue delete, got %q", got)
+	}
+}
+
+func TestScanAuthMaintenanceCandidates_NonFreeCodexSkipsDelete(t *testing.T) {
+	authDir := t.TempDir()
+	service := &Service{
+		cfg: &config.Config{
+			AuthDir: authDir,
+			AuthMaintenance: config.AuthMaintenanceConfig{
+				Enable:            true,
+				DeleteStatusCodes: []int{401, 429},
+			},
+		},
+		coreManager: coreauth.NewManager(nil, nil, nil),
+	}
+
+	filePath := filepath.Join(authDir, "status-team.json")
+	auth := &coreauth.Auth{
+		ID:         "status-team",
+		FileName:   filepath.Base(filePath),
+		Provider:   "codex",
+		Status:     coreauth.StatusError,
+		LastError:  &coreauth.Error{HTTPStatus: 401, Message: "unauthorized"},
+		Attributes: map[string]string{"path": filePath, "plan_type": "team"},
+		UpdatedAt:  timeNowForTest(),
+	}
+	if _, err := service.coreManager.Register(context.Background(), auth); err != nil {
+		t.Fatalf("failed to register auth: %v", err)
+	}
+
+	candidates := service.scanAuthMaintenanceCandidates(timeNowForTest(), service.cfg.AuthMaintenance, authDir)
+	if len(candidates) != 0 {
+		t.Fatalf("expected non-free codex auth not to be queued for delete, got %#v", candidates)
 	}
 }
 
@@ -691,7 +724,8 @@ func TestScanAuthMaintenanceCandidates_DisabledPendingDeleteStillQueues(t *testi
 		Status:   coreauth.StatusDisabled,
 		Disabled: true,
 		Attributes: map[string]string{
-			"path": filePath,
+			"path":      filePath,
+			"plan_type": "free",
 		},
 		Metadata: map[string]any{
 			"disabled":                               true,
@@ -1118,7 +1152,7 @@ func TestHandleAuthMaintenanceResult_SharedPathDisablesAllAuthsAndQueuesSingleCa
 			FileName:   filepath.Base(filePath),
 			Provider:   "codex",
 			Status:     coreauth.StatusActive,
-			Attributes: map[string]string{"path": filePath},
+			Attributes: map[string]string{"path": filePath, "plan_type": "free"},
 			Metadata:   map[string]any{"email": "primary@example.com"},
 		},
 		{
@@ -1199,7 +1233,7 @@ func TestScanAuthMaintenanceCandidates_LargeAuthPool9053(t *testing.T) {
 			FileName:   fileName,
 			Provider:   "codex",
 			Status:     coreauth.StatusActive,
-			Attributes: map[string]string{"path": filePath},
+			Attributes: map[string]string{"path": filePath, "plan_type": "free"},
 			UpdatedAt:  timeNowForTest(),
 		}
 		switch {

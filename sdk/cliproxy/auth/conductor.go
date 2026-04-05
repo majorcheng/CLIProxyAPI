@@ -3,8 +3,6 @@ package auth
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io"
@@ -186,10 +184,6 @@ type Manager struct {
 	// Auto refresh state
 	refreshCancel    context.CancelFunc
 	refreshSemaphore chan struct{}
-	// codexInitialRefreshSeen 只记录当前 manager 生命周期内已经触发过
-	// “首读强制刷新”的 Codex token，避免同一 refresh_token 在失败回退后
-	// 又被重复当成“首次读取”。
-	codexInitialRefreshSeen map[string]struct{}
 
 	// Async persistence state for high-frequency runtime updates.
 	persistStartOnce sync.Once
@@ -207,16 +201,15 @@ func NewManager(store Store, selector Selector, hook Hook) *Manager {
 		hook = NoopHook{}
 	}
 	manager := &Manager{
-		store:                   store,
-		executors:               make(map[string]ProviderExecutor),
-		selector:                selector,
-		blockedRequests:         newBlockedRequestLRU(1000),
-		auths:                   make(map[string]*Auth),
-		providerOffsets:         make(map[string]int),
-		inflightPerAuth:         make(map[string]int),
-		modelPoolOffsets:        make(map[string]int),
-		refreshSemaphore:        make(chan struct{}, refreshMaxConcurrency),
-		codexInitialRefreshSeen: make(map[string]struct{}),
+		store:            store,
+		executors:        make(map[string]ProviderExecutor),
+		selector:         selector,
+		blockedRequests:  newBlockedRequestLRU(1000),
+		auths:            make(map[string]*Auth),
+		providerOffsets:  make(map[string]int),
+		inflightPerAuth:  make(map[string]int),
+		modelPoolOffsets: make(map[string]int),
+		refreshSemaphore: make(chan struct{}, refreshMaxConcurrency),
 	}
 	manager.hookValue.Store(hookState{hook: hook})
 	// atomic.Value requires non-nil initial value.
@@ -1080,7 +1073,9 @@ func (m *Manager) Register(ctx context.Context, auth *Auth) (*Auth, error) {
 	if m.scheduler != nil {
 		m.scheduler.upsertAuth(schedulerSnapshot)
 	}
-	_ = m.persist(ctx, auth)
+	if errPersist := m.persist(ctx, auth); errPersist != nil {
+		log.WithError(errPersist).Warnf("auth manager: 持久化认证 %s 失败", strings.TrimSpace(auth.ID))
+	}
 	hook := m.Hook()
 	hook.OnAuthRegistered(ctx, auth.Clone())
 	return auth.Clone(), nil
@@ -1121,7 +1116,9 @@ func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
 	if m.scheduler != nil {
 		m.scheduler.upsertAuth(schedulerSnapshot)
 	}
-	_ = m.persist(ctx, auth)
+	if errPersist := m.persist(ctx, auth); errPersist != nil {
+		log.WithError(errPersist).Warnf("auth manager: 持久化认证 %s 失败", strings.TrimSpace(auth.ID))
+	}
 	hook := m.Hook()
 	hook.OnAuthUpdated(ctx, auth.Clone())
 	return auth.Clone(), nil
@@ -3211,10 +3208,10 @@ func (m *Manager) StartAutoRefresh(parent context.Context, interval time.Duratio
 	}()
 }
 
-// TriggerCodexInitialRefreshOnLoadIfNeeded 会在 auth 首次被当前 manager 读到后，
-// 按配置决定是否立即发起一次后台 refresh。
-// 该触发只针对 Codex 且要求 refresh_token 非空，并且同一 refresh_token
-// 在当前 manager 生命周期内最多只会触发一次。
+// TriggerCodexInitialRefreshOnLoadIfNeeded 只会在 auth metadata 仍带有
+// “新文件初始 refresh 待处理”标记时，按配置决定是否立即发起一次后台 refresh。
+// 这样可以把 codex-initial-refresh-on-load 收口成“新文件首次入池的一次性初始交换”，
+// 避免 RT 轮转后又被当成“首次读取”重复触发。
 func (m *Manager) TriggerCodexInitialRefreshOnLoadIfNeeded(ctx context.Context, id string) {
 	if m == nil || strings.TrimSpace(id) == "" {
 		return
@@ -3226,6 +3223,7 @@ func (m *Manager) TriggerCodexInitialRefreshOnLoadIfNeeded(ctx context.Context, 
 	if !m.markCodexInitialRefreshPending(id, now) {
 		return
 	}
+	log.Debugf("codex 新文件初始 refresh 已调度: %s", strings.TrimSpace(id))
 	go m.refreshAuthWithLimit(ctx, id)
 }
 
@@ -3376,7 +3374,7 @@ func (m *Manager) shouldRefreshCodexFromTokenJSON(a *Auth, now, lastRefresh, exp
 	if !authHasRefreshToken(a) {
 		return false
 	}
-	if m.shouldTriggerCodexInitialRefreshOnLoad(a) {
+	if m.codexInitialRefreshOnLoadEnabled() && CodexInitialRefreshPending(a) {
 		return true
 	}
 
@@ -3420,44 +3418,6 @@ func authHasRefreshToken(a *Auth) bool {
 	}
 	refreshToken, _ := a.Metadata["refresh_token"].(string)
 	return strings.TrimSpace(refreshToken) != ""
-}
-
-// shouldTriggerCodexInitialRefreshOnLoad 只在显式开启配置时，
-// 对“首次读到且 refresh_token 非空”的 Codex auth 放开一次强制刷新。
-// 这个“一次”只在当前 manager 生命周期内生效，不落盘；
-// 首刷完成后，后续仍回到常规保守门控。
-func (m *Manager) shouldTriggerCodexInitialRefreshOnLoad(a *Auth) bool {
-	if m == nil || a == nil || !m.codexInitialRefreshOnLoadEnabled() {
-		return false
-	}
-	attemptKey, ok := codexInitialRefreshAttemptKey(a)
-	if !ok {
-		return false
-	}
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if _, seen := m.codexInitialRefreshSeen[attemptKey]; seen {
-		return false
-	}
-	m.codexInitialRefreshSeen[attemptKey] = struct{}{}
-	return true
-}
-
-func codexInitialRefreshAttemptKey(a *Auth) (string, bool) {
-	if a == nil {
-		return "", false
-	}
-	authID := strings.TrimSpace(a.ID)
-	if authID == "" || len(a.Metadata) == 0 {
-		return "", false
-	}
-	refreshToken, _ := a.Metadata["refresh_token"].(string)
-	refreshToken = strings.TrimSpace(refreshToken)
-	if refreshToken == "" {
-		return "", false
-	}
-	sum := sha256.Sum256([]byte(refreshToken))
-	return authID + ":" + hex.EncodeToString(sum[:]), true
 }
 
 func authPreferredInterval(a *Auth) time.Duration {
@@ -3635,17 +3595,12 @@ func (m *Manager) markCodexInitialRefreshPending(id string, now time.Time) bool 
 	if !m.codexInitialRefreshOnLoadEnabled() || !strings.EqualFold(strings.TrimSpace(auth.Provider), "codex") {
 		return false
 	}
-	attemptKey, ok := codexInitialRefreshAttemptKey(auth)
-	if !ok {
-		return false
-	}
-	if _, seen := m.codexInitialRefreshSeen[attemptKey]; seen {
+	if !CodexInitialRefreshPending(auth) {
 		return false
 	}
 	if !auth.NextRefreshAfter.IsZero() && now.Before(auth.NextRefreshAfter) {
 		return false
 	}
-	m.codexInitialRefreshSeen[attemptKey] = struct{}{}
 	auth.NextRefreshAfter = now.Add(refreshPendingBackoff)
 	m.auths[id] = auth
 	return true
@@ -3666,6 +3621,7 @@ func (m *Manager) refreshAuth(ctx context.Context, id string) {
 		return
 	}
 	cloned := auth.Clone()
+	initialRefreshPending := m.codexInitialRefreshOnLoadEnabled() && CodexInitialRefreshPending(cloned)
 	updated, err := exec.Refresh(ctx, cloned)
 	if err != nil && errors.Is(err, context.Canceled) {
 		log.Debugf("refresh canceled for %s, %s", auth.Provider, auth.ID)
@@ -3675,20 +3631,35 @@ func (m *Manager) refreshAuth(ctx context.Context, id string) {
 	now := time.Now()
 	if err != nil {
 		refreshErr := &Error{Message: err.Error()}
-		if status := terminalStatusCodeFromError(err); status > 0 {
-			refreshErr.HTTPStatus = status
+		terminalStatus := terminalStatusCodeFromError(err)
+		if terminalStatus > 0 {
+			refreshErr.HTTPStatus = terminalStatus
 		}
+		var persistSnapshot *Auth
 		m.mu.Lock()
 		if current := m.auths[id]; current != nil {
 			current.NextRefreshAfter = now.Add(refreshFailureBackoff)
 			current.LastError = refreshErr
 			current.UpdatedAt = now
+			if initialRefreshPending && terminalStatus > 0 && ClearCodexInitialRefreshPending(current) {
+				persistSnapshot = current.Clone()
+			}
 			m.auths[id] = current
 			if m.scheduler != nil {
 				m.scheduler.upsertAuth(current.Clone())
 			}
 		}
 		m.mu.Unlock()
+		if persistSnapshot != nil {
+			m.enqueuePersist(persistSnapshot)
+		}
+		if initialRefreshPending {
+			if terminalStatus > 0 {
+				log.Warnf("codex 新文件初始 refresh 终态失败，停止继续初始 refresh: %s, %v", strings.TrimSpace(id), err)
+			} else {
+				log.Warnf("codex 新文件初始 refresh 失败，将按退避继续重试: %s, %v", strings.TrimSpace(id), err)
+			}
+		}
 		return
 	}
 	if updated == nil {
@@ -3698,6 +3669,10 @@ func (m *Manager) refreshAuth(ctx context.Context, id string) {
 	// If executor didn't set one, fall back to the previous runtime.
 	if updated.Runtime == nil {
 		updated.Runtime = auth.Runtime
+	}
+	if initialRefreshPending {
+		ClearCodexInitialRefreshPending(updated)
+		log.Infof("codex 新文件初始 refresh 完成: %s", strings.TrimSpace(id))
 	}
 	updated.LastRefreshedAt = now
 	updated.NextRefreshAfter = time.Time{}

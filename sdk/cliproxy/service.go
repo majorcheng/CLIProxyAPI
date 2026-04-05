@@ -590,6 +590,31 @@ func (s *Service) wsOnDisconnected(channelID string, reason error) {
 	})
 }
 
+func cloneServiceMetadata(metadata map[string]any) map[string]any {
+	if metadata == nil {
+		return nil
+	}
+	cloned := make(map[string]any, len(metadata))
+	for key, value := range metadata {
+		cloned[key] = value
+	}
+	return cloned
+}
+
+// shouldPreserveExistingCodexInitialRefreshMetadata 用来拦住“旧 pending 快照”
+// 在新 RT 已经写回后又反向覆盖当前 manager 状态的场景。
+// 这里只处理“当前 manager 已经不再 pending，但传入快照仍然 pending”的方向，
+// 这样既能挡住旧 refresh_token 回滚，又不影响用户在 pending 期间主动替换同名文件。
+func shouldPreserveExistingCodexInitialRefreshMetadata(existing, incoming *coreauth.Auth) bool {
+	if existing == nil || incoming == nil {
+		return false
+	}
+	if !strings.EqualFold(strings.TrimSpace(existing.Provider), "codex") || !strings.EqualFold(strings.TrimSpace(incoming.Provider), "codex") {
+		return false
+	}
+	return !coreauth.CodexInitialRefreshPending(existing) && coreauth.CodexInitialRefreshPending(incoming)
+}
+
 func (s *Service) applyCoreAuthAddOrUpdate(ctx context.Context, auth *coreauth.Auth) {
 	if s == nil || s.coreManager == nil || auth == nil || auth.ID == "" {
 		return
@@ -603,8 +628,15 @@ func (s *Service) applyCoreAuthAddOrUpdate(ctx context.Context, auth *coreauth.A
 	// immediately for API calls, rather than waiting for model registration to complete.
 	op := "register"
 	var err error
-	if existing, ok := s.coreManager.GetByID(auth.ID); ok {
+	existing, existed := s.coreManager.GetByID(auth.ID)
+	if !existed && s.cfg != nil && s.cfg.CodexInitialRefreshOnLoad {
+		coreauth.MarkCodexInitialRefreshPendingForNewFile(auth)
+	}
+	if existed {
 		auth.CreatedAt = existing.CreatedAt
+		if shouldPreserveExistingCodexInitialRefreshMetadata(existing, auth) {
+			auth.Metadata = cloneServiceMetadata(existing.Metadata)
+		}
 		if !existing.Disabled && existing.Status != coreauth.StatusDisabled && !auth.Disabled && auth.Status != coreauth.StatusDisabled {
 			auth.LastRefreshedAt = existing.LastRefreshedAt
 			auth.NextRefreshAfter = existing.NextRefreshAfter
@@ -627,9 +659,12 @@ func (s *Service) applyCoreAuthAddOrUpdate(ctx context.Context, auth *coreauth.A
 		auth = current
 	}
 
-	// 对启用了“首读强刷”的 Codex token，在 auth 首次进入 manager 后
-	// 立即发起一次后台 refresh，避免只依赖下一轮周期 auto-refresh。
-	s.coreManager.TriggerCodexInitialRefreshOnLoadIfNeeded(ctx, auth.ID)
+	// 只对仍带有“新文件初始 refresh 待处理”标记的 Codex auth 触发一次后台 refresh。
+	// refresh 成功或终态失败后会清理该标记，因此普通 update / 重启不会重复触发。
+	if current, ok := s.coreManager.GetByID(auth.ID); ok && current != nil {
+		auth = current
+		s.coreManager.TriggerCodexInitialRefreshOnLoadIfNeeded(ctx, auth.ID)
+	}
 
 	// Register models after auth is updated in coreManager.
 	// This operation may block on network calls, but the auth configuration

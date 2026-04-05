@@ -341,6 +341,70 @@ func TestUploadAuthFile_BatchMultipart_PreservesFirstRegisteredAtOnSameNameUploa
 	}
 }
 
+func TestBuildAuthFromFileData_NewCodexFileMarksInitialRefreshPending(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	gin.SetMode(gin.TestMode)
+
+	authDir := t.TempDir()
+	manager := coreauth.NewManager(nil, nil, nil)
+	h := NewHandlerWithoutConfigFilePath(&config.Config{
+		AuthDir: authDir,
+		SDKConfig: config.SDKConfig{
+			CodexInitialRefreshOnLoad: true,
+		},
+	}, manager)
+
+	content := []byte(`{"type":"codex","email":"alpha@example.com","refresh_token":"refresh-token"}`)
+	auth, err := h.buildAuthFromFileData(filepath.Join(authDir, "alpha.json"), content)
+	if err != nil {
+		t.Fatalf("buildAuthFromFileData() error = %v", err)
+	}
+	if auth == nil {
+		t.Fatal("buildAuthFromFileData() auth = nil")
+	}
+	if !coreauth.CodexInitialRefreshPending(auth) {
+		t.Fatal("expected new codex file auth to carry pending initial refresh marker")
+	}
+}
+
+func TestBuildAuthFromFileData_ExistingCodexFileDoesNotRearmInitialRefreshPending(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	gin.SetMode(gin.TestMode)
+
+	authDir := t.TempDir()
+	manager := coreauth.NewManager(nil, nil, nil)
+	existing := &coreauth.Auth{
+		ID:       "alpha.json",
+		Provider: "codex",
+		Status:   coreauth.StatusActive,
+		Metadata: map[string]any{
+			"refresh_token": "refresh-token",
+		},
+	}
+	if _, err := manager.Register(context.Background(), existing); err != nil {
+		t.Fatalf("register existing auth: %v", err)
+	}
+
+	h := NewHandlerWithoutConfigFilePath(&config.Config{
+		AuthDir: authDir,
+		SDKConfig: config.SDKConfig{
+			CodexInitialRefreshOnLoad: true,
+		},
+	}, manager)
+
+	content := []byte(`{"type":"codex","email":"alpha@example.com","refresh_token":"refresh-token"}`)
+	auth, err := h.buildAuthFromFileData(filepath.Join(authDir, "alpha.json"), content)
+	if err != nil {
+		t.Fatalf("buildAuthFromFileData() error = %v", err)
+	}
+	if auth == nil {
+		t.Fatal("buildAuthFromFileData() auth = nil")
+	}
+	if coreauth.CodexInitialRefreshPending(auth) {
+		t.Fatal("expected same-name codex update not to rearm initial refresh pending marker")
+	}
+}
+
 func TestBuildAuthFromFileData_CodexPlanTypeFromIDToken(t *testing.T) {
 	t.Setenv("MANAGEMENT_PASSWORD", "")
 	gin.SetMode(gin.TestMode)

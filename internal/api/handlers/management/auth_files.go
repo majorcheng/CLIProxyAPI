@@ -1256,6 +1256,7 @@ func (h *Handler) buildAuthFromFileData(path string, data []byte) (*coreauth.Aut
 	if authID == "" {
 		authID = path
 	}
+	isNewAuth := true
 	attr := map[string]string{
 		"path":   path,
 		"source": path,
@@ -1279,6 +1280,7 @@ func (h *Handler) buildAuthFromFileData(path string, data []byte) (*coreauth.Aut
 	}
 	if h != nil && h.authManager != nil {
 		if existing, ok := h.authManager.GetByID(authID); ok {
+			isNewAuth = false
 			if registeredAt, okRegisteredAt := coreauth.FirstRegisteredAt(existing); okRegisteredAt {
 				auth.CreatedAt = registeredAt
 				auth.Metadata[coreauth.FirstRegisteredAtMetadataKey] = registeredAt.Format(time.RFC3339Nano)
@@ -1291,6 +1293,9 @@ func (h *Handler) buildAuthFromFileData(path string, data []byte) (*coreauth.Aut
 			auth.NextRefreshAfter = existing.NextRefreshAfter
 			auth.Runtime = existing.Runtime
 		}
+	}
+	if isNewAuth && h != nil && h.cfg != nil && h.cfg.CodexInitialRefreshOnLoad {
+		coreauth.MarkCodexInitialRefreshPendingForNewFile(auth)
 	}
 	coreauth.EnsureFirstRegisteredAt(auth, auth.CreatedAt)
 	return auth, nil

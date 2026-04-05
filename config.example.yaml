@@ -126,11 +126,13 @@ usage-statistics-retention-days: 0
 # 单个条目的 proxy-url 也支持 "direct" 或 "none"，用于显式绕过全局 proxy-url 和环境代理。
 proxy-url: ""
 
-# 是否允许 Codex 文件型/OAuth auth 在当前服务首次读到该 token 时，
-# 只要 refresh_token 非空就先强制 refresh 一次，以优先校准 access_token、
-# expired、last_refresh 等字段。
+# 是否允许新的 Codex auth 文件在首次入池时，先做一次后台初始 refresh，
+# 用来优先校准 access_token、refresh_token、expired、last_refresh 等字段。
+# 该行为只对“新文件首次提交”生效；普通 update、重启恢复和 refresh 成功后的 RT 轮转
+# 都不会再次触发。若首次 refresh 遇到网络/5xx 等瞬态问题，会保留待处理标记并继续重试，
+# 直到成功或命中终态失败。
 # 默认 false；关闭时仍保持现有保守门控：只有 token JSON 明确显示需要刷新时才会自动 refresh。
-# 该开关只影响后台 auto-refresh 判定，不会让请求路径在 401 时现场补刷并重放。
+# 该开关不会让请求路径在 401 时现场补刷并重放。
 # codex-initial-refresh-on-load: false
 
 # 为 true 时，不带前缀的模型请求只会使用没有 prefix 的凭证（prefix == model name 的情况除外）。

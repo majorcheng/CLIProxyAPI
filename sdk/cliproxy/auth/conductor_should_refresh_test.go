@@ -151,7 +151,7 @@ func TestManagerShouldRefresh_CodexUsesConservativeTokenJSONGate(t *testing.T) {
 	}
 }
 
-func TestManagerShouldRefresh_CodexInitialRefreshOnLoadForcesFreshLookingTokenOnce(t *testing.T) {
+func TestManagerShouldRefresh_CodexInitialRefreshPendingForcesFreshLookingToken(t *testing.T) {
 	t.Parallel()
 
 	manager := NewManager(nil, nil, nil)
@@ -171,12 +171,14 @@ func TestManagerShouldRefresh_CodexInitialRefreshOnLoadForcesFreshLookingTokenOn
 			"expired":       now.Add(30 * 24 * time.Hour).Format(time.RFC3339),
 		},
 	}
+	MarkCodexInitialRefreshPendingForNewFile(auth)
 
 	if got := manager.shouldRefresh(auth, now); !got {
-		t.Fatal("shouldRefresh() = false, want initial forced refresh when config enabled")
+		t.Fatal("shouldRefresh() = false, want pending initial refresh to force one refresh")
 	}
+	ClearCodexInitialRefreshPending(auth)
 	if got := manager.shouldRefresh(auth, now.Add(time.Hour)); got {
-		t.Fatal("shouldRefresh() = true after initial forced refresh, want one-shot behavior within the same manager lifecycle")
+		t.Fatal("shouldRefresh() = true after pending flag cleared, want fresh-looking token to stay idle")
 	}
 }
 
@@ -222,7 +224,7 @@ func TestManagerCollectRefreshTargets_SkipsCodexWithUnknownTokenTiming(t *testin
 	}
 }
 
-func TestManagerCollectRefreshTargets_CodexInitialRefreshOnLoadSchedulesFreshLookingTokenOnce(t *testing.T) {
+func TestManagerCollectRefreshTargets_CodexInitialRefreshPendingSchedulesFreshLookingToken(t *testing.T) {
 	t.Parallel()
 
 	manager := NewManager(nil, nil, nil)
@@ -249,15 +251,32 @@ func TestManagerCollectRefreshTargets_CodexInitialRefreshOnLoadSchedulesFreshLoo
 	}); err != nil {
 		t.Fatalf("register codex auth: %v", err)
 	}
+	auth, ok := manager.GetByID("codex-initial-unknown")
+	if !ok || auth == nil {
+		t.Fatalf("expected codex auth to be present")
+	}
+	MarkCodexInitialRefreshPendingForNewFile(auth)
+	if _, err := manager.Update(context.Background(), auth); err != nil {
+		t.Fatalf("update codex auth with pending initial refresh: %v", err)
+	}
 
 	first := manager.collectRefreshTargets(now)
 	if !containsRefreshTarget(first, "codex-initial-unknown") {
-		t.Fatalf("collectRefreshTargets() = %v, want initial forced refresh target", first)
+		t.Fatalf("collectRefreshTargets() = %v, want pending initial refresh target", first)
+	}
+
+	auth, ok = manager.GetByID("codex-initial-unknown")
+	if !ok || auth == nil {
+		t.Fatalf("expected codex auth after pending refresh scheduling")
+	}
+	ClearCodexInitialRefreshPending(auth)
+	if _, err := manager.Update(context.Background(), auth); err != nil {
+		t.Fatalf("update codex auth after clearing pending flag: %v", err)
 	}
 
 	second := manager.collectRefreshTargets(now.Add(time.Hour))
 	if containsRefreshTarget(second, "codex-initial-unknown") {
-		t.Fatalf("collectRefreshTargets() = %v, want one-shot forced refresh scheduling", second)
+		t.Fatalf("collectRefreshTargets() = %v, want fresh-looking codex auth to stop scheduling after pending flag is cleared", second)
 	}
 }
 

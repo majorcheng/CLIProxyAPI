@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -79,6 +80,12 @@ type timedDeleteRecord struct {
 	at   time.Time
 }
 
+type retryableTokenStore struct {
+	mu      sync.Mutex
+	deleted []string
+	errs    []error
+}
+
 func (s *timedTrackingTokenStore) List(context.Context) ([]*coreauth.Auth, error) {
 	return nil, nil
 }
@@ -106,6 +113,31 @@ func (s *timedTrackingTokenStore) snapshot() []timedDeleteRecord {
 	copy(out, s.deleted)
 	return out
 }
+
+func (s *retryableTokenStore) List(context.Context) ([]*coreauth.Auth, error) {
+	return nil, nil
+}
+
+func (s *retryableTokenStore) Save(_ context.Context, auth *coreauth.Auth) (string, error) {
+	if auth == nil {
+		return "", nil
+	}
+	return auth.ID, nil
+}
+
+func (s *retryableTokenStore) Delete(_ context.Context, id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.deleted = append(s.deleted, id)
+	if len(s.errs) == 0 {
+		return nil
+	}
+	err := s.errs[0]
+	s.errs = s.errs[1:]
+	return err
+}
+
+func (s *retryableTokenStore) SetBaseDir(string) {}
 
 type authMaintenanceStressExecutor struct {
 	delay      time.Duration
@@ -482,6 +514,8 @@ func TestScanAuthMaintenanceCandidates_429DoesNotQueueDeleteWithoutExplicitQuota
 
 func TestDeleteAuthMaintenanceCandidate_RemovesFileAndDisablesAllAuths(t *testing.T) {
 	authDir := t.TempDir()
+	trashBase := filepath.Join(t.TempDir(), "writable")
+	t.Setenv("WRITABLE_PATH", trashBase)
 	filePath := filepath.Join(authDir, "shared.json")
 	if err := os.WriteFile(filePath, []byte(`{"type":"codex"}`), 0o600); err != nil {
 		t.Fatalf("failed to write auth file: %v", err)
@@ -528,7 +562,15 @@ func TestDeleteAuthMaintenanceCandidate_RemovesFileAndDisablesAllAuths(t *testin
 	}
 
 	if _, errStat := os.Stat(filePath); !os.IsNotExist(errStat) {
-		t.Fatalf("expected auth file to be removed, stat err: %v", errStat)
+		t.Fatalf("expected auth file to be removed from auth dir, stat err: %v", errStat)
+	}
+	archivedPath := filepath.Join(trashBase, "logs", "delete", "401", "shared.json")
+	archivedData, errReadArchived := os.ReadFile(archivedPath)
+	if errReadArchived != nil {
+		t.Fatalf("expected auth file to be archived to trash, read err: %v", errReadArchived)
+	}
+	if string(archivedData) != `{"type":"codex"}` {
+		t.Fatalf("unexpected archived auth content: %s", string(archivedData))
 	}
 	store.mu.Lock()
 	deleted := append([]string(nil), store.deleted...)
@@ -674,6 +716,8 @@ func TestScanAuthMaintenanceCandidates_DisabledPendingDeleteStillQueues(t *testi
 
 func TestDeleteAuthMaintenanceCandidate_ClearsPendingDeleteMarkerOnSuccess(t *testing.T) {
 	authDir := t.TempDir()
+	trashBase := filepath.Join(t.TempDir(), "writable")
+	t.Setenv("WRITABLE_PATH", trashBase)
 	filePath := filepath.Join(authDir, "pending-delete.json")
 	if err := os.WriteFile(filePath, []byte(`{"type":"codex"}`), 0o600); err != nil {
 		t.Fatalf("failed to write auth file: %v", err)
@@ -732,6 +776,174 @@ func TestDeleteAuthMaintenanceCandidate_ClearsPendingDeleteMarkerOnSuccess(t *te
 	}, authDir)
 	if len(candidates) != 0 {
 		t.Fatalf("expected no follow-up candidates after successful delete, got %#v", candidates)
+	}
+	if _, errStat := os.Stat(filepath.Join(trashBase, "logs", "delete", "401", "pending-delete.json")); errStat != nil {
+		t.Fatalf("expected auth file to be archived to 401 trash bucket, stat err: %v", errStat)
+	}
+}
+
+func TestDeleteAuthMaintenanceCandidate_UsesNonHTTPReasonBucket(t *testing.T) {
+	authDir := t.TempDir()
+	trashBase := filepath.Join(t.TempDir(), "writable")
+	t.Setenv("WRITABLE_PATH", trashBase)
+	filePath := filepath.Join(authDir, "quota.json")
+	if err := os.WriteFile(filePath, []byte(`{"type":"codex"}`), 0o600); err != nil {
+		t.Fatalf("failed to write auth file: %v", err)
+	}
+
+	store := &trackingTokenStore{}
+	previousStore := sdkAuth.GetTokenStore()
+	sdkAuth.RegisterTokenStore(store)
+	t.Cleanup(func() { sdkAuth.RegisterTokenStore(previousStore) })
+
+	service := &Service{
+		cfg:         &config.Config{AuthDir: authDir},
+		coreManager: coreauth.NewManager(nil, nil, nil),
+	}
+
+	err := service.deleteAuthMaintenanceCandidate(context.Background(), authMaintenanceCandidate{
+		Key:    filePath,
+		Path:   filePath,
+		IDs:    []string{"quota-auth"},
+		Reason: "quota_strikes_6",
+	})
+	if err != nil {
+		t.Fatalf("deleteAuthMaintenanceCandidate() error = %v", err)
+	}
+	if _, errStat := os.Stat(filepath.Join(trashBase, "logs", "delete", "quota_strikes_6", "quota.json")); errStat != nil {
+		t.Fatalf("expected auth file to be archived to non-http trash bucket, stat err: %v", errStat)
+	}
+}
+
+func TestDeleteAuthMaintenanceCandidate_RetryAfterArchiveWithMissingSourceStillSucceeds(t *testing.T) {
+	authDir := t.TempDir()
+	trashBase := filepath.Join(t.TempDir(), "writable")
+	t.Setenv("WRITABLE_PATH", trashBase)
+	filePath := filepath.Join(authDir, "retry.json")
+	if err := os.WriteFile(filePath, []byte(`{"type":"codex"}`), 0o600); err != nil {
+		t.Fatalf("failed to write auth file: %v", err)
+	}
+
+	storeErr := errors.New("token store temporary failure")
+	store := &retryableTokenStore{errs: []error{storeErr, nil}}
+	previousStore := sdkAuth.GetTokenStore()
+	sdkAuth.RegisterTokenStore(store)
+	t.Cleanup(func() { sdkAuth.RegisterTokenStore(previousStore) })
+
+	service := &Service{
+		cfg:         &config.Config{AuthDir: authDir},
+		coreManager: coreauth.NewManager(nil, nil, nil),
+	}
+	auth := &coreauth.Auth{
+		ID:       "retry-auth",
+		FileName: filepath.Base(filePath),
+		Provider: "codex",
+		Status:   coreauth.StatusDisabled,
+		Disabled: true,
+		Attributes: map[string]string{
+			"path": filePath,
+		},
+		Metadata: map[string]any{
+			"disabled":                               true,
+			authMaintenancePendingDeleteMetadataKey:  true,
+			authMaintenanceDeleteReasonMetadataKey:   "http_401",
+			authMaintenanceDeleteQueuedAtMetadataKey: timeNowForTest().Format(time.RFC3339Nano),
+		},
+		UpdatedAt: timeNowForTest(),
+	}
+	if _, err := service.coreManager.Register(context.Background(), auth); err != nil {
+		t.Fatalf("failed to register auth: %v", err)
+	}
+
+	candidate := authMaintenanceCandidate{
+		Key:    filePath,
+		Path:   filePath,
+		IDs:    []string{"retry-auth"},
+		Reason: "http_401",
+	}
+	err := service.deleteAuthMaintenanceCandidate(context.Background(), candidate)
+	if !errors.Is(err, storeErr) {
+		t.Fatalf("deleteAuthMaintenanceCandidate() first error = %v, want %v", err, storeErr)
+	}
+	if _, errStat := os.Stat(filePath); !os.IsNotExist(errStat) {
+		t.Fatalf("expected source auth file to be moved out of auth dir after first attempt, stat err: %v", errStat)
+	}
+	updated, ok := service.coreManager.GetByID("retry-auth")
+	if !ok || updated == nil {
+		t.Fatal("expected auth to remain in manager after first attempt")
+	}
+	if !updated.Disabled || updated.Status != coreauth.StatusDisabled {
+		t.Fatalf("expected auth to stay disabled after first attempt, got disabled=%v status=%q", updated.Disabled, updated.Status)
+	}
+	if err := service.deleteAuthMaintenanceCandidate(context.Background(), candidate); err != nil {
+		t.Fatalf("deleteAuthMaintenanceCandidate() second error = %v", err)
+	}
+	updated, ok = service.coreManager.GetByID("retry-auth")
+	if !ok || updated == nil {
+		t.Fatal("expected auth to remain in manager after retry")
+	}
+	if authMaintenancePendingDelete(updated) {
+		t.Fatal("expected pending delete marker to be cleared after retry succeeds")
+	}
+	matches, errGlob := filepath.Glob(filepath.Join(trashBase, "logs", "delete", "401", "*.json"))
+	if errGlob != nil {
+		t.Fatalf("failed to glob archived auth file: %v", errGlob)
+	}
+	if len(matches) != 1 {
+		t.Fatalf("expected exactly 1 archived auth file after retry, got %#v", matches)
+	}
+	store.mu.Lock()
+	callCount := len(store.deleted)
+	store.mu.Unlock()
+	if callCount != 2 {
+		t.Fatalf("expected backend cleanup to be retried twice, got %d", callCount)
+	}
+}
+
+func TestResolveAuthMaintenanceTrashRoot_FallsBackOutsideAuthDir(t *testing.T) {
+	baseDir := t.TempDir()
+	authDir := filepath.Join(baseDir, "auth")
+	logDir := filepath.Join(authDir, "logs")
+	got := resolveAuthMaintenanceTrashRoot(logDir, authDir)
+	want := filepath.Join(baseDir, "logs", "delete")
+	if got != want {
+		t.Fatalf("resolveAuthMaintenanceTrashRoot() = %q, want %q", got, want)
+	}
+}
+
+func TestMoveFileToAuthMaintenanceTrash_CrossDeviceRenameFallsBackToCopy(t *testing.T) {
+	srcDir := t.TempDir()
+	dstDir := t.TempDir()
+	src := filepath.Join(srcDir, "cross-device.json")
+	const content = `{"type":"codex","email":"cross-device@example.com"}`
+	if err := os.WriteFile(src, []byte(content), 0o600); err != nil {
+		t.Fatalf("failed to write source auth file: %v", err)
+	}
+
+	originalRename := authMaintenanceRenameFile
+	callCount := 0
+	authMaintenanceRenameFile = func(oldPath string, newPath string) error {
+		callCount++
+		if callCount == 1 {
+			return &os.LinkError{Op: "rename", Old: oldPath, New: newPath, Err: syscall.EXDEV}
+		}
+		return os.Rename(oldPath, newPath)
+	}
+	t.Cleanup(func() { authMaintenanceRenameFile = originalRename })
+
+	archivedPath, err := moveFileToAuthMaintenanceTrash(src, dstDir)
+	if err != nil {
+		t.Fatalf("moveFileToAuthMaintenanceTrash() error = %v", err)
+	}
+	if _, errStat := os.Stat(src); !os.IsNotExist(errStat) {
+		t.Fatalf("expected source auth file to be removed after cross-device fallback, stat err: %v", errStat)
+	}
+	archivedData, errRead := os.ReadFile(archivedPath)
+	if errRead != nil {
+		t.Fatalf("failed to read archived auth file: %v", errRead)
+	}
+	if string(archivedData) != content {
+		t.Fatalf("unexpected archived auth content: %s", string(archivedData))
 	}
 }
 

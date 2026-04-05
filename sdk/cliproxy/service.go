@@ -1491,10 +1491,10 @@ func (s *Service) deleteAuthMaintenanceCandidate(ctx context.Context, candidate 
 		if s.watcher != nil {
 			s.watcher.SuppressAuthPath(path, authMaintenanceDeleteSuppressWindow)
 		}
-		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
-			return fmt.Errorf("remove auth file: %w", err)
+		if _, err := s.archiveAuthMaintenanceCandidate(path, candidate.Reason); err != nil {
+			return fmt.Errorf("archive auth file to trash: %w", err)
 		}
-		if err := s.deleteAuthTokenRecord(ctx, path); err != nil {
+		if err := s.deleteAuthMaintenanceTokenRecord(ctx, path, candidate.Reason); err != nil {
 			cleanupErr = fmt.Errorf("delete auth token record: %w", err)
 		}
 	}

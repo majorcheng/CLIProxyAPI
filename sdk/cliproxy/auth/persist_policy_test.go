@@ -82,6 +82,24 @@ func TestWithSkipPersist_DisablesRegisterPersistence(t *testing.T) {
 	}
 }
 
+func TestWithoutSkipPersist_ReEnablesPersistence(t *testing.T) {
+	store := &countingStore{}
+	mgr := NewManager(store, nil, nil)
+	auth := &Auth{
+		ID:       "auth-1",
+		Provider: "antigravity",
+		Metadata: map[string]any{"type": "antigravity"},
+	}
+
+	ctx := WithoutSkipPersist(WithSkipPersist(context.Background()))
+	if _, err := mgr.Update(ctx, auth); err != nil {
+		t.Fatalf("Update(WithoutSkipPersist(WithSkipPersist)) returned error: %v", err)
+	}
+	if got := store.saveCount.Load(); got != 1 {
+		t.Fatalf("expected 1 Save call after re-enabling persistence, got %d", got)
+	}
+}
+
 func TestMarkResult_PersistsAsynchronously(t *testing.T) {
 	store := &blockingStore{
 		started: make(chan struct{}, 1),

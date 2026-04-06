@@ -3219,6 +3219,11 @@ func (m *Manager) TriggerCodexInitialRefreshOnLoadIfNeeded(ctx context.Context, 
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	// 这里显式去掉 watcher 路径带来的 skipPersist。
+	// “文件变更 -> 注册/更新 auth”本身不该回写磁盘，否则会形成 watcher 写回环；
+	// 但其后派生出的 Codex 初始 refresh 一旦成功，会拿到新的 RT/AT，并且必须落盘。
+	// 否则重启后仍会从磁盘读到旧 RT，再次触发 refresh_token_reused。
+	ctx = WithoutSkipPersist(ctx)
 	now := time.Now()
 	if !m.markCodexInitialRefreshPending(id, now) {
 		return

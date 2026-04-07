@@ -232,6 +232,9 @@ type AuthMaintenanceConfig struct {
 	// When 429 is included, a single quota response is enough to enqueue deletion,
 	// so QuotaStrikeThreshold does not delay that path.
 	DeleteStatusCodes []int `yaml:"delete-status-codes" json:"delete-status-codes"`
+	// Refresh401Requires429 控制“refresh RT 失败导致的 401”是否需要额外命中 429 才允许删除。
+	// 设为 true 时，这类 refresh 401 不会直接按 401 删除，只有已经具备 429/额度状态时才会进入删除队列。
+	Refresh401Requires429 bool `yaml:"refresh-401-requires-429" json:"refresh-401-requires-429"`
 	// DeleteQuotaExceeded enables a second delete path for auths that repeatedly hit quota limits.
 	// This is most useful when 429 is not included in DeleteStatusCodes.
 	DeleteQuotaExceeded bool `yaml:"delete-quota-exceeded" json:"delete-quota-exceeded"`
@@ -649,6 +652,7 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	cfg.AuthMaintenance.ScanIntervalSeconds = 30
 	cfg.AuthMaintenance.DeleteIntervalSeconds = 5
 	cfg.AuthMaintenance.DeleteStatusCodes = []int{401, 402, 403, 404}
+	cfg.AuthMaintenance.Refresh401Requires429 = true
 	cfg.AuthMaintenance.DeleteQuotaExceeded = false
 	cfg.AuthMaintenance.QuotaStrikeThreshold = 6
 	cfg.Pprof.Enable = false

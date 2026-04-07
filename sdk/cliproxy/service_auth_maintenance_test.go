@@ -208,10 +208,11 @@ func TestScanAuthMaintenanceCandidates_GroupsByPath(t *testing.T) {
 		cfg: &config.Config{
 			AuthDir: authDir,
 			AuthMaintenance: config.AuthMaintenanceConfig{
-				Enable:               true,
-				DeleteStatusCodes:    []int{401},
-				DeleteQuotaExceeded:  true,
-				QuotaStrikeThreshold: 3,
+				Enable:                true,
+				DeleteStatusCodes:     []int{401},
+				Refresh401Requires429: true,
+				DeleteQuotaExceeded:   true,
+				QuotaStrikeThreshold:  3,
 			},
 		},
 		coreManager: coreauth.NewManager(nil, nil, nil),
@@ -391,8 +392,9 @@ func TestScanAuthMaintenanceCandidates_StatusMessageJSON401QueuesDelete(t *testi
 		cfg: &config.Config{
 			AuthDir: authDir,
 			AuthMaintenance: config.AuthMaintenanceConfig{
-				Enable:            true,
-				DeleteStatusCodes: []int{401},
+				Enable:                true,
+				DeleteStatusCodes:     []int{401},
+				Refresh401Requires429: true,
 			},
 		},
 		coreManager: coreauth.NewManager(nil, nil, nil),
@@ -459,14 +461,140 @@ func TestScanAuthMaintenanceCandidates_StatusMessageUsageLimitJSONQueuesDelete(t
 	}
 }
 
+func TestScanAuthMaintenanceCandidates_Refresh401Without429SkipsDelete(t *testing.T) {
+	authDir := t.TempDir()
+	service := &Service{
+		cfg: &config.Config{
+			AuthDir: authDir,
+			AuthMaintenance: config.AuthMaintenanceConfig{
+				Enable:                true,
+				DeleteStatusCodes:     []int{401},
+				Refresh401Requires429: true,
+			},
+		},
+		coreManager: coreauth.NewManager(nil, nil, nil),
+	}
+
+	filePath := filepath.Join(authDir, "refresh-401-no-429.json")
+	auth := &coreauth.Auth{
+		ID:        "refresh-401-no-429",
+		FileName:  filepath.Base(filePath),
+		Provider:  "codex",
+		Status:    coreauth.StatusActive,
+		LastError: &coreauth.Error{HTTPStatus: 401, Message: "token refresh failed with status 401: unauthorized"},
+		Attributes: map[string]string{
+			"path":      filePath,
+			"plan_type": "free",
+		},
+		UpdatedAt: timeNowForTest(),
+	}
+	if _, err := service.coreManager.Register(context.Background(), auth); err != nil {
+		t.Fatalf("failed to register auth: %v", err)
+	}
+
+	candidates := service.scanAuthMaintenanceCandidates(timeNowForTest(), service.cfg.AuthMaintenance, authDir)
+	if len(candidates) != 0 {
+		t.Fatalf("expected refresh-induced 401 without 429 not to queue delete, got %#v", candidates)
+	}
+}
+
+func TestScanAuthMaintenanceCandidates_Refresh401Without429QueuesDeleteWhenProtectionDisabled(t *testing.T) {
+	authDir := t.TempDir()
+	service := &Service{
+		cfg: &config.Config{
+			AuthDir: authDir,
+			AuthMaintenance: config.AuthMaintenanceConfig{
+				Enable:                true,
+				DeleteStatusCodes:     []int{401},
+				Refresh401Requires429: false,
+			},
+		},
+		coreManager: coreauth.NewManager(nil, nil, nil),
+	}
+
+	filePath := filepath.Join(authDir, "refresh-401-no-429-direct-delete.json")
+	auth := &coreauth.Auth{
+		ID:        "refresh-401-no-429-direct-delete",
+		FileName:  filepath.Base(filePath),
+		Provider:  "codex",
+		Status:    coreauth.StatusActive,
+		LastError: &coreauth.Error{HTTPStatus: 401, Message: "token refresh failed with status 401: unauthorized"},
+		Attributes: map[string]string{
+			"path":      filePath,
+			"plan_type": "free",
+		},
+		UpdatedAt: timeNowForTest(),
+	}
+	if _, err := service.coreManager.Register(context.Background(), auth); err != nil {
+		t.Fatalf("failed to register auth: %v", err)
+	}
+
+	candidates := service.scanAuthMaintenanceCandidates(timeNowForTest(), service.cfg.AuthMaintenance, authDir)
+	if len(candidates) != 1 {
+		t.Fatalf("expected refresh-induced 401 without 429 to queue delete when protection disabled, got %d", len(candidates))
+	}
+	if got := candidates[0].Reason; got != "http_401" {
+		t.Fatalf("expected disabled protection to keep 401 delete reason, got %q", got)
+	}
+}
+
+func TestScanAuthMaintenanceCandidates_Refresh401With429QueuesDelete(t *testing.T) {
+	authDir := t.TempDir()
+	service := &Service{
+		cfg: &config.Config{
+			AuthDir: authDir,
+			AuthMaintenance: config.AuthMaintenanceConfig{
+				Enable:                true,
+				DeleteStatusCodes:     []int{401},
+				Refresh401Requires429: true,
+			},
+		},
+		coreManager: coreauth.NewManager(nil, nil, nil),
+	}
+
+	filePath := filepath.Join(authDir, "refresh-401-with-429.json")
+	auth := &coreauth.Auth{
+		ID:            "refresh-401-with-429",
+		FileName:      filepath.Base(filePath),
+		Provider:      "codex",
+		Status:        coreauth.StatusError,
+		StatusMessage: "quota exhausted",
+		LastError:     &coreauth.Error{HTTPStatus: 401, Message: "token refresh failed with status 401: unauthorized"},
+		Attributes: map[string]string{
+			"path":      filePath,
+			"plan_type": "free",
+		},
+		Quota: coreauth.QuotaState{
+			Exceeded:    true,
+			Reason:      "quota",
+			StrikeCount: 2,
+		},
+		FailureHTTPStatus: 429,
+		UpdatedAt:         timeNowForTest(),
+		Unavailable:       true,
+	}
+	if _, err := service.coreManager.Register(context.Background(), auth); err != nil {
+		t.Fatalf("failed to register auth: %v", err)
+	}
+
+	candidates := service.scanAuthMaintenanceCandidates(timeNowForTest(), service.cfg.AuthMaintenance, authDir)
+	if len(candidates) != 1 {
+		t.Fatalf("expected refresh-induced 401 with existing 429 to queue delete, got %d", len(candidates))
+	}
+	if got := candidates[0].Reason; got != "http_429" {
+		t.Fatalf("expected refresh-induced 401 to convert into 429 delete reason, got %q", got)
+	}
+}
+
 func TestScanAuthMaintenanceCandidates_NonFreeCodexSkipsDelete(t *testing.T) {
 	authDir := t.TempDir()
 	service := &Service{
 		cfg: &config.Config{
 			AuthDir: authDir,
 			AuthMaintenance: config.AuthMaintenanceConfig{
-				Enable:            true,
-				DeleteStatusCodes: []int{401, 429},
+				Enable:                true,
+				DeleteStatusCodes:     []int{401, 429},
+				Refresh401Requires429: true,
 			},
 		},
 		coreManager: coreauth.NewManager(nil, nil, nil),
@@ -510,10 +638,11 @@ func TestScanAuthMaintenanceCandidates_429DoesNotQueueDeleteWithoutExplicitQuota
 		cfg: &config.Config{
 			AuthDir: authDir,
 			AuthMaintenance: config.AuthMaintenanceConfig{
-				Enable:               true,
-				DeleteStatusCodes:    []int{401, 402, 403, 404},
-				DeleteQuotaExceeded:  false,
-				QuotaStrikeThreshold: 6,
+				Enable:                true,
+				DeleteStatusCodes:     []int{401, 402, 403, 404},
+				Refresh401Requires429: true,
+				DeleteQuotaExceeded:   false,
+				QuotaStrikeThreshold:  6,
 			},
 		},
 		coreManager: coreauth.NewManager(nil, nil, nil),
@@ -710,8 +839,9 @@ func TestScanAuthMaintenanceCandidates_DisabledPendingDeleteStillQueues(t *testi
 		cfg: &config.Config{
 			AuthDir: authDir,
 			AuthMaintenance: config.AuthMaintenanceConfig{
-				Enable:            true,
-				DeleteStatusCodes: []int{401, 429},
+				Enable:                true,
+				DeleteStatusCodes:     []int{401, 429},
+				Refresh401Requires429: true,
 			},
 		},
 		coreManager: coreauth.NewManager(nil, nil, nil),
@@ -997,6 +1127,7 @@ func TestAuthMaintenanceResult_DisablesImmediatelyWhileDeleteBacklogIsThrottled(
 				ScanIntervalSeconds:   30,
 				DeleteIntervalSeconds: 2,
 				DeleteStatusCodes:     []int{401, 429},
+				Refresh401Requires429: true,
 				DeleteQuotaExceeded:   true,
 				QuotaStrikeThreshold:  2,
 			},
@@ -1214,10 +1345,11 @@ func TestScanAuthMaintenanceCandidates_LargeAuthPool9053(t *testing.T) {
 		cfg: &config.Config{
 			AuthDir: authDir,
 			AuthMaintenance: config.AuthMaintenanceConfig{
-				Enable:               true,
-				DeleteStatusCodes:    []int{401, 429},
-				DeleteQuotaExceeded:  true,
-				QuotaStrikeThreshold: 6,
+				Enable:                true,
+				DeleteStatusCodes:     []int{401, 429},
+				Refresh401Requires429: true,
+				DeleteQuotaExceeded:   true,
+				QuotaStrikeThreshold:  6,
 			},
 		},
 		coreManager: coreauth.NewManager(nil, nil, nil),
@@ -1287,6 +1419,7 @@ func TestAuthMaintenanceBackgroundQueue_MixedLoadGraduallyRemoves401And429(t *te
 				ScanIntervalSeconds:   1,
 				DeleteIntervalSeconds: 1,
 				DeleteStatusCodes:     []int{401, 429},
+				Refresh401Requires429: true,
 				DeleteQuotaExceeded:   true,
 				QuotaStrikeThreshold:  2,
 			},

@@ -74,6 +74,10 @@ pprof:
 #   # 例如：如果包含 429，则一次 429 响应就足以立刻禁用该 auth，
 #   # 并将文件加入“移入垃圾站”的队列。quota-strike-threshold 不会延迟这条路径。
 #   delete-status-codes: [401, 429]
+#   # 对“refresh RT 失败导致的 401”做一层额外保护。
+#   # 默认 true：refresh 401 不会直接按 401 删除，只有该 auth 已经具备 429 痕迹时才删除。
+#   # 显式设为 false 时，会回到“只要 delete-status-codes 含 401，就直接按 401 删除”的旧语义。
+#   refresh-401-requires-429: true
 #   # 为重复额度失败启用第二条删除路径。
 #   # 这主要适用于 delete-status-codes 中不包含 429，且你希望 429
 #   # 不是立刻删除，而是在多次命中后再删除的场景。
@@ -90,6 +94,7 @@ pprof:
 #   #
 #   # 2）401 和 429 都立即删除：
 #   # delete-status-codes: [401, 429]
+#   # refresh-401-requires-429: false
 #   # delete-quota-exceeded: true
 #   # quota-strike-threshold: 6
 

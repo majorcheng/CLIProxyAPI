@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -1413,12 +1414,58 @@ func authEligibleForMaintenanceDelete(auth *coreauth.Auth, result *coreauth.Resu
 		return "", false
 	}
 	if statusCode := authMaintenanceStatusCode(auth, result); containsStatusCode(cfg.DeleteStatusCodes, statusCode) {
+		// 这条保护规则默认开启，但允许配置显式关闭：
+		// 对 refresh RT 失败导致的 401，只有 auth 已经具备 429（额度/周限）痕迹时才允许删除。
+		if cfg.Refresh401Requires429 && statusCode == http.StatusUnauthorized && authMaintenanceRefreshUnauthorized(auth, result) {
+			if !authMaintenanceHasQuota429(auth, result) {
+				return "", false
+			}
+			return fmt.Sprintf("http_%d", http.StatusTooManyRequests), true
+		}
 		return fmt.Sprintf("http_%d", statusCode), true
 	}
 	if cfg.DeleteQuotaExceeded && auth.Quota.Exceeded && auth.Quota.StrikeCount >= cfg.QuotaStrikeThreshold {
 		return fmt.Sprintf("quota_strikes_%d", auth.Quota.StrikeCount), true
 	}
 	return "", false
+}
+
+func authMaintenanceRefreshUnauthorized(auth *coreauth.Auth, result *coreauth.Result) bool {
+	if auth == nil || auth.LastError == nil {
+		return false
+	}
+	// 若本轮执行结果显式返回了 401，则按普通执行失败处理，不认为是 refresh 失败痕迹。
+	if authMaintenanceStatusCodeFromResult(result) == http.StatusUnauthorized {
+		return false
+	}
+	if auth.LastError.HTTPStatus != http.StatusUnauthorized {
+		return false
+	}
+	message := strings.ToLower(strings.TrimSpace(auth.LastError.Message))
+	if message == "" {
+		return false
+	}
+	return strings.Contains(message, "token refresh failed") ||
+		(strings.Contains(message, "refresh") && strings.Contains(message, "status 401"))
+}
+
+func authMaintenanceHasQuota429(auth *coreauth.Auth, result *coreauth.Result) bool {
+	if authMaintenanceStatusCodeFromResult(result) == http.StatusTooManyRequests {
+		return true
+	}
+	if auth == nil {
+		return false
+	}
+	if coreauth.NormalizePersistableFailureHTTPStatus(auth.FailureHTTPStatus) == http.StatusTooManyRequests {
+		return true
+	}
+	if auth.Quota.Exceeded {
+		return true
+	}
+	if strings.EqualFold(strings.TrimSpace(auth.StatusMessage), "quota exhausted") {
+		return true
+	}
+	return authMaintenanceStatusCodeFromMessage(auth.StatusMessage) == http.StatusTooManyRequests
 }
 
 func authMaintenanceStatusCode(auth *coreauth.Auth, result *coreauth.Result) int {

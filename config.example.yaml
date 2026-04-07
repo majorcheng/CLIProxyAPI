@@ -76,6 +76,10 @@ pprof:
 #   delete-status-codes: [401, 429]
 #   # 对“refresh RT 失败导致的 401”做一层额外保护。
 #   # 默认 true：refresh 401 不会直接按 401 删除，只有该 auth 已经具备 429 痕迹时才删除。
+#   # 注意：这只是 refresh 401 的特殊分支，不等于开启了“普通 429 自动删除”。
+#   # 也就是说：如果 delete-status-codes 里没有 429，且 delete-quota-exceeded=false，
+#   # 那么普通 429 仍不会被自动删除；只有“refresh 401 + 已429”这类特殊情况会按 429 归因进入垃圾站。
+#   # 因此你可能会看到文件进入 logs/delete/429/，但这并不代表当前配置已经打开了常规 429 删除。
 #   # 显式设为 false 时，会回到“只要 delete-status-codes 含 401，就直接按 401 删除”的旧语义。
 #   refresh-401-requires-429: true
 #   # 为重复额度失败启用第二条删除路径。
@@ -87,8 +91,9 @@ pprof:
 #   quota-strike-threshold: 6
 #   #
 #   # 常见模式：
-#   # 1）401 立即删除，但 429 要累计到 6 次后才删除：
+#   # 1）普通 401 立即删除；普通 429 不立刻删，但 refresh 401 若已确认带有 429 痕迹，仍允许删除：
 #   # delete-status-codes: [401]
+#   # refresh-401-requires-429: true
 #   # delete-quota-exceeded: true
 #   # quota-strike-threshold: 6
 #   #
@@ -177,6 +182,10 @@ max-invalid-request-retries: 0
 
 # 对已冷却凭证触发重试前允许等待的最大秒数。
 max-retry-interval: 30
+
+# 为 true 时，关闭 auth/model 冷却调度；失败后不会进入 blackout 窗口。
+# 这主要用于调试、外部调度自行控速，或明确不希望 401/403/404/429 暂停凭证的场景。
+disable-cooling: false
 
 # 为 true 时，当 priority=0 的 OAuth/token auth 仅出现纯传输层/网络抖动时，
 # 会停止在同一请求内继续重试其他 priority=0 OAuth/token auth，

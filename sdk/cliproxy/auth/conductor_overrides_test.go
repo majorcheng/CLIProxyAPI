@@ -603,6 +603,62 @@ func TestManager_MarkResult_RespectsAuthDisableCoolingOverride(t *testing.T) {
 	}
 }
 
+func TestManager_MarkResult_RespectsAuthDisableCoolingOverrideAcrossStatusCodes(t *testing.T) {
+	prev := quotaCooldownDisabled.Load()
+	quotaCooldownDisabled.Store(false)
+	t.Cleanup(func() { quotaCooldownDisabled.Store(prev) })
+
+	tests := []struct {
+		name   string
+		status int
+	}{
+		{name: "401 unauthorized", status: http.StatusUnauthorized},
+		{name: "403 forbidden", status: http.StatusForbidden},
+		{name: "404 not found", status: http.StatusNotFound},
+		{name: "429 quota", status: http.StatusTooManyRequests},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			m := NewManager(nil, nil, nil)
+			auth := &Auth{
+				ID:       "auth-" + tt.name,
+				Provider: "claude",
+				Metadata: map[string]any{
+					"disable_cooling": true,
+				},
+			}
+			if _, errRegister := m.Register(context.Background(), auth); errRegister != nil {
+				t.Fatalf("register auth: %v", errRegister)
+			}
+
+			model := "test-model"
+			m.MarkResult(context.Background(), Result{
+				AuthID:   auth.ID,
+				Provider: auth.Provider,
+				Model:    model,
+				Success:  false,
+				Error:    &Error{HTTPStatus: tt.status, Message: http.StatusText(tt.status)},
+			})
+
+			updated, ok := m.GetByID(auth.ID)
+			if !ok || updated == nil {
+				t.Fatalf("expected auth to be present")
+			}
+			state := updated.ModelStates[model]
+			if state == nil {
+				t.Fatalf("expected model state to be present")
+			}
+			if !state.NextRetryAfter.IsZero() {
+				t.Fatalf("expected NextRetryAfter to be zero when disable_cooling=true, got %v", state.NextRetryAfter)
+			}
+			if tt.status == http.StatusTooManyRequests && !state.Quota.NextRecoverAt.IsZero() {
+				t.Fatalf("expected quota NextRecoverAt to remain zero when disable_cooling=true, got %v", state.Quota.NextRecoverAt)
+			}
+		})
+	}
+}
+
 func TestManager_MarkResult_RequestScopedNotFoundDoesNotCooldownAuth(t *testing.T) {
 	m := NewManager(nil, nil, nil)
 

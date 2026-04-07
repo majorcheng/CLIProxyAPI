@@ -677,6 +677,7 @@ func (s *Service) applyCoreAuthAddOrUpdate(ctx context.Context, auth *coreauth.A
 	// have an empty supportedModelSet (because Register/Update upserts into the
 	// scheduler before registerModelsForAuth runs) and are invisible to the scheduler.
 	s.coreManager.RefreshSchedulerEntry(auth.ID)
+	s.coreManager.ReconcileRegistryModelStates(ctx, auth.ID)
 	s.indexAuthMaintenanceAuth(auth)
 }
 
@@ -2425,6 +2426,7 @@ func (s *Service) refreshModelRegistrationForAuth(current *coreauth.Auth) bool {
 	s.ensureExecutorsForAuth(latest)
 	s.registerModelsForAuth(latest)
 	s.coreManager.RefreshSchedulerEntry(current.ID)
+	s.coreManager.ReconcileRegistryModelStates(context.Background(), current.ID)
 	return true
 }
 

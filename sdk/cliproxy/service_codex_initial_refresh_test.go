@@ -219,3 +219,115 @@ func TestCodexInitialRefreshTrigger_PersistsRefreshResultEvenWhenCallerSkipsPers
 		t.Fatal("expected manager state to clear initial refresh pending after persistence")
 	}
 }
+
+func TestServiceApplyCoreAuthAddOrUpdate_PreservesRuntimeQuota429StateAgainstCleanIncomingSnapshot(t *testing.T) {
+	authID := "quota-codex.json"
+	modelID := "gpt-5.4"
+	authDir := t.TempDir()
+	nextRetry := time.Now().Add(30 * time.Minute)
+
+	reg := GlobalModelRegistry()
+	reg.UnregisterClient(authID)
+	t.Cleanup(func() {
+		reg.UnregisterClient(authID)
+	})
+
+	manager := coreauth.NewManager(nil, nil, nil)
+	service := &Service{
+		cfg:         &config.Config{AuthDir: authDir},
+		coreManager: manager,
+	}
+
+	existing := &coreauth.Auth{
+		ID:                authID,
+		FileName:          authID,
+		Provider:          "codex",
+		Status:            coreauth.StatusError,
+		StatusMessage:     "quota exhausted",
+		Unavailable:       true,
+		FailureHTTPStatus: http.StatusTooManyRequests,
+		NextRetryAfter:    nextRetry,
+		Quota: coreauth.QuotaState{
+			Exceeded:      true,
+			Reason:        "quota",
+			NextRecoverAt: nextRetry,
+			StrikeCount:   3,
+		},
+		Attributes: map[string]string{
+			"path": filepath.Join(authDir, authID),
+		},
+		ModelStates: map[string]*coreauth.ModelState{
+			modelID: {
+				Status:            coreauth.StatusError,
+				StatusMessage:     "quota exhausted",
+				Unavailable:       true,
+				FailureHTTPStatus: http.StatusTooManyRequests,
+				NextRetryAfter:    nextRetry,
+				LastError: &coreauth.Error{
+					HTTPStatus: http.StatusTooManyRequests,
+					Message:    `{"error":{"type":"usage_limit_reached","message":"quota"}}`,
+				},
+				Quota: coreauth.QuotaState{
+					Exceeded:      true,
+					Reason:        "quota",
+					NextRecoverAt: nextRetry,
+					StrikeCount:   3,
+				},
+			},
+		},
+	}
+	if _, err := manager.Register(context.Background(), existing); err != nil {
+		t.Fatalf("register existing auth: %v", err)
+	}
+
+	incoming := &coreauth.Auth{
+		ID:       authID,
+		FileName: authID,
+		Provider: "codex",
+		Status:   coreauth.StatusActive,
+		Attributes: map[string]string{
+			"path": filepath.Join(authDir, authID),
+		},
+		Metadata: map[string]any{
+			"type":  "codex",
+			"email": "quota@example.com",
+		},
+	}
+	service.applyCoreAuthAddOrUpdate(context.Background(), incoming)
+
+	updated, ok := manager.GetByID(authID)
+	if !ok || updated == nil {
+		t.Fatalf("expected auth %q to remain registered", authID)
+	}
+	if updated.Status != coreauth.StatusError {
+		t.Fatalf("status = %q, want %q", updated.Status, coreauth.StatusError)
+	}
+	if updated.StatusMessage != "quota exhausted" {
+		t.Fatalf("status_message = %q, want %q", updated.StatusMessage, "quota exhausted")
+	}
+	if !updated.Unavailable {
+		t.Fatal("expected unavailable=true after add/update")
+	}
+	if updated.FailureHTTPStatus != http.StatusTooManyRequests {
+		t.Fatalf("FailureHTTPStatus = %d, want %d", updated.FailureHTTPStatus, http.StatusTooManyRequests)
+	}
+	if !updated.Quota.Exceeded {
+		t.Fatal("expected quota exceeded to remain true after add/update")
+	}
+	state := updated.ModelStates[modelID]
+	if state == nil {
+		t.Fatalf("expected model state %q to remain present", modelID)
+	}
+	if state.Status != coreauth.StatusError {
+		t.Fatalf("model status = %q, want %q", state.Status, coreauth.StatusError)
+	}
+	if !state.Unavailable {
+		t.Fatal("expected model unavailable=true after add/update")
+	}
+	if state.FailureHTTPStatus != http.StatusTooManyRequests {
+		t.Fatalf("model FailureHTTPStatus = %d, want %d", state.FailureHTTPStatus, http.StatusTooManyRequests)
+	}
+	if !state.Quota.Exceeded {
+		t.Fatal("expected model quota exceeded to remain true after add/update")
+	}
+}

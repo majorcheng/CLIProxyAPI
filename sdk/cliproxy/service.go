@@ -602,6 +602,117 @@ func cloneServiceMetadata(metadata map[string]any) map[string]any {
 	return cloned
 }
 
+func cloneServiceError(err *coreauth.Error) *coreauth.Error {
+	if err == nil {
+		return nil
+	}
+	return &coreauth.Error{
+		Code:       err.Code,
+		Message:    err.Message,
+		Retryable:  err.Retryable,
+		HTTPStatus: err.HTTPStatus,
+	}
+}
+
+func cloneServiceModelStates(states map[string]*coreauth.ModelState) map[string]*coreauth.ModelState {
+	if len(states) == 0 {
+		return nil
+	}
+	cloned := make(map[string]*coreauth.ModelState, len(states))
+	for key, state := range states {
+		if state == nil {
+			continue
+		}
+		cloned[key] = state.Clone()
+	}
+	if len(cloned) == 0 {
+		return nil
+	}
+	return cloned
+}
+
+func authQuotaHasRuntimeState(quota coreauth.QuotaState) bool {
+	return quota.Exceeded ||
+		strings.TrimSpace(quota.Reason) != "" ||
+		!quota.NextRecoverAt.IsZero() ||
+		quota.BackoffLevel != 0 ||
+		quota.StrikeCount != 0
+}
+
+func authRuntimeModelStatePresent(state *coreauth.ModelState) bool {
+	if state == nil {
+		return false
+	}
+	if state.Status != "" && state.Status != coreauth.StatusActive {
+		return true
+	}
+	if strings.TrimSpace(state.StatusMessage) != "" {
+		return true
+	}
+	if state.LastError != nil {
+		return true
+	}
+	if coreauth.NormalizePersistableFailureHTTPStatus(state.FailureHTTPStatus) > 0 {
+		return true
+	}
+	if state.Unavailable || !state.NextRetryAfter.IsZero() {
+		return true
+	}
+	return authQuotaHasRuntimeState(state.Quota)
+}
+
+func authRuntimeModelStatesPresent(states map[string]*coreauth.ModelState) bool {
+	for _, state := range states {
+		if authRuntimeModelStatePresent(state) {
+			return true
+		}
+	}
+	return false
+}
+
+func authRuntimeStatePresent(auth *coreauth.Auth) bool {
+	if auth == nil {
+		return false
+	}
+	if auth.Status != "" && auth.Status != coreauth.StatusActive {
+		return true
+	}
+	if strings.TrimSpace(auth.StatusMessage) != "" {
+		return true
+	}
+	if auth.LastError != nil {
+		return true
+	}
+	if coreauth.NormalizePersistableFailureHTTPStatus(auth.FailureHTTPStatus) > 0 {
+		return true
+	}
+	if auth.Unavailable || !auth.NextRetryAfter.IsZero() {
+		return true
+	}
+	return authQuotaHasRuntimeState(auth.Quota)
+}
+
+// preserveExistingRuntimeState 用来挡住“clean incoming snapshot”把当前内存里的
+// 真实运行态故障覆盖掉的分支。磁盘/watcher 快照本身可能只反映静态配置，不包含
+// 刚刚在内存里打上的 429/401/cooldown；这时应继续保留 existing 的 runtime state。
+func preserveExistingRuntimeState(existing, incoming *coreauth.Auth) {
+	if existing == nil || incoming == nil {
+		return
+	}
+	if !authRuntimeStatePresent(incoming) && authRuntimeStatePresent(existing) {
+		incoming.Status = existing.Status
+		incoming.StatusMessage = existing.StatusMessage
+		incoming.Unavailable = existing.Unavailable
+		incoming.NextRetryAfter = existing.NextRetryAfter
+		incoming.Quota = existing.Quota
+		incoming.LastError = cloneServiceError(existing.LastError)
+		incoming.FailureHTTPStatus = existing.FailureHTTPStatus
+	}
+	if authRuntimeModelStatesPresent(existing.ModelStates) && !authRuntimeModelStatesPresent(incoming.ModelStates) {
+		incoming.ModelStates = cloneServiceModelStates(existing.ModelStates)
+	}
+}
+
 // shouldPreserveExistingCodexInitialRefreshMetadata 用来拦住“旧 pending 快照”
 // 在新 RT 已经写回后又反向覆盖当前 manager 状态的场景。
 // 这里只处理“当前 manager 已经不再 pending，但传入快照仍然 pending”的方向，
@@ -641,9 +752,7 @@ func (s *Service) applyCoreAuthAddOrUpdate(ctx context.Context, auth *coreauth.A
 		if !existing.Disabled && existing.Status != coreauth.StatusDisabled && !auth.Disabled && auth.Status != coreauth.StatusDisabled {
 			auth.LastRefreshedAt = existing.LastRefreshedAt
 			auth.NextRefreshAfter = existing.NextRefreshAfter
-			if len(auth.ModelStates) == 0 && len(existing.ModelStates) > 0 {
-				auth.ModelStates = existing.ModelStates
-			}
+			preserveExistingRuntimeState(existing, auth)
 		}
 		op = "update"
 		_, err = s.coreManager.Update(ctx, auth)

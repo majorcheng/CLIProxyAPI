@@ -313,19 +313,18 @@ func (m *Manager) ReconcileRegistryModelStates(ctx context.Context, authID strin
 			if _, supportedModel := supported[baseModel]; !supportedModel {
 				continue
 			}
-			if modelStateIsClean(state) {
+			if !shouldReconcileRegistryModelState(state) {
 				continue
 			}
 			resetModelState(state, now)
 			changed = true
 		}
 		if changed {
-			updateAggregatedAvailability(auth, now)
-			if !hasModelError(auth, now) {
-				auth.LastError = nil
-				auth.StatusMessage = ""
-				auth.Status = StatusActive
-			}
+			// 这里只回收“模型能力目录变化导致的陈旧 model 失败态”，
+			// 不能顺手清掉真实运行中刚打上的 401/402/403/429 等 credential 级故障。
+			// 聚合态统一复用 scheduler 的收口逻辑，避免出现状态字段已恢复、
+			// 但 FailureHTTPStatus 仍残留旧值的半清理状态。
+			syncAggregatedAuthStateFromModelStates(auth, now)
 			auth.UpdatedAt = now
 			_ = m.persist(ctx, auth)
 			snapshot = auth.Clone()
@@ -2956,6 +2955,43 @@ func modelStateIsClean(state *ModelState) bool {
 		return false
 	}
 	return true
+}
+
+// shouldReconcileRegistryModelState 只允许回收“模型能力目录变化导致的陈旧失败态”。
+// 真实运行时故障（尤其 401/402/403/429）必须保留，避免刚打上的 credential 冷却/周限
+// 被一次 registry 对齐顺手清掉，导致调度与 management 又把 auth 看成正常。
+func shouldReconcileRegistryModelState(state *ModelState) bool {
+	if state == nil || modelStateIsClean(state) {
+		return false
+	}
+	if state.Status == StatusDisabled {
+		return false
+	}
+
+	if state.LastError != nil {
+		switch statusCodeFromResult(state.LastError) {
+		case http.StatusUnauthorized, http.StatusPaymentRequired, http.StatusForbidden, http.StatusTooManyRequests:
+			return false
+		case http.StatusNotFound:
+			return true
+		}
+		if isModelSupportResultError(state.LastError) {
+			return true
+		}
+	}
+
+	switch NormalizePersistableFailureHTTPStatus(state.FailureHTTPStatus) {
+	case http.StatusUnauthorized, http.StatusPaymentRequired, http.StatusForbidden, http.StatusTooManyRequests:
+		return false
+	case http.StatusNotFound:
+		return true
+	}
+
+	message := strings.TrimSpace(state.StatusMessage)
+	if strings.EqualFold(message, "not_found") {
+		return true
+	}
+	return isModelSupportErrorMessage(message)
 }
 
 // nextQuotaCooldown returns the next cooldown duration and updated backoff level for repeated quota errors.

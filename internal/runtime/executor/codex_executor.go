@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 
@@ -579,19 +580,53 @@ func (e *CodexExecutor) cacheHelper(ctx context.Context, from sdktranslator.Form
 
 func readCodexCompletedEvent(ctx context.Context, cfg *config.Config, body io.ReadCloser, reporter *usageReporter) ([]byte, error) {
 	reader := bufio.NewReader(body)
+	outputItemsByIndex := make(map[int64][]byte)
+	var outputItemsFallback [][]byte
 	for {
 		line, err := reader.ReadBytes('\n')
 		if len(line) > 0 {
 			appendAPIResponseChunk(ctx, cfg, line)
 			if bytes.HasPrefix(line, dataTag) {
 				data := bytes.TrimSpace(line[len(dataTag):])
-				if gjson.GetBytes(data, "type").String() == "response.completed" {
-					if detail, ok := parseCodexUsage(data); ok {
+				switch gjson.GetBytes(data, "type").String() {
+				case "response.output_item.done":
+					itemResult := gjson.GetBytes(data, "item")
+					if itemResult.Exists() && itemResult.Type == gjson.JSON {
+						outputIndexResult := gjson.GetBytes(data, "output_index")
+						if outputIndexResult.Exists() {
+							outputItemsByIndex[outputIndexResult.Int()] = []byte(itemResult.Raw)
+						} else {
+							outputItemsFallback = append(outputItemsFallback, []byte(itemResult.Raw))
+						}
+					}
+				case "response.completed":
+					completedData := data
+					outputResult := gjson.GetBytes(completedData, "response.output")
+					shouldPatchOutput := (!outputResult.Exists() || !outputResult.IsArray() || len(outputResult.Array()) == 0) &&
+						(len(outputItemsByIndex) > 0 || len(outputItemsFallback) > 0)
+					if shouldPatchOutput {
+						completedDataPatched := completedData
+						completedDataPatched, _ = sjson.SetRawBytes(completedDataPatched, "response.output", []byte(`[]`))
+
+						indexes := make([]int64, 0, len(outputItemsByIndex))
+						for idx := range outputItemsByIndex {
+							indexes = append(indexes, idx)
+						}
+						sort.Slice(indexes, func(i, j int) bool { return indexes[i] < indexes[j] })
+						for _, idx := range indexes {
+							completedDataPatched, _ = sjson.SetRawBytes(completedDataPatched, "response.output.-1", outputItemsByIndex[idx])
+						}
+						for _, item := range outputItemsFallback {
+							completedDataPatched, _ = sjson.SetRawBytes(completedDataPatched, "response.output.-1", item)
+						}
+						completedData = completedDataPatched
+					}
+					if detail, ok := parseCodexUsage(completedData); ok {
 						reporter.publish(ctx, detail)
 					}
 					reporter.ensurePublished(ctx)
 					drainCodexCompletedBody(ctx, cfg, reader, body)
-					return bytes.Clone(data), nil
+					return bytes.Clone(completedData), nil
 				}
 			}
 		}

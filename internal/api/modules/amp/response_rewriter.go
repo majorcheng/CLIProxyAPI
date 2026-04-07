@@ -2,6 +2,7 @@ package amp
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"strings"
@@ -289,8 +290,9 @@ func (rw *ResponseRewriter) rewriteStreamEvent(data []byte) []byte {
 }
 
 // SanitizeAmpRequestBody removes thinking blocks with empty/missing/invalid signatures
-// from the messages array in a request body before forwarding to the upstream API.
-// This prevents 400 errors from the API which requires valid signatures on thinking blocks.
+// and strips代理注入的 tool_use.signature 字段，然后再把请求转发给上游。
+// Claude 对 thinking 需要有效 signature，但又不接受 tool_use.signature，
+// 因此这里必须同时处理两类块，避免回放 Amp 会话时被上游 400 拒绝。
 func SanitizeAmpRequestBody(body []byte) []byte {
 	messages := gjson.GetBytes(body, "messages")
 	if !messages.Exists() || !messages.IsArray() {
@@ -308,21 +310,27 @@ func SanitizeAmpRequestBody(body []byte) []byte {
 		}
 
 		var keepBlocks []interface{}
-		removedCount := 0
+		contentModified := false
 
 		for _, block := range content.Array() {
 			blockType := block.Get("type").String()
 			if blockType == "thinking" {
 				sig := block.Get("signature")
 				if !sig.Exists() || sig.Type != gjson.String || strings.TrimSpace(sig.String()) == "" {
-					removedCount++
+					contentModified = true
 					continue
 				}
 			}
-			keepBlocks = append(keepBlocks, block.Value())
+
+			blockRaw := []byte(block.Raw)
+			if blockType == "tool_use" && block.Get("signature").Exists() {
+				blockRaw, _ = sjson.DeleteBytes(blockRaw, "signature")
+				contentModified = true
+			}
+			keepBlocks = append(keepBlocks, json.RawMessage(blockRaw))
 		}
 
-		if removedCount > 0 {
+		if contentModified {
 			contentPath := fmt.Sprintf("messages.%d.content", msgIdx)
 			var err error
 			if len(keepBlocks) == 0 {
@@ -331,11 +339,10 @@ func SanitizeAmpRequestBody(body []byte) []byte {
 				body, err = sjson.SetBytes(body, contentPath, keepBlocks)
 			}
 			if err != nil {
-				log.Warnf("Amp RequestSanitizer: failed to remove thinking blocks from message %d: %v", msgIdx, err)
+				log.Warnf("Amp RequestSanitizer: failed to sanitize message %d: %v", msgIdx, err)
 				continue
 			}
 			modified = true
-			log.Debugf("Amp RequestSanitizer: removed %d thinking blocks with invalid signatures from message %d", removedCount, msgIdx)
 		}
 	}
 

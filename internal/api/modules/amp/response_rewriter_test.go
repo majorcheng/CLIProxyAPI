@@ -1,8 +1,6 @@
 package amp
 
-import (
-	"testing"
-)
+import "testing"
 
 func TestRewriteModelInResponse_TopLevel(t *testing.T) {
 	rw := &ResponseRewriter{originalModel: "gpt-5.2-codex"}
@@ -149,6 +147,36 @@ func TestSanitizeAmpRequestBody_RemovesWhitespaceAndNonStringSignatures(t *testi
 	}
 	if !contains(result, []byte("keep-text")) {
 		t.Fatalf("expected non-thinking content to remain, got %s", string(result))
+	}
+}
+
+func TestSanitizeAmpRequestBody_StripsSignatureFromToolUseBlocks(t *testing.T) {
+	input := []byte(`{"messages":[{"role":"assistant","content":[{"type":"thinking","thinking":"thought","signature":"valid-sig"},{"type":"tool_use","id":"toolu_01","name":"Bash","input":{"cmd":"ls"},"signature":""}]}]}`)
+	result := SanitizeAmpRequestBody(input)
+
+	if contains(result, []byte(`"signature":""`)) {
+		t.Fatalf("expected signature to be stripped from tool_use block, got %s", string(result))
+	}
+	if !contains(result, []byte(`"valid-sig"`)) {
+		t.Fatalf("expected thinking signature to remain, got %s", string(result))
+	}
+	if !contains(result, []byte(`"tool_use"`)) {
+		t.Fatalf("expected tool_use block to remain, got %s", string(result))
+	}
+}
+
+func TestSanitizeAmpRequestBody_MixedInvalidThinkingAndToolUseSignature(t *testing.T) {
+	input := []byte(`{"messages":[{"role":"assistant","content":[{"type":"thinking","thinking":"drop-me","signature":""},{"type":"tool_use","id":"toolu_01","name":"Bash","input":{"cmd":"ls"},"signature":""}]}]}`)
+	result := SanitizeAmpRequestBody(input)
+
+	if contains(result, []byte("drop-me")) {
+		t.Fatalf("expected invalid thinking block to be removed, got %s", string(result))
+	}
+	if contains(result, []byte(`"signature"`)) {
+		t.Fatalf("expected signature to be stripped from tool_use block, got %s", string(result))
+	}
+	if !contains(result, []byte(`"tool_use"`)) {
+		t.Fatalf("expected tool_use block to remain, got %s", string(result))
 	}
 }
 

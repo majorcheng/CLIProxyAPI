@@ -297,6 +297,13 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 			recordAPIResponseError(ctx, e.cfg, errScan)
 			reporter.publishFailure(ctx)
 			out <- cliproxyexecutor.StreamChunk{Err: errScan}
+		} else {
+			// 即使上游没有显式发出终止 [DONE]，也补一个合成的 DONE，
+			// 让 translator 有机会在流尾统一补发 response.completed。
+			chunks := sdktranslator.TranslateStream(ctx, to, from, req.Model, opts.OriginalRequest, translated, []byte("data: [DONE]"), &param)
+			for i := range chunks {
+				out <- cliproxyexecutor.StreamChunk{Payload: []byte(chunks[i])}
+			}
 		}
 		// Ensure we record the request if no usage chunk was ever seen
 		reporter.ensurePublished(ctx)

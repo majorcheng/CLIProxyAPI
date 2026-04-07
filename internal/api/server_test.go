@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -15,6 +16,7 @@ import (
 	internallogging "github.com/router-for-me/CLIProxyAPI/v6/internal/logging"
 	sdkaccess "github.com/router-for-me/CLIProxyAPI/v6/sdk/access"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 	sdkconfig "github.com/router-for-me/CLIProxyAPI/v6/sdk/config"
 )
 
@@ -229,5 +231,100 @@ func TestDefaultRequestLoggerFactory_UsesResolvedLogDirectory(t *testing.T) {
 		if strings.HasPrefix(entry.Name(), "error-") && strings.HasSuffix(entry.Name(), ".log") {
 			t.Fatalf("unexpected forced error log in config dir %s", configLogsDir)
 		}
+	}
+}
+
+type serverCodexRefreshTestExecutor struct{}
+
+func (serverCodexRefreshTestExecutor) Identifier() string { return "codex" }
+
+func (serverCodexRefreshTestExecutor) Execute(context.Context, *auth.Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	return cliproxyexecutor.Response{}, nil
+}
+
+func (serverCodexRefreshTestExecutor) ExecuteStream(context.Context, *auth.Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
+	return nil, nil
+}
+
+func (serverCodexRefreshTestExecutor) Refresh(_ context.Context, a *auth.Auth) (*auth.Auth, error) {
+	if a == nil {
+		return nil, nil
+	}
+	if a.Metadata == nil {
+		a.Metadata = make(map[string]any)
+	}
+	a.Metadata["type"] = "codex"
+	a.Metadata["refresh_token"] = "rotated-route-refresh-token"
+	a.Metadata["access_token"] = "rotated-route-access-token"
+	a.Metadata["last_refresh"] = time.Now().Format(time.RFC3339)
+	a.Metadata["expired"] = time.Now().Add(2 * time.Hour).Format(time.RFC3339)
+	return a, nil
+}
+
+func (serverCodexRefreshTestExecutor) CountTokens(context.Context, *auth.Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	return cliproxyexecutor.Response{}, nil
+}
+
+func (serverCodexRefreshTestExecutor) HttpRequest(context.Context, *auth.Auth, *http.Request) (*http.Response, error) {
+	return nil, nil
+}
+
+func TestManagementCodexRefreshRoute(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	t.Setenv("MANAGEMENT_PASSWORD", "manage-secret")
+
+	tmpDir := t.TempDir()
+	authDir := filepath.Join(tmpDir, "auth")
+	if err := os.MkdirAll(authDir, 0o700); err != nil {
+		t.Fatalf("failed to create auth dir: %v", err)
+	}
+
+	cfg := &proxyconfig.Config{
+		SDKConfig: sdkconfig.SDKConfig{
+			APIKeys: []string{"test-key"},
+		},
+		Port:                   0,
+		AuthDir:                authDir,
+		Debug:                  true,
+		LoggingToFile:          false,
+		UsageStatisticsEnabled: false,
+	}
+
+	authManager := auth.NewManager(nil, nil, nil)
+	authManager.RegisterExecutor(serverCodexRefreshTestExecutor{})
+	if _, err := authManager.Register(context.Background(), &auth.Auth{
+		ID:       "route-codex.json",
+		FileName: "route-codex.json",
+		Provider: "codex",
+		Status:   auth.StatusActive,
+		Metadata: map[string]any{
+			"type":          "codex",
+			"refresh_token": "original-route-refresh-token",
+		},
+	}); err != nil {
+		t.Fatalf("register route auth: %v", err)
+	}
+
+	server := NewServer(cfg, authManager, sdkaccess.NewManager(), filepath.Join(tmpDir, "config.yaml"))
+
+	req := httptest.NewRequest(http.MethodPost, "/v0/management/auth-files/codex/refresh", strings.NewReader(`{"name":"route-codex.json"}`))
+	req.Header.Set("Authorization", "Bearer manage-secret")
+	req.Header.Set("Content-Type", "application/json")
+
+	rr := httptest.NewRecorder()
+	server.engine.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("unexpected status code: got %d want %d; body=%s", rr.Code, http.StatusOK, rr.Body.String())
+	}
+	if body := rr.Body.String(); !strings.Contains(body, `"status":"ok"`) {
+		t.Fatalf("response body missing success status: %s", body)
+	}
+	updated, ok := authManager.GetByID("route-codex.json")
+	if !ok || updated == nil {
+		t.Fatal("expected refreshed auth to remain registered")
+	}
+	if got, _ := updated.Metadata["refresh_token"].(string); got != "rotated-route-refresh-token" {
+		t.Fatalf("refresh_token = %q, want %q", got, "rotated-route-refresh-token")
 	}
 }

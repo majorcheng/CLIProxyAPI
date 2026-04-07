@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"strings"
 	"sync"
@@ -345,5 +346,129 @@ func TestManagerRefreshAuth_ClearsCodexInitialRefreshPendingAfterSuccess(t *test
 	last := saves[len(saves)-1]
 	if CodexInitialRefreshPending(last) {
 		t.Fatal("expected persisted auth after successful initial refresh to clear pending flag")
+	}
+}
+
+func TestManagerRefreshAuthNow_ReEnablesPersistenceAndReturnsUpdatedSnapshot(t *testing.T) {
+	ctx := WithSkipPersist(context.Background())
+	store := &codexRefreshRecordingStore{}
+	manager := NewManager(store, nil, nil)
+	manager.RegisterExecutor(refreshFailureTestExecutor{
+		provider: "codex",
+		after: func(auth *Auth) {
+			if auth == nil {
+				return
+			}
+			if auth.Metadata == nil {
+				auth.Metadata = make(map[string]any)
+			}
+			auth.Metadata["refresh_token"] = "rotated-refresh-token"
+			auth.Metadata["access_token"] = "new-access-token"
+			auth.Metadata["last_refresh"] = time.Now().Format(time.RFC3339)
+			auth.Metadata["expired"] = time.Now().Add(2 * time.Hour).Format(time.RFC3339)
+		},
+	})
+
+	auth := &Auth{
+		ID:       "manual-refresh.json",
+		Provider: "codex",
+		Status:   StatusActive,
+		Metadata: map[string]any{
+			"refresh_token": "original-refresh-token",
+			"access_token":  "original-access-token",
+		},
+	}
+	if _, err := manager.Register(ctx, auth); err != nil {
+		t.Fatalf("注册测试 auth 失败: %v", err)
+	}
+	if got := len(store.snapshot()); got != 0 {
+		t.Fatalf("WithSkipPersist 注册后不应写盘，实际保存次数 = %d", got)
+	}
+
+	updated, err := manager.RefreshAuthNow(ctx, auth.ID)
+	if err != nil {
+		t.Fatalf("RefreshAuthNow 返回错误: %v", err)
+	}
+	if updated == nil {
+		t.Fatal("RefreshAuthNow 应返回更新后的快照")
+	}
+	if got, _ := updated.Metadata["refresh_token"].(string); got != "rotated-refresh-token" {
+		t.Fatalf("refresh_token = %q，期望 %q", got, "rotated-refresh-token")
+	}
+	if got, _ := updated.Metadata["access_token"].(string); got != "new-access-token" {
+		t.Fatalf("access_token = %q，期望 %q", got, "new-access-token")
+	}
+	if updated.LastRefreshedAt.IsZero() {
+		t.Fatal("手动刷新成功后应写入 LastRefreshedAt")
+	}
+
+	saves := store.snapshot()
+	if len(saves) != 1 {
+		t.Fatalf("RefreshAuthNow 应覆盖 skipPersist 并写盘一次，实际 = %d", len(saves))
+	}
+	last := saves[len(saves)-1]
+	if got, _ := last.Metadata["refresh_token"].(string); got != "rotated-refresh-token" {
+		t.Fatalf("持久化后的 refresh_token = %q，期望 %q", got, "rotated-refresh-token")
+	}
+}
+
+func TestManagerRefreshAuthNow_ReturnsBusyWhenAutoRefreshInFlight(t *testing.T) {
+	ctx := context.Background()
+	started := make(chan struct{}, 1)
+	release := make(chan struct{})
+
+	manager := NewManager(nil, nil, nil)
+	manager.RegisterExecutor(refreshFailureTestExecutor{
+		provider: "codex",
+		after: func(auth *Auth) {
+			if auth == nil {
+				return
+			}
+			started <- struct{}{}
+			<-release
+			if auth.Metadata == nil {
+				auth.Metadata = make(map[string]any)
+			}
+			auth.Metadata["refresh_token"] = "rotated-refresh-token"
+		},
+	})
+
+	auth := &Auth{
+		ID:       "busy-refresh.json",
+		Provider: "codex",
+		Status:   StatusActive,
+		Metadata: map[string]any{
+			"refresh_token": "original-refresh-token",
+		},
+	}
+	if _, err := manager.Register(ctx, auth); err != nil {
+		t.Fatalf("注册测试 auth 失败: %v", err)
+	}
+
+	done := make(chan struct{})
+	go func() {
+		manager.refreshAuthWithLimit(ctx, auth.ID)
+		close(done)
+	}()
+
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("预期后台 refresh 已进入执行状态")
+	}
+
+	current, err := manager.RefreshAuthNow(ctx, auth.ID)
+	if !errors.Is(err, ErrAuthRefreshInFlight) {
+		t.Fatalf("并发手动刷新错误 = %v，期望 %v", err, ErrAuthRefreshInFlight)
+	}
+	if current == nil || current.ID != auth.ID {
+		t.Fatalf("忙碌态应返回当前 auth 快照，实际 = %#v", current)
+	}
+
+	close(release)
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("释放阻塞后后台 refresh 仍未退出")
 	}
 }

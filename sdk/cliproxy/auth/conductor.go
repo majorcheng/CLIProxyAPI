@@ -184,6 +184,9 @@ type Manager struct {
 	// Auto refresh state
 	refreshCancel    context.CancelFunc
 	refreshSemaphore chan struct{}
+	// refreshInFlight 记录当前正在执行 refresh 的 auth，避免同一 RT 被并发使用。
+	refreshInFlightMu sync.Mutex
+	refreshInFlight   map[string]struct{}
 
 	// Async persistence state for high-frequency runtime updates.
 	persistStartOnce sync.Once
@@ -210,6 +213,7 @@ func NewManager(store Store, selector Selector, hook Hook) *Manager {
 		inflightPerAuth:  make(map[string]int),
 		modelPoolOffsets: make(map[string]int),
 		refreshSemaphore: make(chan struct{}, refreshMaxConcurrency),
+		refreshInFlight:  make(map[string]struct{}),
 	}
 	manager.hookValue.Store(hookState{hook: hook})
 	// atomic.Value requires non-nil initial value.
@@ -2013,6 +2017,32 @@ func (m *Manager) authInflightCount(authID string) int {
 	return m.inflightPerAuth[authID]
 }
 
+func (m *Manager) tryAcquireRefreshSlot(authID string) (func(), bool) {
+	if m == nil {
+		return nil, false
+	}
+	authID = strings.TrimSpace(authID)
+	if authID == "" {
+		return nil, false
+	}
+	m.refreshInFlightMu.Lock()
+	if _, exists := m.refreshInFlight[authID]; exists {
+		m.refreshInFlightMu.Unlock()
+		return nil, false
+	}
+	m.refreshInFlight[authID] = struct{}{}
+	m.refreshInFlightMu.Unlock()
+
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			m.refreshInFlightMu.Lock()
+			delete(m.refreshInFlight, authID)
+			m.refreshInFlightMu.Unlock()
+		})
+	}, true
+}
+
 func effectiveCredentialRetryLimit(maxRetryCredentials int) int {
 	if maxRetryCredentials > 0 {
 		return maxRetryCredentials
@@ -3232,6 +3262,16 @@ func (m *Manager) TriggerCodexInitialRefreshOnLoadIfNeeded(ctx context.Context, 
 	go m.refreshAuthWithLimit(ctx, id)
 }
 
+// RefreshAuthNow 立即同步刷新指定 auth，并返回刷新后的最新快照。
+// 该入口主要给 management 等“手动操作某个凭证”的场景使用。
+func (m *Manager) RefreshAuthNow(ctx context.Context, id string) (*Auth, error) {
+	if m == nil || strings.TrimSpace(id) == "" {
+		return nil, ErrAuthNotFound
+	}
+	ctx = WithoutSkipPersist(ctx)
+	return m.runRefreshAuth(ctx, id, true)
+}
+
 // StopAutoRefresh cancels the background refresh loop, if running.
 func (m *Manager) StopAutoRefresh() {
 	if m.refreshCancel != nil {
@@ -3290,17 +3330,7 @@ func (m *Manager) collectRefreshTargets(now time.Time) []string {
 }
 
 func (m *Manager) refreshAuthWithLimit(ctx context.Context, id string) {
-	if m.refreshSemaphore == nil {
-		m.refreshAuth(ctx, id)
-		return
-	}
-	select {
-	case m.refreshSemaphore <- struct{}{}:
-		defer func() { <-m.refreshSemaphore }()
-	case <-ctx.Done():
-		return
-	}
-	m.refreshAuth(ctx, id)
+	_, _ = m.runRefreshAuth(ctx, id, false)
 }
 
 func (m *Manager) snapshotAuths() []*Auth {
@@ -3612,6 +3642,41 @@ func (m *Manager) markCodexInitialRefreshPending(id string, now time.Time) bool 
 }
 
 func (m *Manager) refreshAuth(ctx context.Context, id string) {
+	_, _ = m.runRefreshAuth(ctx, id, false)
+}
+
+func (m *Manager) runRefreshAuth(ctx context.Context, id string, failIfBusy bool) (*Auth, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return nil, ErrAuthNotFound
+	}
+	if m.refreshSemaphore != nil {
+		select {
+		case m.refreshSemaphore <- struct{}{}:
+			defer func() { <-m.refreshSemaphore }()
+		case <-ctx.Done():
+			return m.cloneAuthByID(id), ctx.Err()
+		}
+	}
+	return m.runRefreshAuthLocked(ctx, id, failIfBusy)
+}
+
+func (m *Manager) runRefreshAuthLocked(ctx context.Context, id string, failIfBusy bool) (*Auth, error) {
+	release, ok := m.tryAcquireRefreshSlot(id)
+	if !ok {
+		if failIfBusy {
+			return m.cloneAuthByID(id), ErrAuthRefreshInFlight
+		}
+		return nil, nil
+	}
+	defer release()
+	return m.executeRefreshAuth(ctx, id)
+}
+
+func (m *Manager) executeRefreshAuth(ctx context.Context, id string) (*Auth, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -3622,15 +3687,18 @@ func (m *Manager) refreshAuth(ctx context.Context, id string) {
 		exec = m.executors[auth.Provider]
 	}
 	m.mu.RUnlock()
-	if auth == nil || exec == nil {
-		return
+	if auth == nil {
+		return nil, ErrAuthNotFound
+	}
+	if exec == nil {
+		return auth.Clone(), ErrAuthRefreshExecutorUnavailable
 	}
 	cloned := auth.Clone()
 	initialRefreshPending := m.codexInitialRefreshOnLoadEnabled() && CodexInitialRefreshPending(cloned)
 	updated, err := exec.Refresh(ctx, cloned)
 	if err != nil && errors.Is(err, context.Canceled) {
 		log.Debugf("refresh canceled for %s, %s", auth.Provider, auth.ID)
-		return
+		return m.cloneAuthByID(id), err
 	}
 	log.Debugf("refreshed %s, %s, %v", auth.Provider, auth.ID, err)
 	now := time.Now()
@@ -3641,6 +3709,7 @@ func (m *Manager) refreshAuth(ctx context.Context, id string) {
 			refreshErr.HTTPStatus = terminalStatus
 		}
 		var persistSnapshot *Auth
+		var currentSnapshot *Auth
 		m.mu.Lock()
 		if current := m.auths[id]; current != nil {
 			current.NextRefreshAfter = now.Add(refreshFailureBackoff)
@@ -3649,6 +3718,7 @@ func (m *Manager) refreshAuth(ctx context.Context, id string) {
 			if initialRefreshPending && terminalStatus > 0 && ClearCodexInitialRefreshPending(current) {
 				persistSnapshot = current.Clone()
 			}
+			currentSnapshot = current.Clone()
 			m.auths[id] = current
 			if m.scheduler != nil {
 				m.scheduler.upsertAuth(current.Clone())
@@ -3665,7 +3735,10 @@ func (m *Manager) refreshAuth(ctx context.Context, id string) {
 				log.Warnf("codex 新文件初始 refresh 失败，将按退避继续重试: %s, %v", strings.TrimSpace(id), err)
 			}
 		}
-		return
+		if currentSnapshot == nil {
+			currentSnapshot = m.cloneAuthByID(id)
+		}
+		return currentSnapshot, err
 	}
 	if updated == nil {
 		updated = cloned
@@ -3683,7 +3756,11 @@ func (m *Manager) refreshAuth(ctx context.Context, id string) {
 	updated.NextRefreshAfter = time.Time{}
 	updated.LastError = nil
 	updated.UpdatedAt = now
-	_, _ = m.Update(ctx, updated)
+	persisted, _ := m.Update(ctx, updated)
+	if persisted != nil {
+		return persisted, nil
+	}
+	return m.cloneAuthByID(id), nil
 }
 
 func (m *Manager) executorFor(provider string) ProviderExecutor {

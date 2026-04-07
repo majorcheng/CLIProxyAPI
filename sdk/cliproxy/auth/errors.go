@@ -8,6 +8,15 @@ import (
 	"time"
 )
 
+var (
+	// ErrAuthNotFound 表示指定的认证记录不存在。
+	ErrAuthNotFound = errors.New("认证不存在")
+	// ErrAuthRefreshInFlight 表示同一个 auth 当前已经有 refresh 在执行。
+	ErrAuthRefreshInFlight = errors.New("当前凭证正在刷新中")
+	// ErrAuthRefreshExecutorUnavailable 表示当前 provider 没有注册可用的 refresh 执行器。
+	ErrAuthRefreshExecutorUnavailable = errors.New("当前凭证未配置刷新执行器")
+)
+
 // Error describes an authentication related failure in a provider agnostic format.
 type Error struct {
 	// Code is a short machine readable identifier.

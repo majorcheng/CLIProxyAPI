@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	internalconfig "github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 )
@@ -874,6 +875,41 @@ func TestManager_PickNextMixed_UsesWeightedProviderRotationBeforeCredentialRotat
 		if got.ID != wantIDs[index] {
 			t.Fatalf("pickNextMixed() #%d auth.ID = %q, want %q", index, got.ID, wantIDs[index])
 		}
+	}
+}
+
+func TestManager_PickNextMixed_OpenAICompatUsesProviderKeyAttribute(t *testing.T) {
+	t.Parallel()
+
+	providerKey := internalconfig.BuildOpenAICompatProviderKeyFromNormalized("dooongai")
+	model := "gpt-5.4"
+	registerSchedulerModels(t, providerKey, model, "compat-a")
+
+	manager := NewManager(nil, &RoundRobinSelector{}, nil)
+	manager.executors[providerKey] = schedulerTestExecutor{}
+	if _, errRegister := manager.Register(context.Background(), &Auth{
+		ID:       "compat-a",
+		Provider: "dooongai",
+		Attributes: map[string]string{
+			"compat_name":  "DooongAI",
+			"provider_key": providerKey,
+		},
+	}); errRegister != nil {
+		t.Fatalf("Register(compat-a) error = %v", errRegister)
+	}
+
+	got, _, provider, errPick := manager.pickNextMixed(context.Background(), []string{providerKey}, model, cliproxyexecutor.Options{}, nil)
+	if errPick != nil {
+		t.Fatalf("pickNextMixed() error = %v", errPick)
+	}
+	if got == nil {
+		t.Fatal("pickNextMixed() auth = nil")
+	}
+	if got.ID != "compat-a" {
+		t.Fatalf("pickNextMixed() auth.ID = %q, want %q", got.ID, "compat-a")
+	}
+	if provider != providerKey {
+		t.Fatalf("pickNextMixed() provider = %q, want %q", provider, providerKey)
 	}
 }
 

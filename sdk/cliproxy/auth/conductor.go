@@ -3089,6 +3089,42 @@ func (m *Manager) Executor(provider string) (ProviderExecutor, bool) {
 	return executor, true
 }
 
+func executorLookupKeys(provider string, auth *Auth) []string {
+	keys := make([]string, 0, 4)
+	appendKey := func(value string) {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			return
+		}
+		for _, existing := range keys {
+			if strings.EqualFold(existing, value) {
+				return
+			}
+		}
+		keys = append(keys, value)
+	}
+
+	appendKey(provider)
+	appendKey(executorKeyFromAuth(auth))
+	if auth != nil {
+		appendKey(auth.Provider)
+		if auth.Attributes != nil {
+			appendKey(auth.Attributes["compat_name"])
+			appendKey(auth.Attributes["provider_key"])
+		}
+	}
+	return keys
+}
+
+func (m *Manager) executorForAuth(provider string, auth *Auth) (ProviderExecutor, string, bool) {
+	for _, key := range executorLookupKeys(provider, auth) {
+		if executor, ok := m.Executor(key); ok {
+			return executor, strings.ToLower(strings.TrimSpace(key)), true
+		}
+	}
+	return nil, "", false
+}
+
 // CloseExecutionSession asks all registered executors to release the supplied execution session.
 func (m *Manager) CloseExecutionSession(sessionID string) {
 	sessionID = strings.TrimSpace(sessionID)
@@ -3277,14 +3313,14 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 		return nil, nil, "", &Error{Code: "auth_not_found", Message: "selector returned no auth"}
 	}
 	providerKey := strings.TrimSpace(strings.ToLower(selected.Provider))
-	executor, okExecutor := m.executors[providerKey]
+	executor, resolvedProvider, okExecutor := m.executorForAuth(providerKey, selected)
 	if !okExecutor {
 		m.mu.RUnlock()
 		return nil, nil, "", &Error{Code: "executor_not_found", Message: "executor not registered"}
 	}
 	authCopy := selected.Clone()
 	m.mu.RUnlock()
-	return m.finalizePickedAuth(authCopy), executor, providerKey, nil
+	return m.finalizePickedAuth(authCopy), executor, resolvedProvider, nil
 }
 
 func (m *Manager) pickNextMixed(ctx context.Context, providers []string, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Auth, ProviderExecutor, string, error) {
@@ -3323,11 +3359,11 @@ func (m *Manager) pickNextMixed(ctx context.Context, providers []string, model s
 	if selected == nil {
 		return nil, nil, "", &Error{Code: "auth_not_found", Message: "selector returned no auth"}
 	}
-	executor, okExecutor := m.Executor(providerKey)
+	executor, resolvedProvider, okExecutor := m.executorForAuth(providerKey, selected)
 	if !okExecutor {
 		return nil, nil, "", &Error{Code: "executor_not_found", Message: "executor not registered"}
 	}
-	return m.finalizePickedAuth(selected), executor, providerKey, nil
+	return m.finalizePickedAuth(selected), executor, resolvedProvider, nil
 }
 
 func (m *Manager) finalizePickedAuth(authCopy *Auth) *Auth {

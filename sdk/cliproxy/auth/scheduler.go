@@ -37,6 +37,7 @@ type authScheduler struct {
 	priorityZeroStrategy       schedulerStrategy
 	priorityZeroStrategyActive bool
 	providers                  map[string]*providerScheduler
+	providerAliases            map[string]string
 	authProviders              map[string]string
 	mixedCursors               map[string]int
 }
@@ -102,10 +103,11 @@ type cooldownQueue []*scheduledAuth
 // newAuthScheduler constructs an empty scheduler configured for the supplied selector strategy.
 func newAuthScheduler(selector Selector) *authScheduler {
 	return &authScheduler{
-		strategy:      selectorStrategy(selector),
-		providers:     make(map[string]*providerScheduler),
-		authProviders: make(map[string]string),
-		mixedCursors:  make(map[string]int),
+		strategy:        selectorStrategy(selector),
+		providers:       make(map[string]*providerScheduler),
+		providerAliases: make(map[string]string),
+		authProviders:   make(map[string]string),
+		mixedCursors:    make(map[string]int),
 	}
 }
 
@@ -170,6 +172,7 @@ func (s *authScheduler) rebuild(auths []*Auth) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.providers = make(map[string]*providerScheduler)
+	s.providerAliases = make(map[string]string)
 	s.authProviders = make(map[string]string)
 	s.mixedCursors = make(map[string]int)
 	now := time.Now()
@@ -245,13 +248,14 @@ func (s *authScheduler) pickSingle(ctx context.Context, provider, model string, 
 	if s == nil {
 		return nil, &Error{Code: "auth_not_found", Message: "no auth available"}
 	}
-	providerKey := strings.ToLower(strings.TrimSpace(provider))
+	requestedProvider := strings.ToLower(strings.TrimSpace(provider))
 	modelKey := canonicalModelKey(model)
 	pinnedAuthID := pinnedAuthIDFromMetadata(opts.Metadata)
-	preferWebsocket := cliproxyexecutor.DownstreamWebsocket(ctx) && providerKey == "codex" && pinnedAuthID == ""
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	providerKey := s.resolveProviderAliasLocked(requestedProvider)
+	preferWebsocket := cliproxyexecutor.DownstreamWebsocket(ctx) && providerKey == "codex" && pinnedAuthID == ""
 	providerState := s.providers[providerKey]
 	if providerState == nil {
 		return nil, &Error{Code: "auth_not_found", Message: "no auth available"}
@@ -288,10 +292,6 @@ func (s *authScheduler) pickMixed(ctx context.Context, providers []string, model
 	if s == nil {
 		return nil, "", &Error{Code: "auth_not_found", Message: "no auth available"}
 	}
-	normalized := normalizeProviderKeys(providers)
-	if len(normalized) == 0 {
-		return nil, "", &Error{Code: "provider_not_found", Message: "no provider supplied"}
-	}
 	pinnedAuthID := pinnedAuthIDFromMetadata(opts.Metadata)
 	modelKey := canonicalModelKey(model)
 	preferWebsocketForProvider := func(providerKey string) bool {
@@ -300,6 +300,10 @@ func (s *authScheduler) pickMixed(ctx context.Context, providers []string, model
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	normalized := s.normalizeProviderKeysLocked(providers)
+	if len(normalized) == 0 {
+		return nil, "", &Error{Code: "provider_not_found", Message: "no provider supplied"}
+	}
 	if pinnedAuthID != "" {
 		providerKey := s.authProviders[pinnedAuthID]
 		if providerKey == "" || !containsProvider(normalized, providerKey) {
@@ -504,6 +508,73 @@ func normalizeProviderKeys(providers []string) []string {
 	return out
 }
 
+func providerAliasesForAuth(auth *Auth, providerKey string) []string {
+	aliases := make([]string, 0, 3)
+	appendAlias := func(value string) {
+		value = strings.ToLower(strings.TrimSpace(value))
+		if value == "" {
+			return
+		}
+		for _, existing := range aliases {
+			if existing == value {
+				return
+			}
+		}
+		aliases = append(aliases, value)
+	}
+
+	appendAlias(providerKey)
+	if auth == nil {
+		return aliases
+	}
+	appendAlias(auth.Provider)
+	if auth.Attributes != nil {
+		appendAlias(auth.Attributes["compat_name"])
+		appendAlias(auth.Attributes["provider_key"])
+	}
+	return aliases
+}
+
+func (s *authScheduler) setProviderAliasesLocked(auth *Auth, providerKey string) {
+	if s == nil || providerKey == "" {
+		return
+	}
+	if s.providerAliases == nil {
+		s.providerAliases = make(map[string]string)
+	}
+	for _, alias := range providerAliasesForAuth(auth, providerKey) {
+		s.providerAliases[alias] = providerKey
+	}
+}
+
+func (s *authScheduler) resolveProviderAliasLocked(provider string) string {
+	provider = strings.ToLower(strings.TrimSpace(provider))
+	if provider == "" {
+		return ""
+	}
+	if canonical, ok := s.providerAliases[provider]; ok && canonical != "" {
+		return canonical
+	}
+	return provider
+}
+
+func (s *authScheduler) normalizeProviderKeysLocked(providers []string) []string {
+	seen := make(map[string]struct{}, len(providers))
+	out := make([]string, 0, len(providers))
+	for _, provider := range providers {
+		providerKey := s.resolveProviderAliasLocked(provider)
+		if providerKey == "" {
+			continue
+		}
+		if _, ok := seen[providerKey]; ok {
+			continue
+		}
+		seen[providerKey] = struct{}{}
+		out = append(out, providerKey)
+	}
+	return out
+}
+
 // containsProvider reports whether provider is present in the normalized provider list.
 func containsProvider(providers []string, provider string) bool {
 	for _, candidate := range providers {
@@ -520,7 +591,7 @@ func (s *authScheduler) upsertAuthLocked(auth *Auth, now time.Time) {
 		return
 	}
 	authID := strings.TrimSpace(auth.ID)
-	providerKey := strings.ToLower(strings.TrimSpace(auth.Provider))
+	providerKey := executorKeyFromAuth(auth)
 	if authID == "" || providerKey == "" || auth.Disabled {
 		s.removeAuthLocked(authID)
 		return
@@ -532,6 +603,7 @@ func (s *authScheduler) upsertAuthLocked(auth *Auth, now time.Time) {
 	}
 	meta := buildScheduledAuthMeta(auth)
 	s.authProviders[authID] = providerKey
+	s.setProviderAliasesLocked(auth, providerKey)
 	s.ensureProviderLocked(providerKey).upsertAuthLocked(meta, now)
 }
 
@@ -567,7 +639,7 @@ func (s *authScheduler) ensureProviderLocked(providerKey string) *providerSchedu
 
 // buildScheduledAuthMeta extracts the scheduling metadata needed for shard bookkeeping.
 func buildScheduledAuthMeta(auth *Auth) *scheduledAuthMeta {
-	providerKey := strings.ToLower(strings.TrimSpace(auth.Provider))
+	providerKey := executorKeyFromAuth(auth)
 	virtualParent := ""
 	if auth.Attributes != nil {
 		virtualParent = strings.TrimSpace(auth.Attributes["gemini_virtual_parent"])

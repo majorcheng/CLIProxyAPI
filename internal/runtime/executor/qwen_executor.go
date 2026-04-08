@@ -23,7 +23,7 @@ import (
 )
 
 const (
-	qwenUserAgent       = "QwenCode/0.10.3 (darwin; arm64)"
+	qwenUserAgent       = "QwenCode/0.14.2 (darwin; arm64)"
 	qwenRateLimitPerMin = 60          // 60 requests per minute per credential
 	qwenRateLimitWindow = time.Minute // sliding window duration
 )
@@ -551,20 +551,23 @@ func (e *QwenExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*c
 }
 
 func applyQwenHeaders(r *http.Request, token string, stream bool) {
-	r.Header.Set("Content-Type", "application/json")
-	r.Header.Set("Authorization", "Bearer "+token)
-	r.Header.Set("User-Agent", qwenUserAgent)
-	r.Header.Set("X-Dashscope-Useragent", qwenUserAgent)
 	r.Header.Set("X-Stainless-Runtime-Version", "v22.17.0")
-	r.Header.Set("Sec-Fetch-Mode", "cors")
+	r.Header.Set("User-Agent", qwenUserAgent)
 	r.Header.Set("X-Stainless-Lang", "js")
-	r.Header.Set("X-Stainless-Arch", "arm64")
-	r.Header.Set("X-Stainless-Package-Version", "5.11.0")
+	r.Header.Set("Accept-Language", "*")
 	r.Header.Set("X-Dashscope-Cachecontrol", "enable")
-	r.Header.Set("X-Stainless-Retry-Count", "0")
 	r.Header.Set("X-Stainless-Os", "MacOS")
 	r.Header.Set("X-Dashscope-Authtype", "qwen-oauth")
+	r.Header.Set("X-Stainless-Arch", "arm64")
 	r.Header.Set("X-Stainless-Runtime", "node")
+	r.Header.Set("X-Stainless-Retry-Count", "0")
+	r.Header.Set("Accept-Encoding", "gzip, deflate")
+	r.Header.Set("Authorization", "Bearer "+token)
+	r.Header.Set("X-Stainless-Package-Version", "5.11.0")
+	r.Header.Set("Sec-Fetch-Mode", "cors")
+	r.Header.Set("Content-Type", "application/json")
+	r.Header.Set("Connection", "keep-alive")
+	r.Header.Set("X-Dashscope-Useragent", qwenUserAgent)
 
 	if stream {
 		r.Header.Set("Accept", "text/event-stream")

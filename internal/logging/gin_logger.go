@@ -28,6 +28,8 @@ var aiAPIPrefixes = []string{
 
 const skipGinLogKey = "__gin_skip_request_logging__"
 
+const maxLoggedUserAgentRunes = 160
+
 // GinLogrusLogger returns a Gin middleware handler that logs HTTP requests and responses
 // using logrus. It captures request details including method, path, status code, latency,
 // client IP, and any error messages. Request ID is only added for AI API requests.
@@ -42,6 +44,7 @@ func GinLogrusLogger() gin.HandlerFunc {
 		start := time.Now()
 		path := c.Request.URL.Path
 		raw := util.MaskSensitiveQuery(c.Request.URL.RawQuery)
+		userAgent := summarizeUserAgentForMainLog(c.Request)
 
 		// Only generate request ID for AI API paths
 		var requestID string
@@ -77,7 +80,7 @@ func GinLogrusLogger() gin.HandlerFunc {
 		if requestID == "" {
 			requestID = "--------"
 		}
-		logLine := fmt.Sprintf("%3d | %13v | %15s | %-7s \"%s\"", statusCode, latency, clientIP, method, path)
+		logLine := fmt.Sprintf("%3d | %13v | %15s | %-7s \"%s\" | ua=%q", statusCode, latency, clientIP, method, path, userAgent)
 		if errorMessage != "" {
 			logLine = logLine + " | " + errorMessage
 		}
@@ -93,6 +96,26 @@ func GinLogrusLogger() gin.HandlerFunc {
 			entry.Info(logLine)
 		}
 	}
+}
+
+// summarizeUserAgentForMainLog 将客户端 UA 压成单行、限长摘要后写入主日志。
+// 这样既能在 main.log 里快速看出调用方类型，又避免超长/多行指纹把日志可读性撑坏。
+func summarizeUserAgentForMainLog(req *http.Request) string {
+	if req == nil {
+		return "-"
+	}
+
+	userAgent := strings.Join(strings.Fields(strings.TrimSpace(req.UserAgent())), " ")
+	if userAgent == "" {
+		return "-"
+	}
+
+	runes := []rune(userAgent)
+	if len(runes) <= maxLoggedUserAgentRunes {
+		return userAgent
+	}
+
+	return string(runes[:maxLoggedUserAgentRunes-3]) + "..."
 }
 
 // isAIAPIPath checks if the given path is an AI API endpoint that should have request ID tracking.

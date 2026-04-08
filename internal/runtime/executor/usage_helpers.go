@@ -69,9 +69,8 @@ func (r *usageReporter) publishWithOutcome(ctx context.Context, detail usage.Det
 			detail.TotalTokens = total
 		}
 	}
-	if detail.InputTokens == 0 && detail.OutputTokens == 0 && detail.ReasoningTokens == 0 && detail.CachedTokens == 0 && detail.TotalTokens == 0 && !failed {
-		return
-	}
+	// 成功请求即使 usage 全为 0 也要落一条记录；
+	// 否则管理端会把“请求成功但上游未计费/未返回 token”的场景误判成根本没发生过。
 	r.once.Do(func() {
 		usage.PublishRecord(ctx, r.buildRecord(detail, failed))
 	})

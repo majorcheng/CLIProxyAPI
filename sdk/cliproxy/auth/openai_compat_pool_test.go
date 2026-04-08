@@ -181,7 +181,7 @@ func newOpenAICompatPoolTestManager(t *testing.T, alias string, models []interna
 		Attributes: map[string]string{
 			"api_key":      "test-key",
 			"compat_name":  "pool",
-			"provider_key": "pool",
+			"provider_key": internalconfig.BuildOpenAICompatProviderKeyFromNormalized("pool"),
 		},
 	}
 	if _, err := m.Register(context.Background(), auth); err != nil {
@@ -738,7 +738,7 @@ func TestManagerExecute_OpenAICompatAliasPoolBlockedAuthDoesNotConsumeRetryBudge
 		Attributes: map[string]string{
 			"api_key":      "bad-key",
 			"compat_name":  "pool",
-			"provider_key": "pool",
+			"provider_key": internalconfig.BuildOpenAICompatProviderKeyFromNormalized("pool"),
 		},
 	}
 	goodAuth := &Auth{
@@ -748,7 +748,7 @@ func TestManagerExecute_OpenAICompatAliasPoolBlockedAuthDoesNotConsumeRetryBudge
 		Attributes: map[string]string{
 			"api_key":      "good-key",
 			"compat_name":  "pool",
-			"provider_key": "pool",
+			"provider_key": internalconfig.BuildOpenAICompatProviderKeyFromNormalized("pool"),
 		},
 	}
 	if _, err := m.Register(context.Background(), badAuth); err != nil {

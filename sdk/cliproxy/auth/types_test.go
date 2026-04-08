@@ -1,6 +1,10 @@
 package auth
 
-import "testing"
+import (
+	"testing"
+
+	internalconfig "github.com/router-for-me/CLIProxyAPI/v6/internal/config"
+)
 
 func TestToolPrefixDisabled(t *testing.T) {
 	var a *Auth
@@ -49,7 +53,7 @@ func TestEnsureIndexUsesCredentialIdentity(t *testing.T) {
 		Attributes: map[string]string{
 			"api_key":      "shared-key",
 			"compat_name":  "bohe",
-			"provider_key": "bohe",
+			"provider_key": internalconfig.BuildOpenAICompatProviderKeyFromNormalized("bohe"),
 			"source":       "config:bohe[def456]",
 		},
 	}

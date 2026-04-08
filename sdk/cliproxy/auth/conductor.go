@@ -1977,7 +1977,7 @@ func resolveOpenAICompatConfig(cfg *internalconfig.Config, providerKey, compatNa
 	for i := range cfg.OpenAICompatibility {
 		compat := &cfg.OpenAICompatibility[i]
 		for _, candidate := range candidates {
-			if candidate != "" && strings.EqualFold(strings.TrimSpace(candidate), compat.Name) {
+			if internalconfig.MatchOpenAICompatIdentity(candidate, candidate, candidate, compat) {
 				return compat
 			}
 		}

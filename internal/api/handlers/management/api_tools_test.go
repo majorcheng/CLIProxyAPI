@@ -76,7 +76,7 @@ func TestAuthByIndexDistinguishesSharedAPIKeysAcrossProviders(t *testing.T) {
 		Attributes: map[string]string{
 			"api_key":      "shared-key",
 			"compat_name":  "bohe",
-			"provider_key": "bohe",
+			"provider_key": config.BuildOpenAICompatProviderKeyFromNormalized("bohe"),
 		},
 	}
 

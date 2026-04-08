@@ -3,7 +3,9 @@
 package management
 
 import (
+	"crypto/sha256"
 	"crypto/subtle"
+	"encoding/hex"
 	"fmt"
 	"net/http"
 	"os"
@@ -48,6 +50,7 @@ type Handler struct {
 	envSecret           string
 	logDir              string
 	postAuthHook        coreauth.PostAuthHook
+	configApplied       func(*config.Config)
 }
 
 // NewHandler creates a new management handler instance.
@@ -107,6 +110,10 @@ func NewHandlerWithoutConfigFilePath(cfg *config.Config, manager *coreauth.Manag
 // SetConfig updates the in-memory config reference when the server hot-reloads.
 func (h *Handler) SetConfig(cfg *config.Config) { h.cfg = cfg }
 
+// SetConfigApplied registers a callback that applies freshly persisted config
+// to the live runtime after management mutations succeed.
+func (h *Handler) SetConfigApplied(apply func(*config.Config)) { h.configApplied = apply }
+
 // SetAuthManager updates the auth manager reference used by management endpoints.
 func (h *Handler) SetAuthManager(manager *coreauth.Manager) { h.authManager = manager }
 
@@ -132,6 +139,19 @@ func (h *Handler) SetLogDirectory(dir string) {
 // SetPostAuthHook registers a hook to be called after auth record creation but before persistence.
 func (h *Handler) SetPostAuthHook(hook coreauth.PostAuthHook) {
 	h.postAuthHook = hook
+}
+
+func computeConfigRevisionBytes(data []byte) string {
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:])
+}
+
+func readConfigRevision(path string) (string, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+	return computeConfigRevisionBytes(data), nil
 }
 
 // Middleware enforces access control for management endpoints.

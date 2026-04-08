@@ -53,3 +53,23 @@ func SaveConfigPreserveCommentsUpdateNestedScalar(configFile string, path []stri
 func NormalizeCommentIndentation(data []byte) []byte {
 	return internalconfig.NormalizeCommentIndentation(data)
 }
+
+func NormalizeOpenAICompatName(name string) (trimmed string, normalized string, err error) {
+	return internalconfig.NormalizeOpenAICompatName(name)
+}
+
+func BuildOpenAICompatProviderKey(name string) (string, error) {
+	return internalconfig.BuildOpenAICompatProviderKey(name)
+}
+
+func BuildOpenAICompatProviderKeyFromNormalized(normalized string) string {
+	return internalconfig.BuildOpenAICompatProviderKeyFromNormalized(normalized)
+}
+
+func ValidateOpenAICompatNames(entries []OpenAICompatibility) error {
+	return internalconfig.ValidateOpenAICompatNames(entries)
+}
+
+func MatchOpenAICompatIdentity(providerKey, compatName, authProvider string, compat *OpenAICompatibility) bool {
+	return internalconfig.MatchOpenAICompatIdentity(providerKey, compatName, authProvider, compat)
+}

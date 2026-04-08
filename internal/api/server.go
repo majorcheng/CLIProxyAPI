@@ -263,6 +263,9 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 	auth.SetQuotaCooldownDisabled(cfg.DisableCooling)
 	// Initialize management handler
 	s.mgmt = managementHandlers.NewHandler(cfg, configFilePath, authManager)
+	s.mgmt.SetConfigApplied(func(updated *config.Config) {
+		s.UpdateClients(updated)
+	})
 	if optionState.localPassword != "" {
 		s.mgmt.SetLocalPassword(optionState.localPassword)
 	}
@@ -619,6 +622,7 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.DELETE("/codex-api-key", s.mgmt.DeleteCodexKey)
 
 		mgmt.GET("/openai-compatibility", s.mgmt.GetOpenAICompat)
+		mgmt.POST("/openai-compatibility", s.mgmt.PostOpenAICompat)
 		mgmt.PUT("/openai-compatibility", s.mgmt.PutOpenAICompat)
 		mgmt.PATCH("/openai-compatibility", s.mgmt.PatchOpenAICompat)
 		mgmt.DELETE("/openai-compatibility", s.mgmt.DeleteOpenAICompat)

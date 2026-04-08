@@ -2,11 +2,18 @@ package management
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
+)
+
+var (
+	errOpenAICompatNotFound         = errors.New("未找到 OpenAI 兼容提供商")
+	errOpenAICompatNameConflict     = errors.New("OpenAI 兼容提供商名称冲突")
+	errOpenAICompatRevisionConflict = errors.New("OpenAI 兼容提供商配置已变化，请刷新后重试")
 )
 
 // Generic helpers for list[string]
@@ -362,8 +369,57 @@ func (h *Handler) DeleteClaudeKey(c *gin.Context) {
 
 // openai-compatibility: []OpenAICompatibility
 func (h *Handler) GetOpenAICompat(c *gin.Context) {
-	c.JSON(200, gin.H{"openai-compatibility": normalizedOpenAICompatibilityEntries(h.cfg.OpenAICompatibility)})
+	entries, revision, err := h.readOpenAICompatState()
+	if err != nil {
+		c.JSON(500, gin.H{"error": "read_failed", "message": err.Error()})
+		return
+	}
+	c.JSON(200, gin.H{"openai-compatibility": entries, "revision": revision})
 }
+
+func (h *Handler) PostOpenAICompat(c *gin.Context) {
+	data, err := c.GetRawData()
+	if err != nil {
+		c.JSON(400, gin.H{"error": "failed to read body"})
+		return
+	}
+	var body struct {
+		Revision string                      `json:"revision"`
+		Value    *config.OpenAICompatibility `json:"value"`
+	}
+	if err = json.Unmarshal(data, &body); err != nil {
+		c.JSON(400, gin.H{"error": "invalid body"})
+		return
+	}
+	var entry config.OpenAICompatibility
+	if body.Value != nil {
+		entry = *body.Value
+	} else if err = json.Unmarshal(data, &entry); err != nil {
+		c.JSON(400, gin.H{"error": "invalid body"})
+		return
+	}
+	normalizeOpenAICompatibilityEntry(&entry)
+	if err = validateOpenAICompatEntry(entry); err != nil {
+		c.JSON(400, gin.H{"error": "invalid_openai_provider", "message": err.Error()})
+		return
+	}
+
+	entries, revision, err := h.mutateOpenAICompat(strings.TrimSpace(body.Revision), func(fresh *config.Config) error {
+		if idx, findErr := findOpenAICompatIndexByName(fresh.OpenAICompatibility, entry.Name); findErr != nil {
+			return findErr
+		} else if idx >= 0 {
+			return errOpenAICompatNameConflict
+		}
+		fresh.OpenAICompatibility = append(fresh.OpenAICompatibility, entry)
+		return nil
+	})
+	if err != nil {
+		h.writeOpenAICompatMutationError(c, err)
+		return
+	}
+	c.JSON(200, gin.H{"openai-compatibility": entries, "revision": revision})
+}
+
 func (h *Handler) PutOpenAICompat(c *gin.Context) {
 	data, err := c.GetRawData()
 	if err != nil {
@@ -371,14 +427,17 @@ func (h *Handler) PutOpenAICompat(c *gin.Context) {
 		return
 	}
 	var arr []config.OpenAICompatibility
+	revision := strings.TrimSpace(c.Query("revision"))
 	if err = json.Unmarshal(data, &arr); err != nil {
 		var obj struct {
-			Items []config.OpenAICompatibility `json:"items"`
+			Revision string                       `json:"revision"`
+			Items    []config.OpenAICompatibility `json:"items"`
 		}
-		if err2 := json.Unmarshal(data, &obj); err2 != nil || len(obj.Items) == 0 {
+		if err2 := json.Unmarshal(data, &obj); err2 != nil {
 			c.JSON(400, gin.H{"error": "invalid body"})
 			return
 		}
+		revision = strings.TrimSpace(obj.Revision)
 		arr = obj.Items
 	}
 	filtered := make([]config.OpenAICompatibility, 0, len(arr))
@@ -388,13 +447,30 @@ func (h *Handler) PutOpenAICompat(c *gin.Context) {
 			filtered = append(filtered, arr[i])
 		}
 	}
-	h.cfg.OpenAICompatibility = filtered
-	h.cfg.SanitizeOpenAICompatibility()
-	h.persist(c)
+	if err = config.ValidateOpenAICompatNames(filtered); err != nil {
+		status := 400
+		if strings.Contains(err.Error(), "规范化后冲突") {
+			status = 409
+		}
+		c.JSON(status, gin.H{"error": "invalid_openai_provider", "message": err.Error()})
+		return
+	}
+
+	entries, nextRevision, err := h.mutateOpenAICompat(revision, func(fresh *config.Config) error {
+		fresh.OpenAICompatibility = append([]config.OpenAICompatibility(nil), filtered...)
+		return nil
+	})
+	if err != nil {
+		h.writeOpenAICompatMutationError(c, err)
+		return
+	}
+	c.JSON(200, gin.H{"openai-compatibility": entries, "revision": nextRevision})
 }
+
 func (h *Handler) PatchOpenAICompat(c *gin.Context) {
 	type openAICompatPatch struct {
 		Name          *string                             `json:"name"`
+		Priority      *int                                `json:"priority"`
 		Prefix        *string                             `json:"prefix"`
 		BaseURL       *string                             `json:"base-url"`
 		APIKeyEntries *[]config.OpenAICompatibilityAPIKey `json:"api-key-entries"`
@@ -402,88 +478,121 @@ func (h *Handler) PatchOpenAICompat(c *gin.Context) {
 		Headers       *map[string]string                  `json:"headers"`
 	}
 	var body struct {
-		Name  *string            `json:"name"`
-		Index *int               `json:"index"`
-		Value *openAICompatPatch `json:"value"`
+		Revision  string             `json:"revision"`
+		MatchName *string            `json:"matchName"`
+		Name      *string            `json:"name"`
+		Index     *int               `json:"index"`
+		Value     *openAICompatPatch `json:"value"`
 	}
 	if err := c.ShouldBindJSON(&body); err != nil || body.Value == nil {
 		c.JSON(400, gin.H{"error": "invalid body"})
 		return
 	}
-	targetIndex := -1
-	if body.Index != nil && *body.Index >= 0 && *body.Index < len(h.cfg.OpenAICompatibility) {
-		targetIndex = *body.Index
+
+	matchName := ""
+	if body.MatchName != nil {
+		matchName = strings.TrimSpace(*body.MatchName)
 	}
-	if targetIndex == -1 && body.Name != nil {
-		match := strings.TrimSpace(*body.Name)
-		for i := range h.cfg.OpenAICompatibility {
-			if h.cfg.OpenAICompatibility[i].Name == match {
-				targetIndex = i
-				break
-			}
-		}
-	}
-	if targetIndex == -1 {
-		c.JSON(404, gin.H{"error": "item not found"})
-		return
+	if matchName == "" && body.Name != nil {
+		matchName = strings.TrimSpace(*body.Name)
 	}
 
-	entry := h.cfg.OpenAICompatibility[targetIndex]
-	if body.Value.Name != nil {
-		entry.Name = strings.TrimSpace(*body.Value.Name)
-	}
-	if body.Value.Prefix != nil {
-		entry.Prefix = strings.TrimSpace(*body.Value.Prefix)
-	}
-	if body.Value.BaseURL != nil {
-		trimmed := strings.TrimSpace(*body.Value.BaseURL)
-		if trimmed == "" {
-			h.cfg.OpenAICompatibility = append(h.cfg.OpenAICompatibility[:targetIndex], h.cfg.OpenAICompatibility[targetIndex+1:]...)
-			h.cfg.SanitizeOpenAICompatibility()
-			h.persist(c)
-			return
+	entries, revision, err := h.mutateOpenAICompat(strings.TrimSpace(body.Revision), func(fresh *config.Config) error {
+		targetIndex := -1
+		if body.Index != nil && *body.Index >= 0 && *body.Index < len(fresh.OpenAICompatibility) {
+			targetIndex = *body.Index
 		}
-		entry.BaseURL = trimmed
+		if targetIndex == -1 && matchName != "" {
+			idx, findErr := findOpenAICompatIndexByName(fresh.OpenAICompatibility, matchName)
+			if findErr != nil {
+				return findErr
+			}
+			targetIndex = idx
+		}
+		if targetIndex == -1 {
+			return errOpenAICompatNotFound
+		}
+
+		entry := fresh.OpenAICompatibility[targetIndex]
+		if body.Value.Name != nil {
+			entry.Name = strings.TrimSpace(*body.Value.Name)
+		}
+		if body.Value.Priority != nil {
+			entry.Priority = *body.Value.Priority
+		}
+		if body.Value.Prefix != nil {
+			entry.Prefix = strings.TrimSpace(*body.Value.Prefix)
+		}
+		if body.Value.BaseURL != nil {
+			trimmed := strings.TrimSpace(*body.Value.BaseURL)
+			if trimmed == "" {
+				fresh.OpenAICompatibility = append(fresh.OpenAICompatibility[:targetIndex], fresh.OpenAICompatibility[targetIndex+1:]...)
+				return nil
+			}
+			entry.BaseURL = trimmed
+		}
+		if body.Value.APIKeyEntries != nil {
+			entry.APIKeyEntries = append([]config.OpenAICompatibilityAPIKey(nil), (*body.Value.APIKeyEntries)...)
+		}
+		if body.Value.Models != nil {
+			entry.Models = append([]config.OpenAICompatibilityModel(nil), (*body.Value.Models)...)
+		}
+		if body.Value.Headers != nil {
+			entry.Headers = config.NormalizeHeaders(*body.Value.Headers)
+		}
+		normalizeOpenAICompatibilityEntry(&entry)
+
+		if nameConflictWithOthers(fresh.OpenAICompatibility, targetIndex, entry.Name) {
+			return errOpenAICompatNameConflict
+		}
+		if err := validateOpenAICompatEntry(entry); err != nil {
+			return err
+		}
+		fresh.OpenAICompatibility[targetIndex] = entry
+		return nil
+	})
+	if err != nil {
+		h.writeOpenAICompatMutationError(c, err)
+		return
 	}
-	if body.Value.APIKeyEntries != nil {
-		entry.APIKeyEntries = append([]config.OpenAICompatibilityAPIKey(nil), (*body.Value.APIKeyEntries)...)
-	}
-	if body.Value.Models != nil {
-		entry.Models = append([]config.OpenAICompatibilityModel(nil), (*body.Value.Models)...)
-	}
-	if body.Value.Headers != nil {
-		entry.Headers = config.NormalizeHeaders(*body.Value.Headers)
-	}
-	normalizeOpenAICompatibilityEntry(&entry)
-	h.cfg.OpenAICompatibility[targetIndex] = entry
-	h.cfg.SanitizeOpenAICompatibility()
-	h.persist(c)
+	c.JSON(200, gin.H{"openai-compatibility": entries, "revision": revision})
 }
 
 func (h *Handler) DeleteOpenAICompat(c *gin.Context) {
-	if name := c.Query("name"); name != "" {
-		out := make([]config.OpenAICompatibility, 0, len(h.cfg.OpenAICompatibility))
-		for _, v := range h.cfg.OpenAICompatibility {
-			if v.Name != name {
-				out = append(out, v)
-			}
-		}
-		h.cfg.OpenAICompatibility = out
-		h.cfg.SanitizeOpenAICompatibility()
-		h.persist(c)
+	var body struct {
+		Revision string `json:"revision"`
+		Name     string `json:"name"`
+	}
+	_ = c.ShouldBindJSON(&body)
+	name := strings.TrimSpace(body.Name)
+	if name == "" {
+		name = strings.TrimSpace(c.Query("name"))
+	}
+	revision := strings.TrimSpace(body.Revision)
+	if revision == "" {
+		revision = strings.TrimSpace(c.Query("revision"))
+	}
+	if name == "" {
+		c.JSON(400, gin.H{"error": "missing_name", "message": "请提供要删除的 OpenAI 兼容提供商名称"})
 		return
 	}
-	if idxStr := c.Query("index"); idxStr != "" {
-		var idx int
-		_, err := fmt.Sscanf(idxStr, "%d", &idx)
-		if err == nil && idx >= 0 && idx < len(h.cfg.OpenAICompatibility) {
-			h.cfg.OpenAICompatibility = append(h.cfg.OpenAICompatibility[:idx], h.cfg.OpenAICompatibility[idx+1:]...)
-			h.cfg.SanitizeOpenAICompatibility()
-			h.persist(c)
-			return
+
+	entries, nextRevision, err := h.mutateOpenAICompat(revision, func(fresh *config.Config) error {
+		idx, findErr := findOpenAICompatIndexByName(fresh.OpenAICompatibility, name)
+		if findErr != nil {
+			return findErr
 		}
+		if idx == -1 {
+			return errOpenAICompatNotFound
+		}
+		fresh.OpenAICompatibility = append(fresh.OpenAICompatibility[:idx], fresh.OpenAICompatibility[idx+1:]...)
+		return nil
+	})
+	if err != nil {
+		h.writeOpenAICompatMutationError(c, err)
+		return
 	}
-	c.JSON(400, gin.H{"error": "missing name or index"})
+	c.JSON(200, gin.H{"openai-compatibility": entries, "revision": nextRevision})
 }
 
 // vertex-api-key: []VertexCompatKey
@@ -938,6 +1047,137 @@ func (h *Handler) DeleteCodexKey(c *gin.Context) {
 		}
 	}
 	c.JSON(400, gin.H{"error": "missing api-key or index"})
+}
+
+func validateOpenAICompatEntry(entry config.OpenAICompatibility) error {
+	if strings.TrimSpace(entry.BaseURL) == "" {
+		return fmt.Errorf("base-url 不能为空")
+	}
+	return config.ValidateOpenAICompatNames([]config.OpenAICompatibility{entry})
+}
+
+func findOpenAICompatIndexByName(entries []config.OpenAICompatibility, name string) (int, error) {
+	_, normalizedName, err := config.NormalizeOpenAICompatName(name)
+	if err != nil {
+		return -1, err
+	}
+	for i := range entries {
+		_, normalizedEntryName, normalizeErr := config.NormalizeOpenAICompatName(entries[i].Name)
+		if normalizeErr != nil {
+			return -1, normalizeErr
+		}
+		if normalizedEntryName == normalizedName {
+			return i, nil
+		}
+	}
+	return -1, nil
+}
+
+func nameConflictWithOthers(entries []config.OpenAICompatibility, targetIndex int, name string) bool {
+	_, normalizedName, err := config.NormalizeOpenAICompatName(name)
+	if err != nil {
+		return false
+	}
+	for i := range entries {
+		if i == targetIndex {
+			continue
+		}
+		_, normalizedEntryName, normalizeErr := config.NormalizeOpenAICompatName(entries[i].Name)
+		if normalizeErr != nil {
+			continue
+		}
+		if normalizedEntryName == normalizedName {
+			return true
+		}
+	}
+	return false
+}
+
+func (h *Handler) readOpenAICompatState() ([]config.OpenAICompatibility, string, error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	freshCfg, err := config.LoadConfig(h.configFilePath)
+	if err != nil {
+		return nil, "", err
+	}
+	revision, err := readConfigRevision(h.configFilePath)
+	if err != nil {
+		return nil, "", err
+	}
+	return normalizedOpenAICompatibilityEntries(freshCfg.OpenAICompatibility), revision, nil
+}
+
+func (h *Handler) mutateOpenAICompat(
+	expectedRevision string,
+	mutate func(*config.Config) error,
+) ([]config.OpenAICompatibility, string, error) {
+	h.mu.Lock()
+
+	freshCfg, err := config.LoadConfig(h.configFilePath)
+	if err != nil {
+		h.mu.Unlock()
+		return nil, "", err
+	}
+	currentRevision, err := readConfigRevision(h.configFilePath)
+	if err != nil {
+		h.mu.Unlock()
+		return nil, "", err
+	}
+	if expectedRevision != "" && expectedRevision != currentRevision {
+		h.mu.Unlock()
+		return nil, currentRevision, errOpenAICompatRevisionConflict
+	}
+
+	if err := mutate(freshCfg); err != nil {
+		h.mu.Unlock()
+		return nil, currentRevision, err
+	}
+
+	freshCfg.SanitizeOpenAICompatibility()
+	if err := config.ValidateOpenAICompatNames(freshCfg.OpenAICompatibility); err != nil {
+		h.mu.Unlock()
+		return nil, currentRevision, err
+	}
+	if err := config.SaveConfigPreserveComments(h.configFilePath, freshCfg); err != nil {
+		h.mu.Unlock()
+		return nil, "", err
+	}
+
+	savedCfg, err := config.LoadConfig(h.configFilePath)
+	if err != nil {
+		h.mu.Unlock()
+		return nil, "", err
+	}
+	revision, err := readConfigRevision(h.configFilePath)
+	if err != nil {
+		h.mu.Unlock()
+		return nil, "", err
+	}
+	h.cfg = savedCfg
+	applier := h.configApplied
+	entries := normalizedOpenAICompatibilityEntries(savedCfg.OpenAICompatibility)
+	h.mu.Unlock()
+
+	if applier != nil {
+		applier(savedCfg)
+	}
+	return entries, revision, nil
+}
+
+func (h *Handler) writeOpenAICompatMutationError(c *gin.Context, err error) {
+	switch {
+	case errors.Is(err, errOpenAICompatRevisionConflict):
+		c.JSON(409, gin.H{"error": "revision_conflict", "message": err.Error()})
+	case errors.Is(err, errOpenAICompatNameConflict):
+		c.JSON(409, gin.H{"error": "name_conflict", "message": err.Error()})
+	case errors.Is(err, errOpenAICompatNotFound):
+		c.JSON(404, gin.H{"error": "not_found", "message": err.Error()})
+	case strings.Contains(err.Error(), "规范化后冲突"):
+		c.JSON(409, gin.H{"error": "name_conflict", "message": err.Error()})
+	default:
+		c.JSON(400, gin.H{"error": "invalid_openai_provider", "message": err.Error()})
+	}
 }
 
 func normalizeOpenAICompatibilityEntry(entry *config.OpenAICompatibility) {

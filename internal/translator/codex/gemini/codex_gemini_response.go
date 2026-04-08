@@ -20,10 +20,11 @@ var (
 
 // ConvertCodexResponseToGeminiParams holds parameters for response conversion.
 type ConvertCodexResponseToGeminiParams struct {
-	Model             string
-	CreatedAt         int64
-	ResponseID        string
-	LastStorageOutput string
+	Model              string
+	CreatedAt          int64
+	ResponseID         string
+	LastStorageOutput  string
+	HasOutputTextDelta bool
 }
 
 // ConvertCodexResponseToGemini converts Codex streaming response format to Gemini format.
@@ -42,10 +43,11 @@ type ConvertCodexResponseToGeminiParams struct {
 func ConvertCodexResponseToGemini(_ context.Context, modelName string, originalRequestRawJSON, requestRawJSON, rawJSON []byte, param *any) []string {
 	if *param == nil {
 		*param = &ConvertCodexResponseToGeminiParams{
-			Model:             modelName,
-			CreatedAt:         0,
-			ResponseID:        "",
-			LastStorageOutput: "",
+			Model:              modelName,
+			CreatedAt:          0,
+			ResponseID:         "",
+			LastStorageOutput:  "",
+			HasOutputTextDelta: false,
 		}
 	}
 
@@ -57,20 +59,17 @@ func ConvertCodexResponseToGemini(_ context.Context, modelName string, originalR
 	rootResult := gjson.ParseBytes(rawJSON)
 	typeResult := rootResult.Get("type")
 	typeStr := typeResult.String()
+	params := (*param).(*ConvertCodexResponseToGeminiParams)
 
 	// Base Gemini response template
 	template := `{"candidates":[{"content":{"role":"model","parts":[]}}],"usageMetadata":{"trafficType":"PROVISIONED_THROUGHPUT"},"modelVersion":"gemini-2.5-pro","createTime":"2025-08-15T02:52:03.884209Z","responseId":"06CeaPH7NaCU48APvNXDyA4"}`
-	if (*param).(*ConvertCodexResponseToGeminiParams).LastStorageOutput != "" && typeStr == "response.output_item.done" {
-		template = (*param).(*ConvertCodexResponseToGeminiParams).LastStorageOutput
-	} else {
-		template, _ = sjson.Set(template, "modelVersion", (*param).(*ConvertCodexResponseToGeminiParams).Model)
-		createdAtResult := rootResult.Get("response.created_at")
-		if createdAtResult.Exists() {
-			(*param).(*ConvertCodexResponseToGeminiParams).CreatedAt = createdAtResult.Int()
-			template, _ = sjson.Set(template, "createTime", time.Unix((*param).(*ConvertCodexResponseToGeminiParams).CreatedAt, 0).Format(time.RFC3339Nano))
-		}
-		template, _ = sjson.Set(template, "responseId", (*param).(*ConvertCodexResponseToGeminiParams).ResponseID)
+	template, _ = sjson.Set(template, "modelVersion", params.Model)
+	createdAtResult := rootResult.Get("response.created_at")
+	if createdAtResult.Exists() {
+		params.CreatedAt = createdAtResult.Int()
+		template, _ = sjson.Set(template, "createTime", time.Unix(params.CreatedAt, 0).Format(time.RFC3339Nano))
 	}
+	template, _ = sjson.Set(template, "responseId", params.ResponseID)
 
 	// Handle function call completion
 	if typeStr == "response.output_item.done" {
@@ -101,7 +100,7 @@ func ConvertCodexResponseToGemini(_ context.Context, modelName string, originalR
 			template, _ = sjson.SetRaw(template, "candidates.0.content.parts.-1", functionCall)
 			template, _ = sjson.Set(template, "candidates.0.finishReason", "STOP")
 
-			(*param).(*ConvertCodexResponseToGeminiParams).LastStorageOutput = template
+			params.LastStorageOutput = template
 
 			// Use this return to storage message
 			return []string{}
@@ -111,15 +110,45 @@ func ConvertCodexResponseToGemini(_ context.Context, modelName string, originalR
 	if typeStr == "response.created" { // Handle response creation - set model and response ID
 		template, _ = sjson.Set(template, "modelVersion", rootResult.Get("response.model").String())
 		template, _ = sjson.Set(template, "responseId", rootResult.Get("response.id").String())
-		(*param).(*ConvertCodexResponseToGeminiParams).ResponseID = rootResult.Get("response.id").String()
+		params.ResponseID = rootResult.Get("response.id").String()
 	} else if typeStr == "response.reasoning_summary_text.delta" { // Handle reasoning/thinking content delta
 		part := `{"thought":true,"text":""}`
 		part, _ = sjson.Set(part, "text", rootResult.Get("delta").String())
 		template, _ = sjson.SetRaw(template, "candidates.0.content.parts.-1", part)
 	} else if typeStr == "response.output_text.delta" { // Handle regular text content delta
+		params.HasOutputTextDelta = true
 		part := `{"text":""}`
 		part, _ = sjson.Set(part, "text", rootResult.Get("delta").String())
 		template, _ = sjson.SetRaw(template, "candidates.0.content.parts.-1", part)
+	} else if typeStr == "response.output_item.done" { // 兜底：当没有 text delta 时，从最终 message 中补回文本。
+		itemResult := rootResult.Get("item")
+		if itemResult.Get("type").String() != "message" || params.HasOutputTextDelta {
+			return []string{}
+		}
+		contentResult := itemResult.Get("content")
+		if !contentResult.Exists() || !contentResult.IsArray() {
+			return []string{}
+		}
+		wroteText := false
+		contentResult.ForEach(func(_, partResult gjson.Result) bool {
+			if partResult.Get("type").String() != "output_text" {
+				return true
+			}
+			text := partResult.Get("text").String()
+			if text == "" {
+				return true
+			}
+			part := `{"text":""}`
+			part, _ = sjson.Set(part, "text", text)
+			template, _ = sjson.SetRaw(template, "candidates.0.content.parts.-1", part)
+			wroteText = true
+			return true
+		})
+		if wroteText {
+			params.HasOutputTextDelta = true
+			return []string{template}
+		}
+		return []string{}
 	} else if typeStr == "response.completed" { // Handle response completion with usage metadata
 		template, _ = sjson.Set(template, "usageMetadata.promptTokenCount", rootResult.Get("response.usage.input_tokens").Int())
 		template, _ = sjson.Set(template, "usageMetadata.candidatesTokenCount", rootResult.Get("response.usage.output_tokens").Int())
@@ -129,11 +158,12 @@ func ConvertCodexResponseToGemini(_ context.Context, modelName string, originalR
 		return []string{}
 	}
 
-	if (*param).(*ConvertCodexResponseToGeminiParams).LastStorageOutput != "" {
-		return []string{(*param).(*ConvertCodexResponseToGeminiParams).LastStorageOutput, template}
-	} else {
-		return []string{template}
+	if params.LastStorageOutput != "" {
+		stored := params.LastStorageOutput
+		params.LastStorageOutput = ""
+		return []string{stored, template}
 	}
+	return []string{template}
 
 }
 

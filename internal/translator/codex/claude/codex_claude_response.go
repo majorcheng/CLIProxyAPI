@@ -26,6 +26,8 @@ type ConvertCodexResponseToClaudeParams struct {
 	HasToolCall               bool
 	BlockIndex                int
 	HasReceivedArgumentsDelta bool
+	HasTextDelta              bool
+	TextBlockOpen             bool
 	ThinkingBlockOpen         bool
 	ThinkingStopPending       bool
 	ThinkingSignature         string
@@ -115,9 +117,11 @@ func ConvertCodexResponseToClaude(_ context.Context, _ string, originalRequestRa
 	case "response.content_part.added":
 		template = `{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}`
 		template, _ = sjson.Set(template, "index", params.BlockIndex)
+		params.TextBlockOpen = true
 		appendClaudeSSEEvent(&output, "content_block_start", template)
 
 	case "response.output_text.delta":
+		params.HasTextDelta = true
 		template = `{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":""}}`
 		template, _ = sjson.Set(template, "index", params.BlockIndex)
 		template, _ = sjson.Set(template, "delta.text", rootResult.Get("delta").String())
@@ -126,6 +130,7 @@ func ConvertCodexResponseToClaude(_ context.Context, _ string, originalRequestRa
 	case "response.content_part.done":
 		template = `{"type":"content_block_stop","index":0}`
 		template, _ = sjson.Set(template, "index", params.BlockIndex)
+		params.TextBlockOpen = false
 		params.BlockIndex++
 		appendClaudeSSEEvent(&output, "content_block_stop", template)
 
@@ -180,6 +185,50 @@ func ConvertCodexResponseToClaude(_ context.Context, _ string, originalRequestRa
 	case "response.output_item.done":
 		itemResult := rootResult.Get("item")
 		switch itemResult.Get("type").String() {
+		case "message":
+			// 兜底：当 Codex 没有逐段下发 output_text.delta 时，
+			// 仍要从最终 message 的 output_text 中补出 Claude 文本块。
+			if params.HasTextDelta {
+				break
+			}
+			contentResult := itemResult.Get("content")
+			if !contentResult.Exists() || !contentResult.IsArray() {
+				break
+			}
+			var textBuilder strings.Builder
+			contentResult.ForEach(func(_, part gjson.Result) bool {
+				if part.Get("type").String() != "output_text" {
+					return true
+				}
+				if txt := part.Get("text").String(); txt != "" {
+					textBuilder.WriteString(txt)
+				}
+				return true
+			})
+			text := textBuilder.String()
+			if text == "" {
+				break
+			}
+
+			finalizeCodexThinkingBlock(params, &output)
+			if !params.TextBlockOpen {
+				template = `{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}`
+				template, _ = sjson.Set(template, "index", params.BlockIndex)
+				params.TextBlockOpen = true
+				appendClaudeSSEEvent(&output, "content_block_start", template)
+			}
+
+			template = `{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":""}}`
+			template, _ = sjson.Set(template, "index", params.BlockIndex)
+			template, _ = sjson.Set(template, "delta.text", text)
+			appendClaudeSSEEvent(&output, "content_block_delta", template)
+
+			template = `{"type":"content_block_stop","index":0}`
+			template, _ = sjson.Set(template, "index", params.BlockIndex)
+			params.TextBlockOpen = false
+			params.BlockIndex++
+			params.HasTextDelta = true
+			appendClaudeSSEEvent(&output, "content_block_stop", template)
 		case "function_call":
 			template = `{"type":"content_block_stop","index":0}`
 			template, _ = sjson.Set(template, "index", params.BlockIndex)

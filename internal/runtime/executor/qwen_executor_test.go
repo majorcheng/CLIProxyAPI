@@ -1,6 +1,8 @@
 package executor
 
 import (
+	"context"
+	"net/http"
 	"testing"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
@@ -78,5 +80,27 @@ func TestEnsureQwenSystemMessageCreatesMessagesArrayWhenMissing(t *testing.T) {
 	}
 	if got := messages[0].Get("role").String(); got != "system" {
 		t.Fatalf("messages[0].role = %q, want system", got)
+	}
+}
+
+func TestWrapQwenError_InsufficientQuotaDoesNotSetRetryAfter(t *testing.T) {
+	body := []byte(`{"error":{"code":"insufficient_quota","message":"You exceeded your current quota","type":"insufficient_quota"}}`)
+	code, retryAfter := wrapQwenError(context.Background(), http.StatusTooManyRequests, body)
+	if code != http.StatusTooManyRequests {
+		t.Fatalf("wrapQwenError status = %d, want %d", code, http.StatusTooManyRequests)
+	}
+	if retryAfter != nil {
+		t.Fatalf("wrapQwenError retryAfter = %v, want nil", *retryAfter)
+	}
+}
+
+func TestWrapQwenError_Maps403QuotaTo429WithoutRetryAfter(t *testing.T) {
+	body := []byte(`{"error":{"code":"insufficient_quota","message":"You exceeded your current quota","type":"insufficient_quota"}}`)
+	code, retryAfter := wrapQwenError(context.Background(), http.StatusForbidden, body)
+	if code != http.StatusTooManyRequests {
+		t.Fatalf("wrapQwenError status = %d, want %d", code, http.StatusTooManyRequests)
+	}
+	if retryAfter != nil {
+		t.Fatalf("wrapQwenError retryAfter = %v, want nil", *retryAfter)
 	}
 }

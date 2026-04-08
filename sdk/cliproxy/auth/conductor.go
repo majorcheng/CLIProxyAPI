@@ -576,6 +576,21 @@ func preserveRequestedModelSuffix(requestedModel, resolved string) string {
 	return preserveResolvedModelSuffix(resolved, thinking.ParseSuffix(requestedModel))
 }
 
+// selectionModelForAuth 返回该 auth 在调度/冷却判断时真正对应的上游模型名。
+// 这里必须先处理前缀改写，再处理 OAuth alias；否则当请求走别名模型时，
+// cooldown 会错误地去看 route model，导致本该等待的账号被当成可立即重试。
+func (m *Manager) selectionModelForAuth(auth *Auth, routeModel string) string {
+	requestedModel := rewriteModelForAuth(routeModel, auth)
+	if strings.TrimSpace(requestedModel) == "" {
+		requestedModel = strings.TrimSpace(routeModel)
+	}
+	resolvedModel := m.applyOAuthModelAlias(auth, requestedModel)
+	if strings.TrimSpace(resolvedModel) == "" {
+		resolvedModel = requestedModel
+	}
+	return resolvedModel
+}
+
 func (m *Manager) executionModelCandidates(auth *Auth, routeModel string) []string {
 	requestedModel := rewriteModelForAuth(routeModel, auth)
 	requestedModel = m.applyOAuthModelAlias(auth, requestedModel)
@@ -2162,7 +2177,11 @@ func (m *Manager) closestCooldownWait(providers []string, model string, attempt 
 		if attempt >= effectiveRetry {
 			continue
 		}
-		blocked, reason, next := isAuthBlockedForModel(auth, model, now)
+		checkModel := model
+		if strings.TrimSpace(model) != "" {
+			checkModel = m.selectionModelForAuth(auth, model)
+		}
+		blocked, reason, next := isAuthBlockedForModel(auth, checkModel, now)
 		if !blocked || next.IsZero() || reason == blockReasonDisabled {
 			continue
 		}

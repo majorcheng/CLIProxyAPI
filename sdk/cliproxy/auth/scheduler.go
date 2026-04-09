@@ -44,9 +44,10 @@ type authScheduler struct {
 
 // providerScheduler stores auth metadata and model shards for a single provider.
 type providerScheduler struct {
-	providerKey string
-	auths       map[string]*scheduledAuthMeta
-	modelShards map[string]*modelScheduler
+	providerKey  string
+	auths        map[string]*scheduledAuthMeta
+	modelShards  map[string]*modelScheduler
+	cursorStates map[string]modelSchedulerCursorState
 }
 
 // scheduledAuthMeta stores the immutable scheduling fields derived from an auth snapshot.
@@ -99,6 +100,111 @@ type childBucket struct {
 
 // cooldownQueue is the blocked auth collection ordered by next retry time during rebuilds.
 type cooldownQueue []*scheduledAuth
+
+type readyViewCursorState struct {
+	cursor       int
+	parentCursor int
+	childCursors map[string]int
+}
+
+type readyBucketCursorState struct {
+	all readyViewCursorState
+	ws  readyViewCursorState
+}
+
+type modelSchedulerCursorState map[int]readyBucketCursorState
+
+func snapshotReadyViewCursors(view readyView) readyViewCursorState {
+	state := readyViewCursorState{
+		cursor:       view.cursor,
+		parentCursor: view.parentCursor,
+	}
+	if len(view.children) == 0 {
+		return state
+	}
+	state.childCursors = make(map[string]int, len(view.children))
+	for parent, child := range view.children {
+		if child == nil {
+			continue
+		}
+		state.childCursors[parent] = child.cursor
+	}
+	return state
+}
+
+func restoreReadyViewCursors(view *readyView, state readyViewCursorState) {
+	if view == nil {
+		return
+	}
+	if len(view.flat) > 0 {
+		view.cursor = normalizeCursor(state.cursor, len(view.flat))
+	}
+	if len(view.parentOrder) == 0 || len(view.children) == 0 {
+		return
+	}
+	view.parentCursor = normalizeCursor(state.parentCursor, len(view.parentOrder))
+	if len(state.childCursors) == 0 {
+		return
+	}
+	for parent, child := range view.children {
+		if child == nil || len(child.items) == 0 {
+			continue
+		}
+		cursor, ok := state.childCursors[parent]
+		if !ok {
+			continue
+		}
+		child.cursor = normalizeCursor(cursor, len(child.items))
+	}
+}
+
+func normalizeCursor(cursor, size int) int {
+	if size <= 0 || cursor <= 0 {
+		return 0
+	}
+	cursor = cursor % size
+	if cursor < 0 {
+		cursor += size
+	}
+	return cursor
+}
+
+func snapshotModelSchedulerCursors(shard *modelScheduler) modelSchedulerCursorState {
+	if shard == nil || len(shard.readyByPriority) == 0 {
+		return nil
+	}
+	state := make(modelSchedulerCursorState, len(shard.readyByPriority))
+	for priority, bucket := range shard.readyByPriority {
+		if bucket == nil {
+			continue
+		}
+		state[priority] = readyBucketCursorState{
+			all: snapshotReadyViewCursors(bucket.all),
+			ws:  snapshotReadyViewCursors(bucket.ws),
+		}
+	}
+	if len(state) == 0 {
+		return nil
+	}
+	return state
+}
+
+func restoreModelSchedulerCursors(shard *modelScheduler, state modelSchedulerCursorState) {
+	if shard == nil || len(state) == 0 {
+		return
+	}
+	for priority, bucket := range shard.readyByPriority {
+		if bucket == nil {
+			continue
+		}
+		cursorState, ok := state[priority]
+		if !ok {
+			continue
+		}
+		restoreReadyViewCursors(&bucket.all, cursorState.all)
+		restoreReadyViewCursors(&bucket.ws, cursorState.ws)
+	}
+}
 
 // newAuthScheduler constructs an empty scheduler configured for the supplied selector strategy.
 func newAuthScheduler(selector Selector) *authScheduler {
@@ -171,6 +277,21 @@ func (s *authScheduler) rebuild(auths []*Auth) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	previousCursors := make(map[string]map[string]modelSchedulerCursorState, len(s.providers))
+	for providerKey, providerState := range s.providers {
+		if providerState == nil || len(providerState.modelShards) == 0 {
+			continue
+		}
+		modelStates := make(map[string]modelSchedulerCursorState, len(providerState.modelShards))
+		for modelKey, shard := range providerState.modelShards {
+			if state := snapshotModelSchedulerCursors(shard); len(state) > 0 {
+				modelStates[modelKey] = state
+			}
+		}
+		if len(modelStates) > 0 {
+			previousCursors[providerKey] = modelStates
+		}
+	}
 	s.providers = make(map[string]*providerScheduler)
 	s.providerAliases = make(map[string]string)
 	s.authProviders = make(map[string]string)
@@ -179,15 +300,15 @@ func (s *authScheduler) rebuild(auths []*Auth) {
 	for _, auth := range auths {
 		s.upsertAuthLocked(auth, now)
 	}
-	for _, providerState := range s.providers {
+	for providerKey, providerState := range s.providers {
 		if providerState == nil {
 			continue
 		}
-		for _, shard := range providerState.modelShards {
-			if shard != nil {
-				shard.rebuildIndexesLocked()
-			}
+		modelStates := previousCursors[providerKey]
+		if len(modelStates) == 0 {
+			continue
 		}
+		providerState.cursorStates = modelStates
 	}
 }
 
@@ -628,9 +749,10 @@ func (s *authScheduler) ensureProviderLocked(providerKey string) *providerSchedu
 	providerState := s.providers[providerKey]
 	if providerState == nil {
 		providerState = &providerScheduler{
-			providerKey: providerKey,
-			auths:       make(map[string]*scheduledAuthMeta),
-			modelShards: make(map[string]*modelScheduler),
+			providerKey:  providerKey,
+			auths:        make(map[string]*scheduledAuthMeta),
+			modelShards:  make(map[string]*modelScheduler),
+			cursorStates: make(map[string]modelSchedulerCursorState),
 		}
 		s.providers[providerKey] = providerState
 	}
@@ -730,7 +852,12 @@ func (p *providerScheduler) ensureModelLocked(modelKey string, now time.Time) *m
 		}
 		shard.upsertEntryLocked(meta, now)
 	}
-	shard.resetReadyCursorsLocked()
+	if state, ok := p.cursorStates[modelKey]; ok {
+		restoreModelSchedulerCursors(shard, state)
+		delete(p.cursorStates, modelKey)
+	} else {
+		shard.resetReadyCursorsLocked()
+	}
 	p.modelShards[modelKey] = shard
 	return shard
 }
@@ -1562,6 +1689,17 @@ func (m *modelScheduler) availabilitySummaryLocked(predicate func(*scheduledAuth
 
 // rebuildIndexesLocked reconstructs ready and blocked views from the current entry map.
 func (m *modelScheduler) rebuildIndexesLocked() {
+	cursorStates := make(map[int]readyBucketCursorState, len(m.readyByPriority))
+	for priority, bucket := range m.readyByPriority {
+		if bucket == nil {
+			continue
+		}
+		cursorStates[priority] = readyBucketCursorState{
+			all: snapshotReadyViewCursors(bucket.all),
+			ws:  snapshotReadyViewCursors(bucket.ws),
+		}
+	}
+
 	m.readyByPriority = make(map[int]*readyBucket)
 	m.priorityOrder = m.priorityOrder[:0]
 	m.blocked = m.blocked[:0]
@@ -1582,7 +1720,12 @@ func (m *modelScheduler) rebuildIndexesLocked() {
 		sort.Slice(entries, func(i, j int) bool {
 			return entries[i].auth.ID < entries[j].auth.ID
 		})
-		m.readyByPriority[priority] = buildReadyBucket(entries)
+		bucket := buildReadyBucket(entries)
+		if cursorState, ok := cursorStates[priority]; ok && bucket != nil {
+			restoreReadyViewCursors(&bucket.all, cursorState.all)
+			restoreReadyViewCursors(&bucket.ws, cursorState.ws)
+		}
+		m.readyByPriority[priority] = bucket
 		m.priorityOrder = append(m.priorityOrder, priority)
 	}
 	sort.Slice(m.priorityOrder, func(i, j int) bool {

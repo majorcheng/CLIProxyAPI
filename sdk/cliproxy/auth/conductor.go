@@ -2197,6 +2197,52 @@ func (m *Manager) closestCooldownWait(providers []string, model string, attempt 
 	return minWait, found
 }
 
+// retryAllowed 用于判断当前 providers 里是否仍存在“值得继续重试”的 auth。
+// 只有至少一个 auth 的 request_retry 上限尚未耗尽时，才会消费上游 Retry-After。
+func (m *Manager) retryAllowed(attempt int, providers []string) bool {
+	if m == nil || attempt < 0 || len(providers) == 0 {
+		return false
+	}
+	defaultRetry := int(m.requestRetry.Load())
+	if defaultRetry < 0 {
+		defaultRetry = 0
+	}
+	providerSet := make(map[string]struct{}, len(providers))
+	for i := range providers {
+		key := strings.TrimSpace(strings.ToLower(providers[i]))
+		if key == "" {
+			continue
+		}
+		providerSet[key] = struct{}{}
+	}
+	if len(providerSet) == 0 {
+		return false
+	}
+
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	for _, auth := range m.auths {
+		if auth == nil {
+			continue
+		}
+		providerKey := strings.TrimSpace(strings.ToLower(auth.Provider))
+		if _, ok := providerSet[providerKey]; !ok {
+			continue
+		}
+		effectiveRetry := defaultRetry
+		if override, ok := auth.RequestRetryOverride(); ok {
+			effectiveRetry = override
+		}
+		if effectiveRetry < 0 {
+			effectiveRetry = 0
+		}
+		if attempt < effectiveRetry {
+			return true
+		}
+	}
+	return false
+}
+
 func (m *Manager) shouldRetryAfterError(err error, attempt int, providers []string, model string, maxWait time.Duration) (time.Duration, bool) {
 	if err == nil {
 		return 0, false
@@ -2207,17 +2253,31 @@ func (m *Manager) shouldRetryAfterError(err error, attempt int, providers []stri
 	if isAuthCapacityError(err) {
 		return 0, false
 	}
-	if status := statusCodeFromError(err); status == http.StatusOK {
+	status := statusCodeFromError(err)
+	if status == http.StatusOK {
 		return 0, false
 	}
 	if isRequestInvalidError(err) {
 		return 0, false
 	}
 	wait, found := m.closestCooldownWait(providers, model, attempt)
-	if !found || wait > maxWait {
+	if found {
+		if wait > maxWait {
+			return 0, false
+		}
+		return wait, true
+	}
+	if status != http.StatusTooManyRequests {
 		return 0, false
 	}
-	return wait, true
+	if !m.retryAllowed(attempt, providers) {
+		return 0, false
+	}
+	retryAfter := retryAfterFromError(err)
+	if retryAfter == nil || *retryAfter <= 0 || *retryAfter > maxWait {
+		return 0, false
+	}
+	return *retryAfter, true
 }
 
 func waitForCooldown(ctx context.Context, wait time.Duration) error {

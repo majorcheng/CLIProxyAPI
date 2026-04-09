@@ -282,6 +282,101 @@ func TestSchedulerPick_GeminiVirtualParentRegroupsAfterPlainAuthRemoval(t *testi
 	}
 }
 
+func TestSchedulerRebuild_PreservesFlatReadyCursor(t *testing.T) {
+	t.Parallel()
+
+	auths := []*Auth{
+		{ID: "a", Provider: "gemini"},
+		{ID: "b", Provider: "gemini"},
+		{ID: "c", Provider: "gemini"},
+	}
+	scheduler := newSchedulerForTest(&RoundRobinSelector{}, auths...)
+
+	first, errPick := scheduler.pickSingle(context.Background(), "gemini", "", cliproxyexecutor.Options{}, nil)
+	if errPick != nil {
+		t.Fatalf("first pickSingle() error = %v", errPick)
+	}
+	if first == nil || first.ID != "a" {
+		t.Fatalf("first pickSingle() auth.ID = %v, want a", authIDForTest(first))
+	}
+
+	scheduler.rebuild(auths)
+
+	second, errPick := scheduler.pickSingle(context.Background(), "gemini", "", cliproxyexecutor.Options{}, nil)
+	if errPick != nil {
+		t.Fatalf("second pickSingle() error = %v", errPick)
+	}
+	if second == nil || second.ID != "b" {
+		t.Fatalf("second pickSingle() auth.ID = %v, want b", authIDForTest(second))
+	}
+}
+
+func TestSchedulerRebuild_PreservesGroupedReadyCursors(t *testing.T) {
+	t.Parallel()
+
+	auths := []*Auth{
+		{ID: "cred-a::proj-1", Provider: "gemini-cli", Attributes: map[string]string{"gemini_virtual_parent": "cred-a"}},
+		{ID: "cred-a::proj-2", Provider: "gemini-cli", Attributes: map[string]string{"gemini_virtual_parent": "cred-a"}},
+		{ID: "cred-b::proj-1", Provider: "gemini-cli", Attributes: map[string]string{"gemini_virtual_parent": "cred-b"}},
+		{ID: "cred-b::proj-2", Provider: "gemini-cli", Attributes: map[string]string{"gemini_virtual_parent": "cred-b"}},
+	}
+	scheduler := newSchedulerForTest(&RoundRobinSelector{}, auths...)
+
+	wantBefore := []string{"cred-a::proj-1", "cred-b::proj-1"}
+	for index, wantID := range wantBefore {
+		got, errPick := scheduler.pickSingle(context.Background(), "gemini-cli", "", cliproxyexecutor.Options{}, nil)
+		if errPick != nil {
+			t.Fatalf("pickSingle() before rebuild #%d error = %v", index, errPick)
+		}
+		if got == nil || got.ID != wantID {
+			t.Fatalf("pickSingle() before rebuild #%d auth.ID = %v, want %q", index, authIDForTest(got), wantID)
+		}
+	}
+
+	scheduler.rebuild(auths)
+
+	wantAfter := []string{"cred-a::proj-2", "cred-b::proj-2"}
+	for index, wantID := range wantAfter {
+		got, errPick := scheduler.pickSingle(context.Background(), "gemini-cli", "", cliproxyexecutor.Options{}, nil)
+		if errPick != nil {
+			t.Fatalf("pickSingle() after rebuild #%d error = %v", index, errPick)
+		}
+		if got == nil || got.ID != wantID {
+			t.Fatalf("pickSingle() after rebuild #%d auth.ID = %v, want %q", index, authIDForTest(got), wantID)
+		}
+	}
+}
+
+func TestSchedulerRebuild_PreservesWebsocketReadyCursor(t *testing.T) {
+	t.Parallel()
+
+	auths := []*Auth{
+		{ID: "codex-http", Provider: "codex"},
+		{ID: "codex-ws-a", Provider: "codex", Attributes: map[string]string{"websockets": "true"}},
+		{ID: "codex-ws-b", Provider: "codex", Attributes: map[string]string{"websockets": "true"}},
+	}
+	scheduler := newSchedulerForTest(&RoundRobinSelector{}, auths...)
+	ctx := cliproxyexecutor.WithDownstreamWebsocket(context.Background())
+
+	first, errPick := scheduler.pickSingle(ctx, "codex", "", cliproxyexecutor.Options{}, nil)
+	if errPick != nil {
+		t.Fatalf("first websocket pickSingle() error = %v", errPick)
+	}
+	if first == nil || first.ID != "codex-ws-a" {
+		t.Fatalf("first websocket pickSingle() auth.ID = %v, want codex-ws-a", authIDForTest(first))
+	}
+
+	scheduler.rebuild(auths)
+
+	second, errPick := scheduler.pickSingle(ctx, "codex", "", cliproxyexecutor.Options{}, nil)
+	if errPick != nil {
+		t.Fatalf("second websocket pickSingle() error = %v", errPick)
+	}
+	if second == nil || second.ID != "codex-ws-b" {
+		t.Fatalf("second websocket pickSingle() auth.ID = %v, want codex-ws-b", authIDForTest(second))
+	}
+}
+
 func TestSchedulerPick_CodexWebsocketPrefersWebsocketEnabledSubset(t *testing.T) {
 	t.Parallel()
 
@@ -306,6 +401,13 @@ func TestSchedulerPick_CodexWebsocketPrefersWebsocketEnabledSubset(t *testing.T)
 			t.Fatalf("pickSingle() #%d auth.ID = %q, want %q", index, got.ID, wantID)
 		}
 	}
+}
+
+func authIDForTest(auth *Auth) string {
+	if auth == nil {
+		return "<nil>"
+	}
+	return auth.ID
 }
 
 func TestSchedulerPick_MixedSingleCodexProviderWebsocketPrefersWebsocketEnabledSubset(t *testing.T) {

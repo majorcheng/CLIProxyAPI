@@ -1053,6 +1053,8 @@ func (cfg *Config) SanitizeClaudeKeys() {
 }
 
 // SanitizeGeminiKeys deduplicates and normalizes Gemini credentials.
+// 这里的唯一键必须包含 base-url；否则同一 api-key 指向多个 upstream 时，
+// management 删除/编辑会在 sanitize 阶段被静默折叠，导致配置语义丢失。
 func (cfg *Config) SanitizeGeminiKeys() {
 	if cfg == nil {
 		return
@@ -1071,10 +1073,11 @@ func (cfg *Config) SanitizeGeminiKeys() {
 		entry.ProxyURL = strings.TrimSpace(entry.ProxyURL)
 		entry.Headers = NormalizeHeaders(entry.Headers)
 		entry.ExcludedModels = NormalizeExcludedModels(entry.ExcludedModels)
-		if _, exists := seen[entry.APIKey]; exists {
+		uniqueKey := entry.APIKey + "|" + entry.BaseURL
+		if _, exists := seen[uniqueKey]; exists {
 			continue
 		}
-		seen[entry.APIKey] = struct{}{}
+		seen[uniqueKey] = struct{}{}
 		out = append(out, entry)
 	}
 	cfg.GeminiKey = out

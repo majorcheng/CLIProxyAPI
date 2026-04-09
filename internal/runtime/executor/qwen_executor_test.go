@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
+	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	"github.com/tidwall/gjson"
 )
 
@@ -102,5 +103,37 @@ func TestWrapQwenError_Maps403QuotaTo429WithoutRetryAfter(t *testing.T) {
 	}
 	if retryAfter != nil {
 		t.Fatalf("wrapQwenError retryAfter = %v, want nil", *retryAfter)
+	}
+}
+
+func TestQwenCreds_NormalizesResourceURL(t *testing.T) {
+	tests := []struct {
+		name        string
+		resourceURL string
+		wantBaseURL string
+	}{
+		{name: "host only", resourceURL: "portal.qwen.ai", wantBaseURL: "https://portal.qwen.ai/v1"},
+		{name: "scheme without v1", resourceURL: "https://portal.qwen.ai", wantBaseURL: "https://portal.qwen.ai/v1"},
+		{name: "scheme with v1", resourceURL: "https://portal.qwen.ai/v1", wantBaseURL: "https://portal.qwen.ai/v1"},
+		{name: "scheme with trailing slash", resourceURL: "https://portal.qwen.ai/v1/", wantBaseURL: "https://portal.qwen.ai/v1"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			auth := &cliproxyauth.Auth{
+				Metadata: map[string]any{
+					"access_token": "test-token",
+					"resource_url": tt.resourceURL,
+				},
+			}
+
+			token, baseURL := qwenCreds(auth)
+			if token != "test-token" {
+				t.Fatalf("qwenCreds token = %q, want %q", token, "test-token")
+			}
+			if baseURL != tt.wantBaseURL {
+				t.Fatalf("qwenCreds baseURL = %q, want %q", baseURL, tt.wantBaseURL)
+			}
+		})
 	}
 }

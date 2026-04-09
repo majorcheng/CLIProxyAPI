@@ -559,6 +559,28 @@ func applyQwenHeaders(r *http.Request, token string, stream bool) {
 	r.Header.Set("Accept", "application/json")
 }
 
+// normaliseQwenBaseURL 兼容 token 元数据里的 resource_url 既可能是裸 host，
+// 也可能已经带 scheme、尾斜杠或 /v1；这里统一收口成稳定的请求前缀。
+func normaliseQwenBaseURL(resourceURL string) string {
+	raw := strings.TrimSpace(resourceURL)
+	if raw == "" {
+		return ""
+	}
+
+	normalized := raw
+	lower := strings.ToLower(normalized)
+	if !strings.HasPrefix(lower, "http://") && !strings.HasPrefix(lower, "https://") {
+		normalized = "https://" + normalized
+	}
+
+	normalized = strings.TrimRight(normalized, "/")
+	if !strings.HasSuffix(strings.ToLower(normalized), "/v1") {
+		normalized += "/v1"
+	}
+
+	return normalized
+}
+
 func qwenCreds(a *cliproxyauth.Auth) (token, baseURL string) {
 	if a == nil {
 		return "", ""
@@ -576,7 +598,7 @@ func qwenCreds(a *cliproxyauth.Auth) (token, baseURL string) {
 			token = v
 		}
 		if v, ok := a.Metadata["resource_url"].(string); ok {
-			baseURL = fmt.Sprintf("https://%s/v1", v)
+			baseURL = normaliseQwenBaseURL(v)
 		}
 	}
 	return

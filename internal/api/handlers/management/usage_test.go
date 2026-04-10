@@ -29,7 +29,7 @@ func TestGetUsageStatistics_IncludesClientIP(t *testing.T) {
 			OutputTokens: 22,
 			TotalTokens:  33,
 		},
-	})
+	}, "xhigh")
 
 	h := NewHandlerWithoutConfigFilePath(&config.Config{}, nil)
 	h.SetUsageStatistics(stats)
@@ -59,6 +59,9 @@ func TestGetUsageStatistics_IncludesClientIP(t *testing.T) {
 	if details[0].ClientIP != "198.51.100.7" {
 		t.Fatalf("client_ip = %q, want %q", details[0].ClientIP, "198.51.100.7")
 	}
+	if details[0].ReasoningEffort != "xhigh" {
+		t.Fatalf("reasoning_effort = %q, want %q", details[0].ReasoningEffort, "xhigh")
+	}
 	if payload.FailedRequests != 0 {
 		t.Fatalf("failed_requests = %d, want 0", payload.FailedRequests)
 	}
@@ -78,7 +81,7 @@ func TestExportImportUsageStatistics_PreservesClientIP(t *testing.T) {
 			OutputTokens: 8,
 			TotalTokens:  13,
 		},
-	})
+	}, "high")
 
 	exportHandler := NewHandlerWithoutConfigFilePath(&config.Config{}, nil)
 	exportHandler.SetUsageStatistics(sourceStats)
@@ -114,6 +117,9 @@ func TestExportImportUsageStatistics_PreservesClientIP(t *testing.T) {
 	}
 	if details[0].ClientIP != "2001:db8::1" {
 		t.Fatalf("client_ip = %q, want %q", details[0].ClientIP, "2001:db8::1")
+	}
+	if details[0].ReasoningEffort != "high" {
+		t.Fatalf("reasoning_effort = %q, want %q", details[0].ReasoningEffort, "high")
 	}
 }
 
@@ -178,7 +184,7 @@ func TestImportUsageStatistics_AppliesRetentionDays(t *testing.T) {
 	}
 }
 
-func recordManagementUsageWithRemoteAddr(t *testing.T, stats *internalusage.RequestStatistics, remoteAddr string, record coreusage.Record) {
+func recordManagementUsageWithRemoteAddr(t *testing.T, stats *internalusage.RequestStatistics, remoteAddr string, record coreusage.Record, reasoningEffort ...string) {
 	t.Helper()
 
 	recorder := httptest.NewRecorder()
@@ -186,6 +192,9 @@ func recordManagementUsageWithRemoteAddr(t *testing.T, stats *internalusage.Requ
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
 	req.RemoteAddr = remoteAddr
 	ginCtx.Request = req
+	if len(reasoningEffort) > 0 {
+		ginCtx.Set(internalusage.RequestReasoningEffortContextKey, reasoningEffort[0])
+	}
 
 	ctx := context.WithValue(context.Background(), "gin", ginCtx)
 	stats.Record(ctx, record)

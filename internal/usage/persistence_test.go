@@ -27,7 +27,7 @@ func TestPersistAndRestoreRequestStatisticsRoundTrip(t *testing.T) {
 			OutputTokens: 20,
 			TotalTokens:  30,
 		},
-	})
+	}, "xhigh")
 	recordUsageWithRemoteAddrForTest(t, stats, "[2001:db8::1]:443", coreusage.Record{
 		APIKey:      "test-key",
 		Model:       "gpt-5.4",
@@ -89,6 +89,9 @@ func TestPersistAndRestoreRequestStatisticsRoundTrip(t *testing.T) {
 	}
 	if details[0].ClientIP != "203.0.113.10" {
 		t.Fatalf("details[0].client_ip = %q, want %q", details[0].ClientIP, "203.0.113.10")
+	}
+	if details[0].ReasoningEffort != "xhigh" {
+		t.Fatalf("details[0].reasoning_effort = %q, want %q", details[0].ReasoningEffort, "xhigh")
 	}
 	if details[1].ClientIP != "2001:db8::1" {
 		t.Fatalf("details[1].client_ip = %q, want %q", details[1].ClientIP, "2001:db8::1")
@@ -302,7 +305,7 @@ func recordUsageForTest(stats *RequestStatistics, record coreusage.Record) {
 	stats.Record(context.Background(), record)
 }
 
-func recordUsageWithRemoteAddrForTest(t *testing.T, stats *RequestStatistics, remoteAddr string, record coreusage.Record) {
+func recordUsageWithRemoteAddrForTest(t *testing.T, stats *RequestStatistics, remoteAddr string, record coreusage.Record, reasoningEffort ...string) {
 	t.Helper()
 	gin.SetMode(gin.TestMode)
 
@@ -311,6 +314,9 @@ func recordUsageWithRemoteAddrForTest(t *testing.T, stats *RequestStatistics, re
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
 	req.RemoteAddr = remoteAddr
 	ginCtx.Request = req
+	if len(reasoningEffort) > 0 {
+		ginCtx.Set(RequestReasoningEffortContextKey, reasoningEffort[0])
+	}
 
 	ctx := context.WithValue(context.Background(), "gin", ginCtx)
 	stats.Record(ctx, record)

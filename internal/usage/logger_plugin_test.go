@@ -116,6 +116,38 @@ func TestRequestStatisticsRecordMatchesHTTPLogClientIP(t *testing.T) {
 	}
 }
 
+func TestRequestStatisticsRecordIncludesReasoningEffort(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	stats := NewRequestStatistics()
+	recorder := httptest.NewRecorder()
+	ginCtx, _ := gin.CreateTestContext(recorder)
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	ginCtx.Request = req
+	ginCtx.Set(RequestReasoningEffortContextKey, "xhigh")
+
+	ctx := context.WithValue(context.Background(), "gin", ginCtx)
+	stats.Record(ctx, coreusage.Record{
+		APIKey:      "test-key",
+		Model:       "gpt-5.4",
+		RequestedAt: time.Date(2026, 3, 20, 12, 0, 0, 0, time.UTC),
+		Detail: coreusage.Detail{
+			InputTokens:  10,
+			OutputTokens: 20,
+			TotalTokens:  30,
+		},
+	})
+
+	snapshot := stats.Snapshot()
+	details := snapshot.APIs["test-key"].Models["gpt-5.4"].Details
+	if len(details) != 1 {
+		t.Fatalf("details len = %d, want 1", len(details))
+	}
+	if details[0].ReasoningEffort != "xhigh" {
+		t.Fatalf("reasoning_effort = %q, want %q", details[0].ReasoningEffort, "xhigh")
+	}
+}
+
 func TestRequestStatisticsMergeSnapshotDedupIgnoresLatency(t *testing.T) {
 	stats := NewRequestStatistics()
 	timestamp := time.Date(2026, 3, 20, 12, 0, 0, 0, time.UTC)

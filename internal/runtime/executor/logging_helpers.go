@@ -13,6 +13,8 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/logging"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
+	internalusage "github.com/router-for-me/CLIProxyAPI/v6/internal/usage"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
@@ -51,11 +53,12 @@ type upstreamAttempt struct {
 
 // recordAPIRequest stores the upstream request metadata in Gin context for request logging.
 func recordAPIRequest(ctx context.Context, cfg *config.Config, info upstreamRequestLog) {
-	if cfg == nil || !cfg.RequestLog {
-		return
-	}
 	ginCtx := ginContextFrom(ctx)
 	if ginCtx == nil {
+		return
+	}
+	ginCtx.Set(internalusage.RequestReasoningEffortContextKey, thinking.ExtractReasoningEffort(info.Body, info.Provider))
+	if cfg == nil || !cfg.RequestLog {
 		return
 	}
 

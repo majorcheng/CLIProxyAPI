@@ -113,13 +113,14 @@ type modelStats struct {
 
 // RequestDetail stores the timestamp, latency, and token usage for a single request.
 type RequestDetail struct {
-	Timestamp time.Time  `json:"timestamp"`
-	LatencyMs int64      `json:"latency_ms"`
-	Source    string     `json:"source"`
-	ClientIP  string     `json:"client_ip"`
-	AuthIndex string     `json:"auth_index"`
-	Tokens    TokenStats `json:"tokens"`
-	Failed    bool       `json:"failed"`
+	Timestamp       time.Time  `json:"timestamp"`
+	LatencyMs       int64      `json:"latency_ms"`
+	Source          string     `json:"source"`
+	ClientIP        string     `json:"client_ip"`
+	AuthIndex       string     `json:"auth_index"`
+	ReasoningEffort string     `json:"reasoning_effort,omitempty"`
+	Tokens          TokenStats `json:"tokens"`
+	Failed          bool       `json:"failed"`
 }
 
 // TokenStats captures the token usage breakdown for a request.
@@ -161,6 +162,10 @@ type ModelSnapshot struct {
 }
 
 var defaultRequestStatistics = NewRequestStatistics()
+
+// RequestReasoningEffortContextKey stores the normalized reasoning effort
+// derived from the final upstream request body in Gin context.
+const RequestReasoningEffortContextKey = "API_REASONING_EFFORT"
 
 // GetRequestStatistics returns the shared statistics store.
 func GetRequestStatistics() *RequestStatistics { return defaultRequestStatistics }
@@ -226,13 +231,14 @@ func (s *RequestStatistics) Record(ctx context.Context, record coreusage.Record)
 		s.apis[statsKey] = stats
 	}
 	s.updateAPIStats(stats, modelName, RequestDetail{
-		Timestamp: timestamp,
-		LatencyMs: normaliseLatency(record.Latency),
-		Source:    record.Source,
-		ClientIP:  resolveClientIP(ctx),
-		AuthIndex: record.AuthIndex,
-		Tokens:    detail,
-		Failed:    failed,
+		Timestamp:       timestamp,
+		LatencyMs:       normaliseLatency(record.Latency),
+		Source:          record.Source,
+		ClientIP:        resolveClientIP(ctx),
+		AuthIndex:       record.AuthIndex,
+		ReasoningEffort: resolveReasoningEffort(ctx),
+		Tokens:          detail,
+		Failed:          failed,
 	})
 
 	s.requestsByDay[dayKey]++
@@ -394,6 +400,7 @@ func (s *RequestStatistics) MergeSnapshot(snapshot StatisticsSnapshot) MergeResu
 				if detail.LatencyMs < 0 {
 					detail.LatencyMs = 0
 				}
+				detail.ReasoningEffort = strings.TrimSpace(strings.ToLower(detail.ReasoningEffort))
 				if detail.Timestamp.IsZero() {
 					detail.Timestamp = time.Now()
 				}
@@ -707,6 +714,25 @@ func resolveSuccess(ctx context.Context) bool {
 }
 
 const httpStatusBadRequest = 400
+
+func resolveReasoningEffort(ctx context.Context) string {
+	if ctx == nil {
+		return ""
+	}
+	ginCtx, ok := ctx.Value("gin").(*gin.Context)
+	if !ok || ginCtx == nil {
+		return ""
+	}
+	value, exists := ginCtx.Get(RequestReasoningEffortContextKey)
+	if !exists {
+		return ""
+	}
+	text, ok := value.(string)
+	if !ok {
+		return ""
+	}
+	return strings.TrimSpace(text)
+}
 
 func normaliseDetail(detail coreusage.Detail) TokenStats {
 	tokens := TokenStats{

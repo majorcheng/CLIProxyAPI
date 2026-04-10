@@ -170,6 +170,12 @@ func isWebUIRequest(c *gin.Context) bool {
 	}
 }
 
+// callbackForwarderListenAddr 统一收口本地 OAuth 回调转发器的监听地址。
+// 改成 0.0.0.0 后，容器/WSL/端口映射场景可以从宿主机浏览器正常打回调。
+func callbackForwarderListenAddr(port int) string {
+	return fmt.Sprintf("0.0.0.0:%d", port)
+}
+
 func startCallbackForwarder(port int, provider, targetBase string) (*callbackForwarder, error) {
 	callbackForwardersMu.Lock()
 	prev := callbackForwarders[port]
@@ -182,7 +188,7 @@ func startCallbackForwarder(port int, provider, targetBase string) (*callbackFor
 		stopForwarderInstance(port, prev)
 	}
 
-	addr := fmt.Sprintf("127.0.0.1:%d", port)
+	addr := callbackForwarderListenAddr(port)
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		return nil, fmt.Errorf("failed to listen on %s: %w", addr, err)

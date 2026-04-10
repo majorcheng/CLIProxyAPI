@@ -904,6 +904,48 @@ func TestApplyClaudeToolPrefix_ToolChoiceBuiltin(t *testing.T) {
 	}
 }
 
+func TestRemapOAuthToolNames_RenamesToolsChoiceAndMessages(t *testing.T) {
+	input := []byte(`{
+		"tools": [
+			{"name":"bash"},
+			{"name":"question"},
+			{"type":"web_search_20250305","name":"web_search"}
+		],
+		"tool_choice":{"type":"tool","name":"question"},
+		"messages":[
+			{"role":"assistant","content":[
+				{"type":"tool_use","name":"bash","id":"t1","input":{}},
+				{"type":"tool_use","name":"question","id":"t2","input":{}},
+				{"type":"tool_reference","tool_name":"question"}
+			]}
+		]
+	}`)
+
+	out := remapOAuthToolNames(input)
+
+	if got := gjson.GetBytes(out, "tools.0.name").String(); got != "Bash" {
+		t.Fatalf("tools.0.name = %q, want %q", got, "Bash")
+	}
+	if got := gjson.GetBytes(out, "tools.1.name").String(); got != "Question" {
+		t.Fatalf("tools.1.name = %q, want %q", got, "Question")
+	}
+	if got := gjson.GetBytes(out, "tools.2.name").String(); got != "web_search" {
+		t.Fatalf("built-in tool should stay unchanged, got %q", got)
+	}
+	if got := gjson.GetBytes(out, "tool_choice.name").String(); got != "Question" {
+		t.Fatalf("tool_choice.name = %q, want %q", got, "Question")
+	}
+	if got := gjson.GetBytes(out, "messages.0.content.0.name").String(); got != "Bash" {
+		t.Fatalf("messages.0.content.0.name = %q, want %q", got, "Bash")
+	}
+	if got := gjson.GetBytes(out, "messages.0.content.1.name").String(); got != "Question" {
+		t.Fatalf("messages.0.content.1.name = %q, want %q", got, "Question")
+	}
+	if got := gjson.GetBytes(out, "messages.0.content.2.tool_name").String(); got != "Question" {
+		t.Fatalf("messages.0.content.2.tool_name = %q, want %q", got, "Question")
+	}
+}
+
 func TestStripClaudeToolPrefixFromResponse(t *testing.T) {
 	input := []byte(`{"content":[{"type":"tool_use","name":"proxy_alpha","id":"t1","input":{}},{"type":"tool_use","name":"bravo","id":"t2","input":{}}]}`)
 	out := stripClaudeToolPrefixFromResponse(input, "proxy_")
@@ -938,6 +980,28 @@ func TestStripClaudeToolPrefixFromStreamLine(t *testing.T) {
 	}
 	if got := gjson.GetBytes(payload, "content_block.name").String(); got != "alpha" {
 		t.Fatalf("content_block.name = %q, want %q", got, "alpha")
+	}
+}
+
+func TestReverseRemapOAuthToolNamesFromStreamLine(t *testing.T) {
+	line := []byte(`data: {"type":"content_block_start","content_block":{"type":"tool_use","name":"Question","id":"t1"},"index":0}`)
+	out := reverseRemapOAuthToolNamesFromStreamLine(line)
+
+	payload := bytes.TrimSpace(out)
+	if bytes.HasPrefix(payload, []byte("data:")) {
+		payload = bytes.TrimSpace(payload[len("data:"):])
+	}
+	if got := gjson.GetBytes(payload, "content_block.name").String(); got != "question" {
+		t.Fatalf("content_block.name = %q, want %q", got, "question")
+	}
+}
+
+func TestSignAnthropicMessagesBody_SignsPlaceholderCCH(t *testing.T) {
+	body := []byte(`{"system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.63.abc; cc_entrypoint=cli; cch=00000;"}],"messages":[{"role":"user","content":"hi"}]}`)
+	out := signAnthropicMessagesBody(body)
+	billing := gjson.GetBytes(out, "system.0.text").String()
+	if strings.Contains(billing, "cch=00000;") {
+		t.Fatalf("expected cch placeholder to be signed, got %q", billing)
 	}
 }
 
@@ -1234,6 +1298,74 @@ func TestClaudeExecutor_CountTokens_AppliesCacheControlGuards(t *testing.T) {
 	}
 	if hasTTLOrderingViolation(seenBody) {
 		t.Fatalf("count_tokens body still has ttl ordering violations: %s", string(seenBody))
+	}
+}
+
+func TestClaudeExecutor_Execute_OAuthRequestAppliesCloakingRemapAndSigning(t *testing.T) {
+	var seenBody []byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		seenBody = bytes.Clone(body)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"id":"msg_test",
+			"type":"message",
+			"role":"assistant",
+			"model":"claude-3-5-sonnet-20241022",
+			"content":[{"type":"text","text":"ok"}],
+			"stop_reason":"end_turn",
+			"usage":{"input_tokens":1,"output_tokens":1}
+		}`))
+	}))
+	defer server.Close()
+
+	executor := NewClaudeExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{
+		Attributes: map[string]string{
+			"base_url": server.URL,
+		},
+		Metadata: map[string]any{
+			"access_token": "sk-ant-oat-test",
+		},
+	}
+
+	payload := []byte(`{
+		"system":"Third-party prompt that should not stay in system blocks.",
+		"messages":[{"role":"user","content":"hi"}],
+		"tools":[{"name":"bash","input_schema":{"type":"object"}}],
+		"tool_choice":{"type":"tool","name":"bash"}
+	}`)
+
+	_, err := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "claude-3-5-sonnet-20241022",
+		Payload: payload,
+	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("claude")})
+	if err != nil {
+		t.Fatalf("Execute error: %v", err)
+	}
+
+	if len(seenBody) == 0 {
+		t.Fatal("expected upstream request body to be captured")
+	}
+	if got := gjson.GetBytes(seenBody, "tools.0.name").String(); got != "Bash" {
+		t.Fatalf("tools.0.name = %q, want %q", got, "Bash")
+	}
+	if got := gjson.GetBytes(seenBody, "tool_choice.name").String(); got != "Bash" {
+		t.Fatalf("tool_choice.name = %q, want %q", got, "Bash")
+	}
+	if got := gjson.GetBytes(seenBody, "system.1.text").String(); got != "You are Claude Code, Anthropic's official CLI for Claude." {
+		t.Fatalf("system.1.text = %q, want Claude Code agent block", got)
+	}
+	billing := gjson.GetBytes(seenBody, "system.0.text").String()
+	if !strings.HasPrefix(billing, "x-anthropic-billing-header:") {
+		t.Fatalf("expected billing header, got %q", billing)
+	}
+	if strings.Contains(billing, "cch=00000;") {
+		t.Fatalf("expected billing header cch to be signed, got %q", billing)
+	}
+	firstUserText := gjson.GetBytes(seenBody, "messages.0.content").String()
+	if !strings.Contains(firstUserText, "<system-reminder>") {
+		t.Fatalf("expected forwarded system prompt to move into first user message, got %q", firstUserText)
 	}
 }
 
@@ -1752,14 +1884,14 @@ func TestCheckSystemInstructionsWithMode_StringSystemPreserved(t *testing.T) {
 	if !strings.HasPrefix(blocks[0].Get("text").String(), "x-anthropic-billing-header:") {
 		t.Fatalf("blocks[0] should be billing header, got %q", blocks[0].Get("text").String())
 	}
-	if blocks[1].Get("text").String() != "You are a Claude agent, built on Anthropic's Claude Agent SDK." {
+	if blocks[1].Get("text").String() != "You are Claude Code, Anthropic's official CLI for Claude." {
 		t.Fatalf("blocks[1] should be agent block, got %q", blocks[1].Get("text").String())
 	}
-	if blocks[2].Get("text").String() != "You are a helpful assistant." {
-		t.Fatalf("blocks[2] should be user system prompt, got %q", blocks[2].Get("text").String())
+	if !strings.Contains(blocks[2].Get("text").String(), "You are an interactive agent that helps users with software engineering tasks.") {
+		t.Fatalf("blocks[2] should be Claude Code static prompt, got %q", blocks[2].Get("text").String())
 	}
-	if blocks[2].Get("cache_control.type").String() != "ephemeral" {
-		t.Fatalf("blocks[2] should have cache_control.type=ephemeral")
+	if got := gjson.GetBytes(out, "messages.0.content").String(); !strings.Contains(got, "<system-reminder>") || !strings.Contains(got, "You are a helpful assistant.") {
+		t.Fatalf("expected original system prompt to be forwarded into first user message, got %q", got)
 	}
 }
 
@@ -1770,8 +1902,11 @@ func TestCheckSystemInstructionsWithMode_StringSystemStrict(t *testing.T) {
 	out := checkSystemInstructionsWithMode(payload, true)
 
 	blocks := gjson.GetBytes(out, "system").Array()
-	if len(blocks) != 2 {
-		t.Fatalf("strict mode should produce 2 blocks, got %d", len(blocks))
+	if len(blocks) != 3 {
+		t.Fatalf("strict mode should still keep 3 system blocks, got %d", len(blocks))
+	}
+	if got := gjson.GetBytes(out, "messages.0.content").String(); strings.Contains(got, "<system-reminder>") {
+		t.Fatalf("strict mode should not prepend system reminder, got %q", got)
 	}
 }
 
@@ -1782,8 +1917,8 @@ func TestCheckSystemInstructionsWithMode_EmptyStringSystemIgnored(t *testing.T) 
 	out := checkSystemInstructionsWithMode(payload, false)
 
 	blocks := gjson.GetBytes(out, "system").Array()
-	if len(blocks) != 2 {
-		t.Fatalf("empty string system should produce 2 blocks, got %d", len(blocks))
+	if len(blocks) != 3 {
+		t.Fatalf("empty string system should produce 3 blocks, got %d", len(blocks))
 	}
 }
 
@@ -1797,8 +1932,8 @@ func TestCheckSystemInstructionsWithMode_ArraySystemStillWorks(t *testing.T) {
 	if len(blocks) != 3 {
 		t.Fatalf("expected 3 system blocks, got %d", len(blocks))
 	}
-	if blocks[2].Get("text").String() != "Be concise." {
-		t.Fatalf("blocks[2] should be user system prompt, got %q", blocks[2].Get("text").String())
+	if got := gjson.GetBytes(out, "messages.0.content").String(); !strings.Contains(got, "Be concise.") {
+		t.Fatalf("expected array system prompt to move into first user message, got %q", got)
 	}
 }
 
@@ -1812,8 +1947,8 @@ func TestCheckSystemInstructionsWithMode_StringWithSpecialChars(t *testing.T) {
 	if len(blocks) != 3 {
 		t.Fatalf("expected 3 system blocks, got %d", len(blocks))
 	}
-	if blocks[2].Get("text").String() != `Use <xml> tags & "quotes" in output.` {
-		t.Fatalf("blocks[2] text mangled, got %q", blocks[2].Get("text").String())
+	if got := gjson.GetBytes(out, "messages.0.content").String(); !strings.Contains(got, `Use <xml> tags & "quotes" in output.`) {
+		t.Fatalf("forwarded system text mangled, got %q", got)
 	}
 }
 

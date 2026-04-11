@@ -38,6 +38,7 @@ type CodexAuth struct {
 type refreshFailureError struct {
 	statusCode int
 	terminal   bool
+	code       string
 	message    string
 }
 
@@ -60,6 +61,13 @@ func (e *refreshFailureError) Terminal() bool {
 		return false
 	}
 	return e.terminal
+}
+
+func (e *refreshFailureError) ErrorCode() string {
+	if e == nil {
+		return ""
+	}
+	return strings.TrimSpace(e.code)
 }
 
 // NewCodexAuth creates a new CodexAuth service instance.
@@ -336,22 +344,36 @@ func newRefreshFailureError(statusCode int, body string) error {
 	message := fmt.Sprintf("token refresh failed with status %d: %s", statusCode, body)
 	classifiedStatus := statusCode
 	terminal := false
+	code := ""
 	raw := strings.ToLower(body)
 
 	switch {
-	case statusCode == http.StatusUnauthorized:
+	case strings.Contains(raw, "refresh_token_expired"):
 		classifiedStatus = http.StatusUnauthorized
 		terminal = true
+		code = RefreshTokenExpiredErrorCode
 	case strings.Contains(raw, "refresh_token_reused"),
+		strings.Contains(raw, "code\":\"refresh_token_reused\""):
+		classifiedStatus = http.StatusUnauthorized
+		terminal = true
+		code = RefreshTokenReusedErrorCode
+	case strings.Contains(raw, "refresh_token_invalidated"),
+		strings.Contains(raw, "refresh_token_revoked"),
 		strings.Contains(raw, "token_invalidated"),
 		strings.Contains(raw, "token_revoked"):
 		classifiedStatus = http.StatusUnauthorized
 		terminal = true
+		code = RefreshTokenRevokedErrorCode
+	case statusCode == http.StatusUnauthorized:
+		classifiedStatus = http.StatusUnauthorized
+		terminal = true
+		code = RefreshUnauthorizedErrorCode
 	}
 
 	return &refreshFailureError{
 		statusCode: classifiedStatus,
 		terminal:   terminal,
+		code:       code,
 		message:    message,
 	}
 }

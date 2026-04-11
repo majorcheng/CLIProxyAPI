@@ -16,6 +16,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/audit"
+	codexauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/codex"
 	internalconfig "github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
@@ -71,6 +72,10 @@ const (
 	// unlimitedRetrySafetyCap bounds legacy "retry all credentials" mode so a
 	// single unhealthy request cannot fan out across thousands of auth files.
 	unlimitedRetrySafetyCap = 32
+	// Codex 按官方思路优先看 AT 自身 exp；本地策略只在到期前 3 小时内做主动 refresh。
+	codexProactiveRefreshWindow = 3 * time.Hour
+	// 当 Codex access token 缺少可解析 exp 时，回退到官方约 8 天的 stale 判定窗口。
+	codexLastRefreshStaleWindow = 8 * 24 * time.Hour
 )
 
 var quotaCooldownDisabled atomic.Bool
@@ -840,17 +845,17 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 		execReq := req
 		execReq.Model = execModel
 		audit.SetAttempt(ctx, provider, execModel, auth.ID, auth.Label, auth.FileName, auditAuthPath(auth))
-		streamResult, errStream := executor.ExecuteStream(ctx, auth, execReq, opts)
+		updatedAuth, streamResult, errStream := executeWithCodex401Recovery(m, ctx, auth, provider, execReq, opts, func(runCtx context.Context, runAuth *Auth) (*cliproxyexecutor.StreamResult, error) {
+			return executor.ExecuteStream(runCtx, runAuth, execReq, opts)
+		})
+		auth = updatedAuth
 		m.syncExecutionAuth(ctx, auth)
 		if errStream != nil {
 			if errCtx := ctx.Err(); errCtx != nil {
 				releaseNow()
 				return nil, errCtx
 			}
-			rerr := &Error{Message: errStream.Error()}
-			if se, ok := errors.AsType[cliproxyexecutor.StatusError](errStream); ok && se != nil {
-				rerr.HTTPStatus = se.StatusCode()
-			}
+			rerr := resultErrorFromExecError(errStream)
 			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr}
 			result.RetryAfter = retryAfterFromError(errStream)
 			if isRequestInvalidError(errStream) {
@@ -933,6 +938,89 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 	}
 	releaseNow()
 	return nil, lastErr
+}
+
+// isCodex401RecoveryCandidate 只在 Codex 请求返回 401 且 auth 仍持有 refresh_token 时触发恢复链。
+func isCodex401RecoveryCandidate(provider string, auth *Auth, err error) bool {
+	if err == nil || auth == nil {
+		return false
+	}
+	if !strings.EqualFold(strings.TrimSpace(provider), "codex") {
+		return false
+	}
+	if !authHasRefreshToken(auth) {
+		return false
+	}
+	return statusCodeFromError(err) == http.StatusUnauthorized
+}
+
+// latestAuthSnapshot 在 refresh 或 reload 后优先切到最新 auth 快照继续请求。
+func latestAuthSnapshot(current, updated *Auth) *Auth {
+	if updated != nil {
+		return updated
+	}
+	return current
+}
+
+// codexTerminalRefreshRecoveryError 把 refresh 阶段已经确认不可恢复的 401 归一成稳定错误码。
+func codexTerminalRefreshRecoveryError(err error) *Error {
+	if err == nil || statusCodeFromError(err) != http.StatusUnauthorized {
+		return nil
+	}
+	code := errorCodeFromError(err)
+	if code == "" {
+		code = codexauth.RefreshUnauthorizedErrorCode
+	}
+	return &Error{
+		Code:       code,
+		Message:    err.Error(),
+		HTTPStatus: http.StatusUnauthorized,
+	}
+}
+
+// executeWithCodex401Recovery 为 Codex 请求链补上一层官方风格的恢复语义：
+// 首次请求命中 401 时同步 refresh 一次，并仅重试一次；只有终态 401 才继续往上冒泡。
+func executeWithCodex401Recovery[T any](m *Manager, ctx context.Context, auth *Auth, provider string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, run func(context.Context, *Auth) (T, error)) (*Auth, T, error) {
+	var zero T
+	current := auth
+	resp, err := run(ctx, current)
+	if err == nil || !isCodex401RecoveryCandidate(provider, current, err) {
+		return current, resp, err
+	}
+
+	entry := logEntryWithRequestID(ctx)
+	authID := strings.TrimSpace(current.ID)
+	entry.Warnf("codex 请求命中 401，开始 refresh-retry 恢复: auth=%s model=%s", authID, strings.TrimSpace(req.Model))
+
+	refreshed, refreshErr := m.RefreshAuthNow(ctx, authID)
+	current = latestAuthSnapshot(current, refreshed)
+	if refreshErr != nil {
+		if terminalErr := codexTerminalRefreshRecoveryError(refreshErr); terminalErr != nil {
+			entry.Warnf("codex 401 恢复中的 refresh 终态失败: auth=%s code=%s err=%v", authID, terminalErr.Code, refreshErr)
+			return current, zero, terminalErr
+		}
+		entry.Warnf("codex 401 恢复中的 refresh 未完成，保留原始 401: auth=%s err=%v", authID, refreshErr)
+		return current, zero, err
+	}
+
+	if latest := m.cloneAuthByID(authID); latest != nil {
+		current = latest
+	}
+	entry.Infof("codex 401 恢复 refresh 成功，开始重试请求: auth=%s model=%s", authID, strings.TrimSpace(req.Model))
+
+	resp, retryErr := run(ctx, current)
+	if retryErr == nil {
+		return current, resp, nil
+	}
+	if statusCodeFromError(retryErr) == http.StatusUnauthorized {
+		entry.Warnf("codex 401 恢复耗尽，重试后仍返回 401: auth=%s model=%s", authID, strings.TrimSpace(req.Model))
+		return current, zero, &Error{
+			Code:       codexauth.UnauthorizedAfterRecoveryErrorCode,
+			Message:    retryErr.Error(),
+			HTTPStatus: http.StatusUnauthorized,
+		}
+	}
+	return current, zero, retryErr
 }
 
 func (m *Manager) syncExecutionAuth(ctx context.Context, auth *Auth) {
@@ -1454,7 +1542,10 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			execReq := req
 			execReq.Model = upstreamModel
 			audit.SetAttempt(execCtx, provider, upstreamModel, auth.ID, auth.Label, auth.FileName, auditAuthPath(auth))
-			resp, errExec := executor.Execute(execCtx, auth, execReq, opts)
+			updatedAuth, resp, errExec := executeWithCodex401Recovery(m, execCtx, auth, provider, execReq, opts, func(runCtx context.Context, runAuth *Auth) (cliproxyexecutor.Response, error) {
+				return executor.Execute(runCtx, runAuth, execReq, opts)
+			})
+			auth = updatedAuth
 			m.syncExecutionAuth(execCtx, auth)
 			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: errExec == nil}
 			attachRequestSimHashResult(&result, opts.Metadata)
@@ -1463,10 +1554,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 					release()
 					return cliproxyexecutor.Response{}, errCtx
 				}
-				result.Error = &Error{Message: errExec.Error()}
-				if se, ok := errors.AsType[cliproxyexecutor.StatusError](errExec); ok && se != nil {
-					result.Error.HTTPStatus = se.StatusCode()
-				}
+				result.Error = resultErrorFromExecError(errExec)
 				if ra := retryAfterFromError(errExec); ra != nil {
 					result.RetryAfter = ra
 				}
@@ -2641,6 +2729,46 @@ func cloneError(err *Error) *Error {
 	}
 }
 
+// errorCodeFromError 从 provider 原始错误里提取机器可读错误码，供 result/maintenance 共享。
+func errorCodeFromError(err error) string {
+	if err == nil {
+		return ""
+	}
+	type errorCoder interface {
+		ErrorCode() string
+	}
+	var coder errorCoder
+	if errors.As(err, &coder) && coder != nil {
+		if code := strings.TrimSpace(coder.ErrorCode()); code != "" {
+			return code
+		}
+	}
+	var authErr *Error
+	if errors.As(err, &authErr) && authErr != nil {
+		return strings.TrimSpace(authErr.Code)
+	}
+	return ""
+}
+
+// resultErrorFromExecError 把 executor error 统一适配成 manager 内部的 Error 结构。
+func resultErrorFromExecError(err error) *Error {
+	if err == nil {
+		return nil
+	}
+	var authErr *Error
+	if errors.As(err, &authErr) && authErr != nil {
+		return cloneError(authErr)
+	}
+	out := &Error{
+		Code:    errorCodeFromError(err),
+		Message: err.Error(),
+	}
+	if se, ok := errors.AsType[cliproxyexecutor.StatusError](err); ok && se != nil {
+		out.HTTPStatus = se.StatusCode()
+	}
+	return out
+}
+
 func statusCodeFromError(err error) int {
 	if err == nil {
 		return 0
@@ -3699,21 +3827,18 @@ func (m *Manager) shouldRefreshCodexFromTokenJSON(a *Auth, now, lastRefresh, exp
 		return false
 	}
 
-	lead := ProviderRefreshLead("codex", a.Runtime)
-	if lead == nil {
-		return false
-	}
-	if *lead <= 0 {
-		if hasExpiry && !expiry.IsZero() {
-			return !expiry.After(now)
-		}
-		return false
+	// Codex 默认不再使用 provider 级固定 lead：
+	// 1. 优先解析 access token 自身的 exp，并只在到期前 3 小时内主动 refresh；
+	// 2. 若拿不到 exp，再退回到官方客户端近似的 last_refresh 8 天 stale 规则；
+	// 3. 若两类时间信号都没有，则保持静默，不做探测式 refresh。
+	if tokenExpiry, ok := authCodexAccessTokenExpiry(a); ok && !tokenExpiry.IsZero() {
+		return !tokenExpiry.After(now.Add(codexProactiveRefreshWindow))
 	}
 	if hasExpiry && !expiry.IsZero() {
-		return expiry.Sub(now) <= *lead
+		return !expiry.After(now.Add(codexProactiveRefreshWindow))
 	}
 	if !lastRefresh.IsZero() {
-		return now.Sub(lastRefresh) >= *lead
+		return now.Sub(lastRefresh) >= codexLastRefreshStaleWindow
 	}
 	return false
 }
@@ -3724,6 +3849,24 @@ func authHasRefreshToken(a *Auth) bool {
 	}
 	refreshToken, _ := a.Metadata["refresh_token"].(string)
 	return strings.TrimSpace(refreshToken) != ""
+}
+
+// authCodexAccessTokenExpiry 尝试直接从 Codex access token 的 JWT `exp` 读取真实过期时间。
+// 解析失败时返回 false，让上层回退到 metadata 中的 `expired` / `last_refresh` 判定。
+func authCodexAccessTokenExpiry(a *Auth) (time.Time, bool) {
+	if a == nil || len(a.Metadata) == 0 {
+		return time.Time{}, false
+	}
+	raw, _ := a.Metadata["access_token"].(string)
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return time.Time{}, false
+	}
+	claims, err := codexauth.ParseJWTToken(raw)
+	if err != nil || claims == nil || claims.Exp <= 0 {
+		return time.Time{}, false
+	}
+	return time.Unix(int64(claims.Exp), 0).UTC(), true
 }
 
 func authPreferredInterval(a *Auth) time.Duration {
@@ -3974,7 +4117,7 @@ func (m *Manager) executeRefreshAuth(ctx context.Context, id string) (*Auth, err
 	log.Debugf("refreshed %s, %s, %v", auth.Provider, auth.ID, err)
 	now := time.Now()
 	if err != nil {
-		refreshErr := &Error{Message: err.Error()}
+		refreshErr := &Error{Message: err.Error(), Code: errorCodeFromError(err)}
 		terminalStatus := terminalStatusCodeFromError(err)
 		if terminalStatus > 0 {
 			refreshErr.HTTPStatus = terminalStatus

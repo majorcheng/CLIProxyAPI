@@ -26,6 +26,17 @@ func testStatusCode(err error) int {
 	return statusErr.StatusCode()
 }
 
+func testErrorCode(err error) string {
+	if err == nil {
+		return ""
+	}
+	codedErr, ok := err.(interface{ ErrorCode() string })
+	if !ok || codedErr == nil {
+		return ""
+	}
+	return codedErr.ErrorCode()
+}
+
 func TestRefreshTokensWithRetry_NonRetryableOnlyAttemptsOnce(t *testing.T) {
 	var calls int32
 	auth := &CodexAuth{
@@ -51,6 +62,9 @@ func TestRefreshTokensWithRetry_NonRetryableOnlyAttemptsOnce(t *testing.T) {
 	}
 	if got := testStatusCode(err); got != http.StatusUnauthorized {
 		t.Fatalf("expected maintenance status code 401, got %d", got)
+	}
+	if got := testErrorCode(err); got != RefreshTokenReusedErrorCode {
+		t.Fatalf("expected refresh error code %q, got %q", RefreshTokenReusedErrorCode, got)
 	}
 	if got := atomic.LoadInt32(&calls); got != 1 {
 		t.Fatalf("expected 1 refresh attempt, got %d", got)
@@ -79,6 +93,40 @@ func TestRefreshTokensWithRetry_UnauthorizedOnlyAttemptsOnce(t *testing.T) {
 	}
 	if got := testStatusCode(err); got != http.StatusUnauthorized {
 		t.Fatalf("expected maintenance status code 401, got %d", got)
+	}
+	if got := testErrorCode(err); got != RefreshTokenRevokedErrorCode {
+		t.Fatalf("expected refresh error code %q, got %q", RefreshTokenRevokedErrorCode, got)
+	}
+	if got := atomic.LoadInt32(&calls); got != 1 {
+		t.Fatalf("expected 1 refresh attempt, got %d", got)
+	}
+}
+
+func TestRefreshTokensWithRetry_UnknownUnauthorizedUsesGenericTerminalCode(t *testing.T) {
+	var calls int32
+	auth := &CodexAuth{
+		httpClient: &http.Client{
+			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				atomic.AddInt32(&calls, 1)
+				return &http.Response{
+					StatusCode: http.StatusUnauthorized,
+					Body:       io.NopCloser(strings.NewReader(`{"error":{"message":"session expired"}}`)),
+					Header:     make(http.Header),
+					Request:    req,
+				}, nil
+			}),
+		},
+	}
+
+	_, err := auth.RefreshTokensWithRetry(context.Background(), "dummy_refresh_token", 3)
+	if err == nil {
+		t.Fatalf("expected error for unauthorized refresh failure")
+	}
+	if got := testStatusCode(err); got != http.StatusUnauthorized {
+		t.Fatalf("expected maintenance status code 401, got %d", got)
+	}
+	if got := testErrorCode(err); got != RefreshUnauthorizedErrorCode {
+		t.Fatalf("expected refresh error code %q, got %q", RefreshUnauthorizedErrorCode, got)
 	}
 	if got := atomic.LoadInt32(&calls); got != 1 {
 		t.Fatalf("expected 1 refresh attempt, got %d", got)

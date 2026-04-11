@@ -2,6 +2,8 @@ package auth
 
 import (
 	"context"
+	"encoding/base64"
+	"fmt"
 	"testing"
 	"time"
 
@@ -12,7 +14,7 @@ func TestManagerShouldRefresh_CodexUsesConservativeTokenJSONGate(t *testing.T) {
 	t.Parallel()
 
 	now := time.Date(2026, 4, 1, 12, 0, 0, 0, time.UTC)
-	lead := 5 * 24 * time.Hour
+	staleWindow := 8 * 24 * time.Hour
 
 	tests := []struct {
 		name string
@@ -23,69 +25,74 @@ func TestManagerShouldRefresh_CodexUsesConservativeTokenJSONGate(t *testing.T) {
 			name: "codex without refresh token stays idle even when expired",
 			auth: &Auth{
 				Provider: "codex",
-				Runtime:  staticRefreshLeadRuntime(lead),
 				Metadata: map[string]any{
-					"expired": now.Add(-time.Minute).Format(time.RFC3339),
+					"access_token": testJWTWithExp(now.Add(-time.Minute)),
 				},
 			},
 			want: false,
 		},
 		{
-			name: "codex refreshes when already expired",
+			name: "codex refreshes when JWT exp already expired",
 			auth: &Auth{
 				Provider: "codex",
-				Runtime:  staticRefreshLeadRuntime(lead),
 				Metadata: map[string]any{
 					"refresh_token": "refresh-token",
-					"expired":       now.Add(-time.Minute).Format(time.RFC3339),
+					"access_token":  testJWTWithExp(now.Add(-time.Minute)),
 				},
 			},
 			want: true,
 		},
 		{
-			name: "codex refreshes when expiry is within refresh lead",
+			name: "codex refreshes when JWT exp enters 3 hour proactive window",
 			auth: &Auth{
 				Provider: "codex",
-				Runtime:  staticRefreshLeadRuntime(lead),
 				Metadata: map[string]any{
 					"refresh_token": "refresh-token",
-					"expired":       now.Add(lead - time.Hour).Format(time.RFC3339),
+					"access_token":  testJWTWithExp(now.Add(2*time.Hour + 30*time.Minute)),
 				},
 			},
 			want: true,
 		},
 		{
-			name: "codex does not refresh when expiry is still far away",
+			name: "codex does not refresh when JWT exp is still beyond 3 hour window",
 			auth: &Auth{
 				Provider: "codex",
-				Runtime:  staticRefreshLeadRuntime(lead),
 				Metadata: map[string]any{
 					"refresh_token": "refresh-token",
-					"expired":       now.Add(lead + time.Hour).Format(time.RFC3339),
+					"access_token":  testJWTWithExp(now.Add(4 * time.Hour)),
 				},
 			},
 			want: false,
 		},
 		{
-			name: "codex refreshes when last refresh is older than lead",
+			name: "codex falls back to metadata expiry when access token lacks JWT exp",
 			auth: &Auth{
 				Provider: "codex",
-				Runtime:  staticRefreshLeadRuntime(lead),
 				Metadata: map[string]any{
 					"refresh_token": "refresh-token",
-					"last_refresh":  now.Add(-lead - time.Hour).Format(time.RFC3339),
+					"expired":       now.Add(2 * time.Hour).Format(time.RFC3339),
 				},
 			},
 			want: true,
 		},
 		{
-			name: "codex does not refresh when last refresh is still recent",
+			name: "codex refreshes when last refresh is older than 8 day fallback",
 			auth: &Auth{
 				Provider: "codex",
-				Runtime:  staticRefreshLeadRuntime(lead),
 				Metadata: map[string]any{
 					"refresh_token": "refresh-token",
-					"last_refresh":  now.Add(-lead + time.Hour).Format(time.RFC3339),
+					"last_refresh":  now.Add(-staleWindow - time.Hour).Format(time.RFC3339),
+				},
+			},
+			want: true,
+		},
+		{
+			name: "codex does not refresh when last refresh is still within 8 days",
+			auth: &Auth{
+				Provider: "codex",
+				Metadata: map[string]any{
+					"refresh_token": "refresh-token",
+					"last_refresh":  now.Add(-staleWindow + time.Hour).Format(time.RFC3339),
 				},
 			},
 			want: false,
@@ -94,7 +101,6 @@ func TestManagerShouldRefresh_CodexUsesConservativeTokenJSONGate(t *testing.T) {
 			name: "codex with missing expired and last_refresh does not probe upstream",
 			auth: &Auth{
 				Provider: "codex",
-				Runtime:  staticRefreshLeadRuntime(lead),
 				Metadata: map[string]any{
 					"refresh_token": "refresh-token",
 				},
@@ -105,7 +111,6 @@ func TestManagerShouldRefresh_CodexUsesConservativeTokenJSONGate(t *testing.T) {
 			name: "codex honors explicit refresh interval when last refresh is old enough",
 			auth: &Auth{
 				Provider: "codex",
-				Runtime:  staticRefreshLeadRuntime(lead),
 				Metadata: map[string]any{
 					"refresh_token":            "refresh-token",
 					"last_refresh":             now.Add(-2 * time.Hour).Format(time.RFC3339),
@@ -118,7 +123,6 @@ func TestManagerShouldRefresh_CodexUsesConservativeTokenJSONGate(t *testing.T) {
 			name: "codex explicit refresh interval still needs concrete timing fields",
 			auth: &Auth{
 				Provider: "codex",
-				Runtime:  staticRefreshLeadRuntime(lead),
 				Metadata: map[string]any{
 					"refresh_token":            "refresh-token",
 					"refresh_interval_seconds": 3600,
@@ -164,7 +168,6 @@ func TestManagerShouldRefresh_CodexInitialRefreshPendingForcesFreshLookingToken(
 	auth := &Auth{
 		ID:       "codex-initial-refresh-once",
 		Provider: "codex",
-		Runtime:  staticRefreshLeadRuntime(5 * 24 * time.Hour),
 		Metadata: map[string]any{
 			"refresh_token": "refresh-token",
 			"last_refresh":  now.Add(-time.Minute).Format(time.RFC3339),
@@ -193,7 +196,6 @@ func TestManagerCollectRefreshTargets_SkipsCodexWithUnknownTokenTiming(t *testin
 	if _, err := manager.Register(ctx, &Auth{
 		ID:       "codex-unknown",
 		Provider: "codex",
-		Runtime:  staticRefreshLeadRuntime(5 * 24 * time.Hour),
 		Status:   StatusActive,
 		Metadata: map[string]any{
 			"email":         "codex@example.com",
@@ -240,7 +242,6 @@ func TestManagerCollectRefreshTargets_CodexInitialRefreshPendingSchedulesFreshLo
 	if _, err := manager.Register(ctx, &Auth{
 		ID:       "codex-initial-unknown",
 		Provider: "codex",
-		Runtime:  staticRefreshLeadRuntime(5 * 24 * time.Hour),
 		Status:   StatusActive,
 		Metadata: map[string]any{
 			"email":         "codex@example.com",
@@ -294,4 +295,10 @@ type staticRefreshLeadRuntime time.Duration
 func (r staticRefreshLeadRuntime) RefreshLead() *time.Duration {
 	d := time.Duration(r)
 	return &d
+}
+
+func testJWTWithExp(exp time.Time) string {
+	header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"none","typ":"JWT"}`))
+	payload := base64.RawURLEncoding.EncodeToString([]byte(fmt.Sprintf(`{"exp":%d}`, exp.Unix())))
+	return header + "." + payload + ".signature"
 }

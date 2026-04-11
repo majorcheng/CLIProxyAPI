@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	codexauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/codex"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	sdkAuth "github.com/router-for-me/CLIProxyAPI/v6/sdk/auth"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
@@ -228,7 +229,7 @@ func TestScanAuthMaintenanceCandidates_GroupsByPath(t *testing.T) {
 			FileName:    filepath.Base(sharedPath),
 			Provider:    "codex",
 			Status:      coreauth.StatusError,
-			LastError:   &coreauth.Error{HTTPStatus: 401, Message: "unauthorized"},
+			LastError:   &coreauth.Error{Code: codexauth.UnauthorizedAfterRecoveryErrorCode, HTTPStatus: 401, Message: "unauthorized"},
 			Attributes:  map[string]string{"path": sharedPath, "plan_type": "free"},
 			UpdatedAt:   timeNowForTest(),
 			Unavailable: true,
@@ -416,11 +417,8 @@ func TestScanAuthMaintenanceCandidates_StatusMessageJSON401QueuesDelete(t *testi
 	}
 
 	candidates := service.scanAuthMaintenanceCandidates(timeNowForTest(), service.cfg.AuthMaintenance, authDir)
-	if len(candidates) != 1 {
-		t.Fatalf("expected 1 maintenance candidate, got %d", len(candidates))
-	}
-	if got := candidates[0].Reason; got != "http_401" {
-		t.Fatalf("expected JSON 401 status_message to queue delete, got %q", got)
+	if len(candidates) != 0 {
+		t.Fatalf("expected raw codex 401 status_message not to queue delete directly, got %#v", candidates)
 	}
 }
 
@@ -530,15 +528,12 @@ func TestScanAuthMaintenanceCandidates_Refresh401Without429QueuesDeleteWhenProte
 	}
 
 	candidates := service.scanAuthMaintenanceCandidates(timeNowForTest(), service.cfg.AuthMaintenance, authDir)
-	if len(candidates) != 1 {
-		t.Fatalf("expected refresh-induced 401 without 429 to queue delete when protection disabled, got %d", len(candidates))
-	}
-	if got := candidates[0].Reason; got != "http_401" {
-		t.Fatalf("expected disabled protection to keep 401 delete reason, got %q", got)
+	if len(candidates) != 0 {
+		t.Fatalf("expected raw codex refresh 401 still not to queue direct delete, got %#v", candidates)
 	}
 }
 
-func TestScanAuthMaintenanceCandidates_Refresh401With429QueuesDelete(t *testing.T) {
+func TestScanAuthMaintenanceCandidates_CodexTerminalRefresh401QueuesSemanticDelete(t *testing.T) {
 	authDir := t.TempDir()
 	service := &Service{
 		cfg: &config.Config{
@@ -559,7 +554,7 @@ func TestScanAuthMaintenanceCandidates_Refresh401With429QueuesDelete(t *testing.
 		Provider:      "codex",
 		Status:        coreauth.StatusError,
 		StatusMessage: "quota exhausted",
-		LastError:     &coreauth.Error{HTTPStatus: 401, Message: "token refresh failed with status 401: unauthorized"},
+		LastError:     &coreauth.Error{Code: codexauth.RefreshTokenReusedErrorCode, HTTPStatus: 401, Message: "token refresh failed with status 401: unauthorized"},
 		Attributes: map[string]string{
 			"path":      filePath,
 			"plan_type": "free",
@@ -579,10 +574,10 @@ func TestScanAuthMaintenanceCandidates_Refresh401With429QueuesDelete(t *testing.
 
 	candidates := service.scanAuthMaintenanceCandidates(timeNowForTest(), service.cfg.AuthMaintenance, authDir)
 	if len(candidates) != 1 {
-		t.Fatalf("expected refresh-induced 401 with existing 429 to queue delete, got %d", len(candidates))
+		t.Fatalf("expected terminal refresh-induced 401 to queue delete, got %d", len(candidates))
 	}
-	if got := candidates[0].Reason; got != "http_429" {
-		t.Fatalf("expected refresh-induced 401 to convert into 429 delete reason, got %q", got)
+	if got := candidates[0].Reason; got != "terminal_refresh_token_reused" {
+		t.Fatalf("expected semantic terminal reason, got %q", got)
 	}
 }
 
@@ -1372,7 +1367,7 @@ func TestScanAuthMaintenanceCandidates_LargeAuthPool9053(t *testing.T) {
 		case i%700 == 0:
 			auth.Status = coreauth.StatusError
 			auth.Unavailable = true
-			auth.LastError = &coreauth.Error{HTTPStatus: 401, Message: "unauthorized"}
+			auth.LastError = &coreauth.Error{Code: codexauth.UnauthorizedAfterRecoveryErrorCode, HTTPStatus: 401, Message: "unauthorized"}
 			expectedCandidates++
 		case i%333 == 0:
 			auth.Status = coreauth.StatusError

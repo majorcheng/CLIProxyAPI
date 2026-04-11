@@ -9,7 +9,9 @@ import (
 	"testing"
 	"time"
 
+	codexauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/codex"
 	internalconfig "github.com/router-for-me/CLIProxyAPI/v6/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 )
 
@@ -46,12 +48,16 @@ func (e refreshFailureTestExecutor) HttpRequest(context.Context, *Auth, *http.Re
 
 type terminalRefreshTestError struct {
 	status int
+	code   string
 	msg    string
 }
 
 func (e terminalRefreshTestError) Error() string   { return e.msg }
 func (e terminalRefreshTestError) StatusCode() int { return e.status }
 func (e terminalRefreshTestError) Terminal() bool  { return true }
+func (e terminalRefreshTestError) ErrorCode() string {
+	return e.code
+}
 
 type transientRefreshTestError struct {
 	status int
@@ -102,6 +108,7 @@ func TestManagerRefreshAuth_PersistsTerminalRefresh401ForMaintenance(t *testing.
 		provider: "codex",
 		err: terminalRefreshTestError{
 			status: http.StatusUnauthorized,
+			code:   codexauth.RefreshUnauthorizedErrorCode,
 			msg:    "token refresh failed with status 401: unauthorized",
 		},
 	})
@@ -132,6 +139,9 @@ func TestManagerRefreshAuth_PersistsTerminalRefresh401ForMaintenance(t *testing.
 	}
 	if updated.LastError.HTTPStatus != http.StatusUnauthorized {
 		t.Fatalf("expected LastError.HTTPStatus = 401, got %d", updated.LastError.HTTPStatus)
+	}
+	if updated.LastError.Code != codexauth.RefreshUnauthorizedErrorCode {
+		t.Fatalf("expected LastError.Code = %q, got %q", codexauth.RefreshUnauthorizedErrorCode, updated.LastError.Code)
 	}
 	if !strings.Contains(updated.LastError.Message, "status 401") {
 		t.Fatalf("expected LastError.Message to preserve refresh failure details, got %q", updated.LastError.Message)
@@ -470,5 +480,218 @@ func TestManagerRefreshAuthNow_ReturnsBusyWhenAutoRefreshInFlight(t *testing.T) 
 	case <-done:
 	case <-time.After(2 * time.Second):
 		t.Fatal("释放阻塞后后台 refresh 仍未退出")
+	}
+}
+
+type codexRecoveryTestExecutor struct {
+	mu                    sync.Mutex
+	refreshed             bool
+	refreshErr            error
+	retryUnauthorized     bool
+	executeCalls          int
+	streamCalls           int
+	refreshCalls          int
+	lastAccessTokenByCall []string
+}
+
+func (e *codexRecoveryTestExecutor) Identifier() string { return "codex" }
+
+func (e *codexRecoveryTestExecutor) Execute(_ context.Context, auth *Auth, _ cliproxyexecutor.Request, _ cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.executeCalls++
+	e.lastAccessTokenByCall = append(e.lastAccessTokenByCall, authMetadataString(auth, "access_token"))
+	if !e.refreshed {
+		return cliproxyexecutor.Response{}, &Error{HTTPStatus: http.StatusUnauthorized, Message: "unauthorized before refresh"}
+	}
+	if e.retryUnauthorized {
+		return cliproxyexecutor.Response{}, &Error{HTTPStatus: http.StatusUnauthorized, Message: "unauthorized after refresh"}
+	}
+	return cliproxyexecutor.Response{Payload: []byte("ok-after-refresh")}, nil
+}
+
+func (e *codexRecoveryTestExecutor) ExecuteStream(_ context.Context, auth *Auth, _ cliproxyexecutor.Request, _ cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.streamCalls++
+	e.lastAccessTokenByCall = append(e.lastAccessTokenByCall, authMetadataString(auth, "access_token"))
+	if !e.refreshed {
+		return nil, &Error{HTTPStatus: http.StatusUnauthorized, Message: "stream unauthorized before refresh"}
+	}
+	if e.retryUnauthorized {
+		return nil, &Error{HTTPStatus: http.StatusUnauthorized, Message: "stream unauthorized after refresh"}
+	}
+	ch := make(chan cliproxyexecutor.StreamChunk, 1)
+	ch <- cliproxyexecutor.StreamChunk{Payload: []byte("stream-after-refresh")}
+	close(ch)
+	return &cliproxyexecutor.StreamResult{Chunks: ch}, nil
+}
+
+func (e *codexRecoveryTestExecutor) Refresh(_ context.Context, auth *Auth) (*Auth, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.refreshCalls++
+	if e.refreshErr != nil {
+		return auth, e.refreshErr
+	}
+	e.refreshed = true
+	cloned := auth.Clone()
+	if cloned.Metadata == nil {
+		cloned.Metadata = make(map[string]any)
+	}
+	cloned.Metadata["access_token"] = "rotated-access-token"
+	cloned.Metadata["refresh_token"] = "rotated-refresh-token"
+	cloned.Metadata["last_refresh"] = time.Now().Format(time.RFC3339)
+	cloned.Metadata["expired"] = time.Now().Add(24 * time.Hour).Format(time.RFC3339)
+	return cloned, nil
+}
+
+func (e *codexRecoveryTestExecutor) CountTokens(context.Context, *Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	return cliproxyexecutor.Response{}, nil
+}
+
+func (e *codexRecoveryTestExecutor) HttpRequest(context.Context, *Auth, *http.Request) (*http.Response, error) {
+	return nil, nil
+}
+
+func authMetadataString(auth *Auth, key string) string {
+	if auth == nil || auth.Metadata == nil {
+		return ""
+	}
+	raw, _ := auth.Metadata[key].(string)
+	return raw
+}
+
+func registerCodexRecoveryTestAuth(t *testing.T, manager *Manager, id string) {
+	t.Helper()
+	auth := &Auth{
+		ID:       id,
+		Provider: "codex",
+		Status:   StatusActive,
+		Metadata: map[string]any{
+			"access_token":  "stale-access-token",
+			"refresh_token": "refresh-token",
+		},
+	}
+	if _, err := manager.Register(context.Background(), auth); err != nil {
+		t.Fatalf("register auth: %v", err)
+	}
+	reg := registry.GetGlobalRegistry()
+	reg.RegisterClient(auth.ID, "codex", []*registry.ModelInfo{{ID: "gpt-5.4"}})
+	t.Cleanup(func() {
+		reg.UnregisterClient(auth.ID)
+	})
+}
+
+func TestManagerExecute_Codex401RefreshesAndRetriesOnce(t *testing.T) {
+	t.Parallel()
+
+	manager := NewManager(nil, nil, nil)
+	executor := &codexRecoveryTestExecutor{}
+	manager.RegisterExecutor(executor)
+	registerCodexRecoveryTestAuth(t, manager, "codex-recovery")
+
+	resp, err := manager.Execute(context.Background(), []string{"codex"}, cliproxyexecutor.Request{Model: "gpt-5.4"}, cliproxyexecutor.Options{})
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if got := string(resp.Payload); got != "ok-after-refresh" {
+		t.Fatalf("payload = %q, want %q", got, "ok-after-refresh")
+	}
+	if executor.refreshCalls != 1 {
+		t.Fatalf("refreshCalls = %d, want 1", executor.refreshCalls)
+	}
+	if executor.executeCalls != 2 {
+		t.Fatalf("executeCalls = %d, want 2", executor.executeCalls)
+	}
+	if len(executor.lastAccessTokenByCall) < 2 {
+		t.Fatalf("expected two execute attempts, got %v", executor.lastAccessTokenByCall)
+	}
+	if executor.lastAccessTokenByCall[0] != "stale-access-token" || executor.lastAccessTokenByCall[1] != "rotated-access-token" {
+		t.Fatalf("access token sequence = %v, want stale -> rotated", executor.lastAccessTokenByCall)
+	}
+}
+
+func TestManagerExecute_CodexRefreshTerminalFailureBecomesSemantic401(t *testing.T) {
+	t.Parallel()
+
+	manager := NewManager(nil, nil, nil)
+	executor := &codexRecoveryTestExecutor{
+		refreshErr: terminalRefreshTestError{
+			status: http.StatusUnauthorized,
+			code:   codexauth.RefreshTokenReusedErrorCode,
+			msg:    "token refresh failed with status 401: refresh_token_reused",
+		},
+	}
+	manager.RegisterExecutor(executor)
+	registerCodexRecoveryTestAuth(t, manager, "codex-recovery-terminal")
+
+	_, err := manager.Execute(context.Background(), []string{"codex"}, cliproxyexecutor.Request{Model: "gpt-5.4"}, cliproxyexecutor.Options{})
+	if err == nil {
+		t.Fatal("expected terminal recovery error")
+	}
+	authErr, ok := err.(*Error)
+	if !ok {
+		t.Fatalf("expected *Error, got %T", err)
+	}
+	if authErr.Code != codexauth.RefreshTokenReusedErrorCode {
+		t.Fatalf("error code = %q, want %q", authErr.Code, codexauth.RefreshTokenReusedErrorCode)
+	}
+	if authErr.HTTPStatus != http.StatusUnauthorized {
+		t.Fatalf("error status = %d, want 401", authErr.HTTPStatus)
+	}
+}
+
+func TestManagerExecute_CodexRetryStill401MarksUnauthorizedAfterRecovery(t *testing.T) {
+	t.Parallel()
+
+	manager := NewManager(nil, nil, nil)
+	executor := &codexRecoveryTestExecutor{retryUnauthorized: true}
+	manager.RegisterExecutor(executor)
+	registerCodexRecoveryTestAuth(t, manager, "codex-recovery-after-refresh")
+
+	_, err := manager.Execute(context.Background(), []string{"codex"}, cliproxyexecutor.Request{Model: "gpt-5.4"}, cliproxyexecutor.Options{})
+	if err == nil {
+		t.Fatal("expected unauthorized-after-recovery error")
+	}
+	authErr, ok := err.(*Error)
+	if !ok {
+		t.Fatalf("expected *Error, got %T", err)
+	}
+	if authErr.Code != codexauth.UnauthorizedAfterRecoveryErrorCode {
+		t.Fatalf("error code = %q, want %q", authErr.Code, codexauth.UnauthorizedAfterRecoveryErrorCode)
+	}
+	if authErr.HTTPStatus != http.StatusUnauthorized {
+		t.Fatalf("error status = %d, want 401", authErr.HTTPStatus)
+	}
+}
+
+func TestManagerExecuteStream_Codex401RefreshesBeforeFirstByte(t *testing.T) {
+	t.Parallel()
+
+	manager := NewManager(nil, nil, nil)
+	executor := &codexRecoveryTestExecutor{}
+	manager.RegisterExecutor(executor)
+	registerCodexRecoveryTestAuth(t, manager, "codex-stream-recovery")
+
+	result, err := manager.ExecuteStream(context.Background(), []string{"codex"}, cliproxyexecutor.Request{Model: "gpt-5.4"}, cliproxyexecutor.Options{})
+	if err != nil {
+		t.Fatalf("ExecuteStream() error = %v", err)
+	}
+	if result == nil {
+		t.Fatal("expected stream result")
+	}
+	chunk, ok := <-result.Chunks
+	if !ok {
+		t.Fatal("expected first stream chunk")
+	}
+	if string(chunk.Payload) != "stream-after-refresh" {
+		t.Fatalf("stream payload = %q, want %q", string(chunk.Payload), "stream-after-refresh")
+	}
+	if executor.refreshCalls != 1 {
+		t.Fatalf("refreshCalls = %d, want 1", executor.refreshCalls)
+	}
+	if executor.streamCalls != 2 {
+		t.Fatalf("streamCalls = %d, want 2", executor.streamCalls)
 	}
 }

@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/api"
+	codexauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/codex"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/executor"
 	internalusage "github.com/router-for-me/CLIProxyAPI/v6/internal/usage"
@@ -1523,7 +1524,13 @@ func authEligibleForMaintenanceDelete(auth *coreauth.Auth, result *coreauth.Resu
 	if auth.Disabled || auth.Status == coreauth.StatusDisabled {
 		return "", false
 	}
+	if reason, ok := authMaintenanceCodexTerminalDeleteReason(auth, result); ok {
+		return reason, true
+	}
 	if statusCode := authMaintenanceStatusCode(auth, result); containsStatusCode(cfg.DeleteStatusCodes, statusCode) {
+		if strings.EqualFold(strings.TrimSpace(auth.Provider), "codex") && statusCode == http.StatusUnauthorized {
+			return "", false
+		}
 		// 这条保护规则默认开启，但允许配置显式关闭：
 		// 对 refresh RT 失败导致的 401，只有 auth 已经具备 429（额度/周限）痕迹时才允许删除。
 		if cfg.Refresh401Requires429 && statusCode == http.StatusUnauthorized && authMaintenanceRefreshUnauthorized(auth, result) {
@@ -1538,6 +1545,41 @@ func authEligibleForMaintenanceDelete(auth *coreauth.Auth, result *coreauth.Resu
 		return fmt.Sprintf("quota_strikes_%d", auth.Quota.StrikeCount), true
 	}
 	return "", false
+}
+
+// authMaintenanceCodexTerminalDeleteReason 只为 Codex 识别“已经走完恢复链且不可挽回”的删除原因。
+func authMaintenanceCodexTerminalDeleteReason(auth *coreauth.Auth, result *coreauth.Result) (string, bool) {
+	if auth == nil || !strings.EqualFold(strings.TrimSpace(auth.Provider), "codex") {
+		return "", false
+	}
+	code := authMaintenanceTerminalErrorCode(auth, result)
+	switch code {
+	case codexauth.RefreshTokenExpiredErrorCode:
+		return "terminal_refresh_token_expired", true
+	case codexauth.RefreshTokenReusedErrorCode:
+		return "terminal_refresh_token_reused", true
+	case codexauth.RefreshTokenRevokedErrorCode:
+		return "terminal_refresh_token_revoked", true
+	case codexauth.RefreshUnauthorizedErrorCode:
+		return "terminal_refresh_unauthorized", true
+	case codexauth.UnauthorizedAfterRecoveryErrorCode:
+		return "terminal_request_401_after_recovery", true
+	default:
+		return "", false
+	}
+}
+
+// authMaintenanceTerminalErrorCode 优先读取本轮结果里的错误码，回退到 auth 上持久化的 LastError.Code。
+func authMaintenanceTerminalErrorCode(auth *coreauth.Auth, result *coreauth.Result) string {
+	if result != nil && result.Error != nil {
+		if code := strings.TrimSpace(result.Error.Code); code != "" {
+			return code
+		}
+	}
+	if auth != nil && auth.LastError != nil {
+		return strings.TrimSpace(auth.LastError.Code)
+	}
+	return ""
 }
 
 func authMaintenanceRefreshUnauthorized(auth *coreauth.Auth, result *coreauth.Result) bool {

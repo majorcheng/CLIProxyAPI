@@ -8,7 +8,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -85,37 +84,38 @@ func (w *Watcher) reloadClients(rescanAuth bool, affectedOAuthProviders []string
 		if resolvedAuthDir, errResolveAuthDir := util.ResolveAuthDir(cfg.AuthDir); errResolveAuthDir != nil {
 			log.Errorf("failed to resolve auth directory for hash cache: %v", errResolveAuthDir)
 		} else if resolvedAuthDir != "" {
-			_ = filepath.Walk(resolvedAuthDir, func(path string, info fs.FileInfo, err error) error {
-				if err != nil {
-					return nil
-				}
-				if !info.IsDir() && strings.HasSuffix(strings.ToLower(info.Name()), ".json") {
-					if data, errReadFile := os.ReadFile(path); errReadFile == nil && len(data) > 0 {
-						sum := sha256.Sum256(data)
-						normalizedPath := w.normalizeAuthPath(path)
-						w.lastAuthHashes[normalizedPath] = hex.EncodeToString(sum[:])
-						// Parse and cache auth content for future diff comparisons (debug only).
-						if cacheAuthContents {
-							var auth coreauth.Auth
-							if errParse := json.Unmarshal(data, &auth); errParse == nil {
-								w.lastAuthContents[normalizedPath] = &auth
-							}
+			paths, errList := listTopLevelAuthJSONFiles(resolvedAuthDir)
+			if errList != nil {
+				log.Errorf("failed to read auth directory for hash cache: %v", errList)
+			} else {
+				for _, path := range paths {
+					data, errReadFile := os.ReadFile(path)
+					if errReadFile != nil || len(data) == 0 {
+						continue
+					}
+					sum := sha256.Sum256(data)
+					normalizedPath := w.normalizeAuthPath(path)
+					w.lastAuthHashes[normalizedPath] = hex.EncodeToString(sum[:])
+					// Parse and cache auth content for future diff comparisons (debug only).
+					if cacheAuthContents {
+						var auth coreauth.Auth
+						if errParse := json.Unmarshal(data, &auth); errParse == nil {
+							w.lastAuthContents[normalizedPath] = &auth
 						}
-						ctx := &synthesizer.SynthesisContext{
-							Config:      cfg,
-							AuthDir:     resolvedAuthDir,
-							Now:         time.Now(),
-							IDGenerator: synthesizer.NewStableIDGenerator(),
-						}
-						if generated := synthesizer.SynthesizeAuthFile(ctx, path, data); len(generated) > 0 {
-							if pathAuths := authSliceToMap(generated); len(pathAuths) > 0 {
-								w.fileAuthsByPath[normalizedPath] = authIDSet(pathAuths)
-							}
+					}
+					ctx := &synthesizer.SynthesisContext{
+						Config:      cfg,
+						AuthDir:     resolvedAuthDir,
+						Now:         time.Now(),
+						IDGenerator: synthesizer.NewStableIDGenerator(),
+					}
+					if generated := synthesizer.SynthesizeAuthFile(ctx, path, data); len(generated) > 0 {
+						if pathAuths := authSliceToMap(generated); len(pathAuths) > 0 {
+							w.fileAuthsByPath[normalizedPath] = authIDSet(pathAuths)
 						}
 					}
 				}
-				return nil
-			})
+			}
 		}
 		w.clientsMutex.Unlock()
 	}
@@ -306,26 +306,41 @@ func (w *Watcher) loadFileClients(cfg *config.Config) int {
 		return 0
 	}
 
-	errWalk := filepath.Walk(authDir, func(path string, info fs.FileInfo, err error) error {
-		if err != nil {
-			log.Debugf("error accessing path %s: %v", path, err)
-			return err
+	paths, errList := listTopLevelAuthJSONFiles(authDir)
+	if errList != nil {
+		log.Errorf("error reading auth directory: %v", errList)
+		return 0
+	}
+	for _, path := range paths {
+		authFileCount++
+		log.Debugf("processing auth file %d: %s", authFileCount, filepath.Base(path))
+		if data, errReadFile := os.ReadFile(path); errReadFile == nil && len(data) > 0 {
+			successfulAuthCount++
 		}
-		if !info.IsDir() && strings.HasSuffix(strings.ToLower(info.Name()), ".json") {
-			authFileCount++
-			log.Debugf("processing auth file %d: %s", authFileCount, filepath.Base(path))
-			if data, errCreate := os.ReadFile(path); errCreate == nil && len(data) > 0 {
-				successfulAuthCount++
-			}
-		}
-		return nil
-	})
-
-	if errWalk != nil {
-		log.Errorf("error walking auth directory: %v", errWalk)
 	}
 	log.Debugf("auth directory scan complete - found %d .json files, %d readable", authFileCount, successfulAuthCount)
 	return authFileCount
+}
+
+// listTopLevelAuthJSONFiles returns only the auth JSON files that live directly
+// under the auth directory root. 子目录中的 token 文件会被显式忽略。
+func listTopLevelAuthJSONFiles(authDir string) ([]string, error) {
+	entries, err := os.ReadDir(authDir)
+	if err != nil {
+		return nil, err
+	}
+	paths := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		if entry == nil || entry.IsDir() {
+			continue
+		}
+		name := entry.Name()
+		if !strings.HasSuffix(strings.ToLower(name), ".json") {
+			continue
+		}
+		paths = append(paths, filepath.Join(authDir, name))
+	}
+	return paths, nil
 }
 
 func BuildAPIKeyClients(cfg *config.Config) (int, int, int, int, int) {

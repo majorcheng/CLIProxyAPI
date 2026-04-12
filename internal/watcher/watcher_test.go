@@ -675,6 +675,37 @@ func TestReloadClientsCachesAuthHashes(t *testing.T) {
 	}
 }
 
+func TestReloadClientsCachesOnlyTopLevelAuthHashes(t *testing.T) {
+	tmpDir := t.TempDir()
+	authFile := filepath.Join(tmpDir, "one.json")
+	if err := os.WriteFile(authFile, []byte(`{"type":"demo"}`), 0o644); err != nil {
+		t.Fatalf("failed to write top-level auth file: %v", err)
+	}
+	nestedDir := filepath.Join(tmpDir, "nested")
+	if err := os.MkdirAll(nestedDir, 0o755); err != nil {
+		t.Fatalf("failed to create nested dir: %v", err)
+	}
+	nestedFile := filepath.Join(nestedDir, "two.json")
+	if err := os.WriteFile(nestedFile, []byte(`{"type":"demo"}`), 0o644); err != nil {
+		t.Fatalf("failed to write nested auth file: %v", err)
+	}
+	w := &Watcher{
+		authDir: tmpDir,
+		config:  &config.Config{AuthDir: tmpDir},
+	}
+
+	w.reloadClients(true, nil, false)
+
+	w.clientsMutex.RLock()
+	defer w.clientsMutex.RUnlock()
+	if len(w.lastAuthHashes) != 1 {
+		t.Fatalf("expected only top-level auth file to populate hash cache, got %d", len(w.lastAuthHashes))
+	}
+	if _, ok := w.lastAuthHashes[w.normalizeAuthPath(nestedFile)]; ok {
+		t.Fatal("nested auth file should not populate hash cache")
+	}
+}
+
 func TestReloadClientsLogsConfigDiffs(t *testing.T) {
 	tmpDir := t.TempDir()
 	oldCfg := &config.Config{AuthDir: tmpDir, Port: 1, Debug: false}
@@ -939,6 +970,70 @@ func TestHandleEventIgnoresUnrelatedFiles(t *testing.T) {
 	w.handleEvent(fsnotify.Event{Name: filepath.Join(tmpDir, "note.txt"), Op: fsnotify.Write})
 	if atomic.LoadInt32(&reloads) != 0 {
 		t.Fatalf("expected no reloads for unrelated file, got %d", reloads)
+	}
+}
+
+func TestHandleEventIgnoresSiblingAuthDirPrefix(t *testing.T) {
+	tmpDir := t.TempDir()
+	authDir := filepath.Join(tmpDir, "auth")
+	if err := os.MkdirAll(authDir, 0o755); err != nil {
+		t.Fatalf("failed to create auth dir: %v", err)
+	}
+	siblingDir := filepath.Join(tmpDir, "auth-shadow")
+	if err := os.MkdirAll(siblingDir, 0o755); err != nil {
+		t.Fatalf("failed to create sibling auth dir: %v", err)
+	}
+	configPath := filepath.Join(tmpDir, "config.yaml")
+	if err := os.WriteFile(configPath, []byte("auth_dir: "+authDir+"\n"), 0o644); err != nil {
+		t.Fatalf("failed to write config file: %v", err)
+	}
+
+	w := &Watcher{
+		authDir:        authDir,
+		configPath:     configPath,
+		lastAuthHashes: make(map[string]string),
+	}
+	w.SetConfig(&config.Config{AuthDir: authDir})
+	defer w.stopPendingAuthWrites()
+
+	siblingAuthFile := filepath.Join(siblingDir, "a.json")
+	w.handleEvent(fsnotify.Event{Name: siblingAuthFile, Op: fsnotify.Write})
+
+	w.eventMu.Lock()
+	pending := len(w.pendingAuthWrites)
+	w.eventMu.Unlock()
+	if pending != 0 {
+		t.Fatalf("expected sibling auth-dir prefix path to be ignored, got %d pending writes", pending)
+	}
+}
+
+func TestHandleEventIgnoresNestedAuthSubdirJSON(t *testing.T) {
+	tmpDir := t.TempDir()
+	authDir := filepath.Join(tmpDir, "auth")
+	if err := os.MkdirAll(filepath.Join(authDir, "nested"), 0o755); err != nil {
+		t.Fatalf("failed to create nested auth dir: %v", err)
+	}
+	configPath := filepath.Join(tmpDir, "config.yaml")
+	if err := os.WriteFile(configPath, []byte("auth_dir: "+authDir+"\n"), 0o644); err != nil {
+		t.Fatalf("failed to write config file: %v", err)
+	}
+
+	w := &Watcher{
+		authDir:        authDir,
+		configPath:     configPath,
+		lastAuthHashes: make(map[string]string),
+	}
+	w.SetConfig(&config.Config{AuthDir: authDir})
+	defer w.stopPendingAuthWrites()
+
+	nestedAuthFile := filepath.Join(authDir, "nested", "a.json")
+	w.handleEvent(fsnotify.Event{Name: nestedAuthFile, Op: fsnotify.Write})
+
+	w.eventMu.Lock()
+	pending := len(w.pendingAuthWrites)
+	w.eventMu.Unlock()
+	if pending != 0 {
+		t.Fatalf("expected nested auth subdir json to be ignored, got %d pending writes", pending)
 	}
 }
 
@@ -1404,7 +1499,32 @@ func TestAddOrUpdateClientEdgeCases(t *testing.T) {
 	}
 }
 
-func TestLoadFileClientsWalkError(t *testing.T) {
+func TestLoadFileClientsIgnoresNestedSubdirectories(t *testing.T) {
+	tmpDir := t.TempDir()
+	topFile := filepath.Join(tmpDir, "top.json")
+	if err := os.WriteFile(topFile, []byte(`{"type":"demo"}`), 0o644); err != nil {
+		t.Fatalf("failed to write top-level auth file: %v", err)
+	}
+	nestedDir := filepath.Join(tmpDir, "nested")
+	if err := os.MkdirAll(nestedDir, 0o755); err != nil {
+		t.Fatalf("failed to create nested dir: %v", err)
+	}
+	nestedFile := filepath.Join(nestedDir, "nested.json")
+	if err := os.WriteFile(nestedFile, []byte(`{"type":"demo"}`), 0o644); err != nil {
+		t.Fatalf("failed to write nested auth file: %v", err)
+	}
+
+	cfg := &config.Config{AuthDir: tmpDir}
+	w := &Watcher{}
+	w.SetConfig(cfg)
+
+	count := w.loadFileClients(cfg)
+	if count != 1 {
+		t.Fatalf("expected only top-level auth file to be counted, got %d", count)
+	}
+}
+
+func TestLoadFileClientsIgnoresUnreadableNestedDir(t *testing.T) {
 	tmpDir := t.TempDir()
 	noAccessDir := filepath.Join(tmpDir, "0noaccess")
 	if err := os.MkdirAll(noAccessDir, 0o755); err != nil {
@@ -1421,7 +1541,7 @@ func TestLoadFileClientsWalkError(t *testing.T) {
 
 	count := w.loadFileClients(cfg)
 	if count != 0 {
-		t.Fatalf("expected count 0 due to walk error, got %d", count)
+		t.Fatalf("expected count 0 when only nested unreadable dir exists, got %d", count)
 	}
 }
 

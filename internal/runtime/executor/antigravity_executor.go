@@ -1093,10 +1093,17 @@ func (e *AntigravityExecutor) ensureAccessToken(ctx context.Context, auth *clipr
 			refreshCtx = context.WithValue(refreshCtx, "cliproxy.roundtripper", rt)
 		}
 	}
+	beforeRefreshToken := metaStringValue(auth.Metadata, "refresh_token")
 	updated, errRefresh := e.refreshToken(refreshCtx, auth.Clone())
 	if errRefresh != nil {
+		logWithRequestID(ctx).WithError(errRefresh).WithField("auth_id", strings.TrimSpace(auth.ID)).Warn("antigravity rt 交换失败")
 		return "", nil, errRefresh
 	}
+	afterRefreshToken := metaStringValue(updated.Metadata, "refresh_token")
+	logWithRequestID(ctx).WithFields(log.Fields{
+		"auth_id":    strings.TrimSpace(auth.ID),
+		"rt_rotated": beforeRefreshToken != "" && afterRefreshToken != "" && beforeRefreshToken != afterRefreshToken,
+	}).Info("antigravity rt 交换完成")
 	return metaStringValue(updated.Metadata, "access_token"), updated, nil
 }
 

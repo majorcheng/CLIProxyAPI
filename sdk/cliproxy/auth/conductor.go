@@ -3876,6 +3876,27 @@ func authHasRefreshToken(a *Auth) bool {
 	return strings.TrimSpace(refreshToken) != ""
 }
 
+// authRefreshTokenValue 返回 auth metadata 中当前 refresh_token 的规范化字符串。
+// 这里只用于日志审计时判断 RT 是否发生轮转，不会把 token 内容写入日志。
+func authRefreshTokenValue(a *Auth) string {
+	if a == nil || len(a.Metadata) == 0 {
+		return ""
+	}
+	refreshToken, _ := a.Metadata["refresh_token"].(string)
+	return strings.TrimSpace(refreshToken)
+}
+
+// authRefreshTokenRotated 判断一次 refresh 前后 refresh_token 是否真的发生了轮转。
+// 只有新旧 RT 都非空且值不同才认为轮转成功，避免把空值或缺失误判成“已轮转”。
+func authRefreshTokenRotated(before string, after string) bool {
+	before = strings.TrimSpace(before)
+	after = strings.TrimSpace(after)
+	if before == "" || after == "" {
+		return false
+	}
+	return before != after
+}
+
 // authCodexAccessTokenExpiry 尝试直接从 Codex access token 的 JWT `exp` 读取真实过期时间。
 // 解析失败时返回 false，让上层回退到 metadata 中的 `expired` / `last_refresh` 判定。
 func authCodexAccessTokenExpiry(a *Auth) (time.Time, bool) {
@@ -4142,6 +4163,8 @@ func (m *Manager) executeRefreshAuth(ctx context.Context, id string) (*Auth, err
 	}
 	cloned := auth.Clone()
 	initialRefreshPending := m.codexInitialRefreshOnLoadEnabled() && CodexInitialRefreshPending(cloned)
+	rtExchangeLogged := authHasRefreshToken(cloned)
+	beforeRefreshToken := authRefreshTokenValue(cloned)
 	updated, err := exec.Refresh(ctx, cloned)
 	if err != nil && errors.Is(err, context.Canceled) {
 		log.Debugf("refresh canceled for %s, %s", auth.Provider, auth.ID)
@@ -4150,6 +4173,9 @@ func (m *Manager) executeRefreshAuth(ctx context.Context, id string) (*Auth, err
 	log.Debugf("refreshed %s, %s, %v", auth.Provider, auth.ID, err)
 	now := time.Now()
 	if err != nil {
+		if rtExchangeLogged {
+			log.Warnf("auth manager: rt 交换失败: provider=%s auth=%s err=%v", strings.TrimSpace(auth.Provider), strings.TrimSpace(auth.ID), err)
+		}
 		refreshErr := &Error{Message: err.Error(), Code: errorCodeFromError(err)}
 		terminalStatus := terminalStatusCodeFromError(err)
 		if terminalStatus > 0 {
@@ -4190,6 +4216,14 @@ func (m *Manager) executeRefreshAuth(ctx context.Context, id string) (*Auth, err
 	}
 	if updated == nil {
 		updated = cloned
+	}
+	if rtExchangeLogged {
+		log.Infof(
+			"auth manager: rt 交换完成: provider=%s auth=%s rt_rotated=%t",
+			strings.TrimSpace(auth.Provider),
+			strings.TrimSpace(auth.ID),
+			authRefreshTokenRotated(beforeRefreshToken, authRefreshTokenValue(updated)),
+		)
 	}
 	// Preserve runtime created by the executor during Refresh.
 	// If executor didn't set one, fall back to the previous runtime.

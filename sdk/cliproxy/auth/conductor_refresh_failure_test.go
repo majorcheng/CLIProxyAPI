@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"net/http"
@@ -13,6 +14,7 @@ import (
 	internalconfig "github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
+	log "github.com/sirupsen/logrus"
 )
 
 type refreshFailureTestExecutor struct {
@@ -93,6 +95,30 @@ func (s *codexRefreshRecordingStore) snapshot() []*Auth {
 	out := make([]*Auth, len(s.saves))
 	copy(out, s.saves)
 	return out
+}
+
+func captureStandardLogger(t *testing.T) *bytes.Buffer {
+	t.Helper()
+	logger := log.StandardLogger()
+	originalOutput := logger.Out
+	originalLevel := logger.Level
+	originalFormatter := logger.Formatter
+
+	var buf bytes.Buffer
+	logger.SetOutput(&buf)
+	logger.SetLevel(log.InfoLevel)
+	logger.SetFormatter(&log.TextFormatter{
+		DisableTimestamp: true,
+		DisableColors:    true,
+	})
+
+	t.Cleanup(func() {
+		logger.SetOutput(originalOutput)
+		logger.SetLevel(originalLevel)
+		logger.SetFormatter(originalFormatter)
+	})
+
+	return &buf
 }
 
 func TestManagerRefreshAuth_PersistsTerminalRefresh401ForMaintenance(t *testing.T) {
@@ -230,6 +256,79 @@ func TestManagerRefreshAuth_DoesNotMarkTransientRefreshStatusForMaintenance(t *t
 	}
 	if got := len(store.snapshot()); got != 1 {
 		t.Fatalf("expected transient failure not to enqueue extra persistence, got %d saves", got)
+	}
+}
+
+func TestManagerRefreshAuthNow_LogsRTExchangeSuccess(t *testing.T) {
+	ctx := context.Background()
+	logBuf := captureStandardLogger(t)
+
+	manager := NewManager(nil, nil, nil)
+	manager.RegisterExecutor(refreshFailureTestExecutor{
+		provider: "codex",
+		after: func(auth *Auth) {
+			if auth == nil {
+				return
+			}
+			if auth.Metadata == nil {
+				auth.Metadata = make(map[string]any)
+			}
+			auth.Metadata["refresh_token"] = "rotated-refresh-token"
+			auth.Metadata["access_token"] = "new-access-token"
+		},
+	})
+
+	auth := &Auth{
+		ID:       "refresh-log-success",
+		Provider: "codex",
+		Status:   StatusActive,
+		Metadata: map[string]any{
+			"refresh_token": "old-refresh-token",
+		},
+	}
+	if _, err := manager.Register(ctx, auth); err != nil {
+		t.Fatalf("register auth: %v", err)
+	}
+
+	if _, err := manager.RefreshAuthNow(ctx, auth.ID); err != nil {
+		t.Fatalf("RefreshAuthNow error: %v", err)
+	}
+
+	logText := logBuf.String()
+	if !strings.Contains(logText, "auth manager: rt 交换完成: provider=codex auth=refresh-log-success rt_rotated=true") {
+		t.Fatalf("expected rt exchange success log, got %q", logText)
+	}
+}
+
+func TestManagerRefreshAuthNow_LogsRTExchangeFailure(t *testing.T) {
+	ctx := context.Background()
+	logBuf := captureStandardLogger(t)
+
+	manager := NewManager(nil, nil, nil)
+	manager.RegisterExecutor(refreshFailureTestExecutor{
+		provider: "codex",
+		err:      errors.New("refresh boom"),
+	})
+
+	auth := &Auth{
+		ID:       "refresh-log-failure",
+		Provider: "codex",
+		Status:   StatusActive,
+		Metadata: map[string]any{
+			"refresh_token": "old-refresh-token",
+		},
+	}
+	if _, err := manager.Register(ctx, auth); err != nil {
+		t.Fatalf("register auth: %v", err)
+	}
+
+	if _, err := manager.RefreshAuthNow(ctx, auth.ID); err == nil {
+		t.Fatal("expected RefreshAuthNow to return refresh failure")
+	}
+
+	logText := logBuf.String()
+	if !strings.Contains(logText, "auth manager: rt 交换失败: provider=codex auth=refresh-log-failure err=refresh boom") {
+		t.Fatalf("expected rt exchange failure log, got %q", logText)
 	}
 }
 

@@ -188,6 +188,7 @@ type Manager struct {
 
 	// Auto refresh state
 	refreshCancel    context.CancelFunc
+	refreshLoop      *authAutoRefreshLoop
 	refreshSemaphore chan struct{}
 	// refreshInFlight 记录当前正在执行 refresh 的 auth，避免同一 RT 被并发使用。
 	refreshInFlightMu sync.Mutex
@@ -1251,6 +1252,7 @@ func (m *Manager) Register(ctx context.Context, auth *Auth) (*Auth, error) {
 	if m.scheduler != nil {
 		m.scheduler.upsertAuth(schedulerSnapshot)
 	}
+	m.queueRefreshReschedule(auth.ID)
 	if errPersist := m.persist(ctx, auth); errPersist != nil {
 		log.WithError(errPersist).Warnf("auth manager: 持久化认证 %s 失败", strings.TrimSpace(auth.ID))
 	}
@@ -1294,6 +1296,7 @@ func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
 	if m.scheduler != nil {
 		m.scheduler.upsertAuth(schedulerSnapshot)
 	}
+	m.queueRefreshReschedule(auth.ID)
 	if errPersist := m.persist(ctx, auth); errPersist != nil {
 		log.WithError(errPersist).Warnf("auth manager: 持久化认证 %s 失败", strings.TrimSpace(auth.ID))
 	}
@@ -3616,25 +3619,30 @@ func (m *Manager) StartAutoRefresh(parent context.Context, interval time.Duratio
 	if interval <= 0 {
 		interval = refreshCheckInterval
 	}
-	if m.refreshCancel != nil {
-		m.refreshCancel()
-		m.refreshCancel = nil
+
+	m.mu.Lock()
+	cancelPrev := m.refreshCancel
+	m.refreshCancel = nil
+	m.refreshLoop = nil
+	m.mu.Unlock()
+	if cancelPrev != nil {
+		cancelPrev()
 	}
-	ctx, cancel := context.WithCancel(parent)
-	m.refreshCancel = cancel
-	go func() {
-		ticker := time.NewTicker(interval)
-		defer ticker.Stop()
-		m.checkRefreshes(ctx)
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				m.checkRefreshes(ctx)
-			}
-		}
-	}()
+
+	ctx, cancelCtx := context.WithCancel(parent)
+	workers := refreshMaxConcurrency
+	if cfg, ok := m.runtimeConfig.Load().(*internalconfig.Config); ok && cfg != nil && cfg.AuthAutoRefreshWorkers > 0 {
+		workers = cfg.AuthAutoRefreshWorkers
+	}
+	loop := newAuthAutoRefreshLoop(m, interval, workers)
+
+	m.mu.Lock()
+	m.refreshCancel = cancelCtx
+	m.refreshLoop = loop
+	m.mu.Unlock()
+
+	loop.rebuild(time.Now())
+	go loop.run(ctx)
 }
 
 // TriggerCodexInitialRefreshOnLoadIfNeeded 只会在 auth metadata 仍带有
@@ -3673,10 +3681,27 @@ func (m *Manager) RefreshAuthNow(ctx context.Context, id string) (*Auth, error) 
 
 // StopAutoRefresh cancels the background refresh loop, if running.
 func (m *Manager) StopAutoRefresh() {
-	if m.refreshCancel != nil {
-		m.refreshCancel()
-		m.refreshCancel = nil
+	m.mu.Lock()
+	cancel := m.refreshCancel
+	m.refreshCancel = nil
+	m.refreshLoop = nil
+	m.mu.Unlock()
+	if cancel != nil {
+		cancel()
 	}
+}
+
+func (m *Manager) queueRefreshReschedule(authID string) {
+	if m == nil || authID == "" {
+		return
+	}
+	m.mu.RLock()
+	loop := m.refreshLoop
+	m.mu.RUnlock()
+	if loop == nil {
+		return
+	}
+	loop.queueReschedule(authID)
 }
 
 func (m *Manager) checkRefreshes(ctx context.Context) {
@@ -4021,37 +4046,45 @@ func lookupMetadataTime(meta map[string]any, keys ...string) (time.Time, bool) {
 
 func (m *Manager) markRefreshPending(id string, now time.Time) bool {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	auth, ok := m.auths[id]
 	if !ok || auth == nil || auth.Disabled {
+		m.mu.Unlock()
 		return false
 	}
 	if !auth.NextRefreshAfter.IsZero() && now.Before(auth.NextRefreshAfter) {
+		m.mu.Unlock()
 		return false
 	}
 	auth.NextRefreshAfter = now.Add(refreshPendingBackoff)
 	m.auths[id] = auth
+	m.mu.Unlock()
+	m.queueRefreshReschedule(id)
 	return true
 }
 
 func (m *Manager) markCodexInitialRefreshPending(id string, now time.Time) bool {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	auth, ok := m.auths[id]
 	if !ok || auth == nil || auth.Disabled {
+		m.mu.Unlock()
 		return false
 	}
 	if !m.codexInitialRefreshOnLoadEnabled() || !strings.EqualFold(strings.TrimSpace(auth.Provider), "codex") {
+		m.mu.Unlock()
 		return false
 	}
 	if !CodexInitialRefreshPending(auth) {
+		m.mu.Unlock()
 		return false
 	}
 	if !auth.NextRefreshAfter.IsZero() && now.Before(auth.NextRefreshAfter) {
+		m.mu.Unlock()
 		return false
 	}
 	auth.NextRefreshAfter = now.Add(refreshPendingBackoff)
 	m.auths[id] = auth
+	m.mu.Unlock()
+	m.queueRefreshReschedule(id)
 	return true
 }
 
@@ -4139,6 +4172,7 @@ func (m *Manager) executeRefreshAuth(ctx context.Context, id string) (*Auth, err
 			}
 		}
 		m.mu.Unlock()
+		m.queueRefreshReschedule(id)
 		if persistSnapshot != nil {
 			m.enqueuePersist(persistSnapshot)
 		}

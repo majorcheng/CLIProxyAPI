@@ -151,6 +151,195 @@ func TestConvertClaudeRequestToAntigravity_ThinkingBlockWithoutSignature(t *test
 	}
 }
 
+func TestConvertClaudeRequestToAntigravity_DropsRedactedThinkingBlocks(t *testing.T) {
+	cache.ClearSignatureCache("")
+	rawSignature := "abc123validSignature1234567890123456789012345678901234567890"
+	clientSignature := "claude#" + rawSignature
+
+	inputJSON := []byte(`{
+		"model": "claude-opus-4-6",
+		"messages": [
+			{
+				"role": "user",
+				"content": [{"type": "text", "text": "Hello"}]
+			},
+			{
+				"role": "assistant",
+				"content": [
+					{"type": "thinking", "thinking": "", "signature": "` + clientSignature + `"},
+					{"type": "text", "text": "I can help with that."}
+				]
+			},
+			{
+				"role": "user",
+				"content": [{"type": "text", "text": "Follow up question"}]
+			}
+		],
+		"thinking": {"type": "enabled", "budget_tokens": 10000}
+	}`)
+
+	output := ConvertClaudeRequestToAntigravity("claude-opus-4-6", inputJSON, false)
+	assistantParts := gjson.GetBytes(output, "request.contents.1.parts").Array()
+	if len(assistantParts) != 1 {
+		t.Fatalf("Expected 1 part (redacted thinking dropped), got %d: %s",
+			len(assistantParts), gjson.GetBytes(output, "request.contents.1.parts").Raw)
+	}
+	if assistantParts[0].Get("thought").Bool() {
+		t.Fatal("Redacted thinking block with empty text should be dropped")
+	}
+	if assistantParts[0].Get("text").String() != "I can help with that." {
+		t.Fatalf("Expected text part preserved, got: %s", assistantParts[0].Raw)
+	}
+}
+
+func TestConvertClaudeRequestToAntigravity_DropsWrappedRedactedThinking(t *testing.T) {
+	cache.ClearSignatureCache("")
+	rawSignature := "abc123validSignature1234567890123456789012345678901234567890"
+	clientSignature := "claude#" + rawSignature
+
+	inputJSON := []byte(`{
+		"model": "claude-sonnet-4-6",
+		"messages": [
+			{
+				"role": "user",
+				"content": [{"type": "text", "text": "Test user message"}]
+			},
+			{
+				"role": "assistant",
+				"content": [
+					{"type": "thinking", "thinking": {"cache_control": {"type": "ephemeral"}}, "signature": "` + clientSignature + `"},
+					{"type": "text", "text": "Answer"}
+				]
+			},
+			{
+				"role": "user",
+				"content": [{"type": "text", "text": "Follow up"}]
+			}
+		],
+		"thinking": {"type": "enabled", "budget_tokens": 8000}
+	}`)
+
+	output := ConvertClaudeRequestToAntigravity("claude-sonnet-4-6", inputJSON, false)
+	assistantParts := gjson.GetBytes(output, "request.contents.1.parts").Array()
+	if len(assistantParts) != 1 {
+		t.Fatalf("Expected 1 part (wrapped redacted thinking dropped), got %d: %s",
+			len(assistantParts), gjson.GetBytes(output, "request.contents.1.parts").Raw)
+	}
+	if assistantParts[0].Get("text").String() != "Answer" {
+		t.Fatalf("Expected text part preserved, got: %s", assistantParts[0].Raw)
+	}
+}
+
+func TestConvertClaudeRequestToAntigravity_KeepsNonEmptyThinking(t *testing.T) {
+	cache.ClearSignatureCache("")
+	rawSignature := "abc123validSignature1234567890123456789012345678901234567890"
+	clientSignature := "claude#" + rawSignature
+
+	inputJSON := []byte(`{
+		"model": "claude-opus-4-6",
+		"messages": [
+			{
+				"role": "user",
+				"content": [{"type": "text", "text": "Hello"}]
+			},
+			{
+				"role": "assistant",
+				"content": [
+					{"type": "thinking", "thinking": "Let me reason about this carefully...", "signature": "` + clientSignature + `"},
+					{"type": "text", "text": "Here is my answer."}
+				]
+			}
+		],
+		"thinking": {"type": "enabled", "budget_tokens": 10000}
+	}`)
+
+	output := ConvertClaudeRequestToAntigravity("claude-opus-4-6", inputJSON, false)
+	assistantParts := gjson.GetBytes(output, "request.contents.1.parts").Array()
+	if len(assistantParts) != 2 {
+		t.Fatalf("Expected 2 parts (thinking + text), got %d", len(assistantParts))
+	}
+	if !assistantParts[0].Get("thought").Bool() {
+		t.Fatal("First part should be a thought block")
+	}
+	if assistantParts[0].Get("text").String() != "Let me reason about this carefully..." {
+		t.Fatalf("Thinking text mismatch, got: %s", assistantParts[0].Get("text").String())
+	}
+	if assistantParts[1].Get("text").String() != "Here is my answer." {
+		t.Fatalf("Text part mismatch, got: %s", assistantParts[1].Raw)
+	}
+}
+
+func TestConvertClaudeRequestToAntigravity_MultiTurnRedactedThinking(t *testing.T) {
+	cache.ClearSignatureCache("")
+	rawSignature := "abc123validSignature1234567890123456789012345678901234567890"
+	clientSignature := "claude#" + rawSignature
+
+	inputJSON := []byte(`{
+		"model": "claude-opus-4-6",
+		"messages": [
+			{"role": "user", "content": [{"type": "text", "text": "First question"}]},
+			{
+				"role": "assistant",
+				"content": [
+					{"type": "thinking", "thinking": "", "signature": "` + clientSignature + `"},
+					{"type": "text", "text": "First answer"},
+					{"type": "tool_use", "id": "Bash-123-456", "name": "Bash", "input": {"command": "ls"}}
+				]
+			},
+			{
+				"role": "user",
+				"content": [
+					{"type": "tool_result", "tool_use_id": "Bash-123-456", "content": "file1.txt\nfile2.txt"}
+				]
+			},
+			{
+				"role": "assistant",
+				"content": [
+					{"type": "thinking", "thinking": "", "signature": "` + clientSignature + `"},
+					{"type": "text", "text": "Here are the files."}
+				]
+			},
+			{"role": "user", "content": [{"type": "text", "text": "Thanks"}]}
+		],
+		"thinking": {"type": "enabled", "budget_tokens": 10000}
+	}`)
+
+	output := ConvertClaudeRequestToAntigravity("claude-opus-4-6", inputJSON, false)
+	if !gjson.ValidBytes(output) {
+		t.Fatalf("Output is not valid JSON: %s", string(output))
+	}
+
+	firstAssistantParts := gjson.GetBytes(output, "request.contents.1.parts").Array()
+	for _, p := range firstAssistantParts {
+		if p.Get("thought").Bool() {
+			t.Fatal("Redacted thinking should be dropped from first assistant message")
+		}
+	}
+	hasText := false
+	hasFC := false
+	for _, p := range firstAssistantParts {
+		if p.Get("text").String() == "First answer" {
+			hasText = true
+		}
+		if p.Get("functionCall").Exists() {
+			hasFC = true
+		}
+	}
+	if !hasText || !hasFC {
+		t.Fatalf("First assistant message should retain text and tool call, got: %s",
+			gjson.GetBytes(output, "request.contents.1.parts").Raw)
+	}
+
+	secondAssistantParts := gjson.GetBytes(output, "request.contents.3.parts").Array()
+	if len(secondAssistantParts) != 1 {
+		t.Fatalf("Expected second assistant message to keep only text, got %d: %s",
+			len(secondAssistantParts), gjson.GetBytes(output, "request.contents.3.parts").Raw)
+	}
+	if secondAssistantParts[0].Get("text").String() != "Here are the files." {
+		t.Fatalf("Second assistant text mismatch, got: %s", secondAssistantParts[0].Raw)
+	}
+}
+
 func TestConvertClaudeRequestToAntigravity_ToolDeclarations(t *testing.T) {
 	inputJSON := []byte(`{
 		"model": "claude-3-5-sonnet-20240620",

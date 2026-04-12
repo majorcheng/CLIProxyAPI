@@ -1250,17 +1250,49 @@ func (e *AntigravityExecutor) buildRequest(ctx context.Context, auth *cliproxyau
 	payload, _ = sjson.SetBytes(payload, "model", modelName)
 
 	useAntigravitySchema := strings.Contains(modelName, "claude") || strings.Contains(modelName, "gemini-3-pro") || strings.Contains(modelName, "gemini-3.1-pro")
-	payloadStr := string(payload)
-	paths := make([]string, 0)
-	util.Walk(gjson.Parse(payloadStr), "", "parametersJsonSchema", &paths)
-	for _, p := range paths {
-		payloadStr, _ = util.RenameKey(payloadStr, p, p[:len(p)-len("parametersJsonSchema")]+"parameters")
-	}
+	var (
+		bodyReader io.Reader
+		payloadLog []byte
+	)
 
-	if useAntigravitySchema {
-		payloadStr = util.CleanJSONSchemaForAntigravity(payloadStr)
+	// 只有请求里真的带了 tools / response schema 时，才走整包 schema 清洗。
+	// 这样可以避免无工具请求也被整段 JSON 改写，减少不必要的放大与字段误清洗。
+	if antigravityRequestNeedsSchemaSanitization(payload) {
+		payloadStr := string(payload)
+		paths := make([]string, 0)
+		util.Walk(gjson.Parse(payloadStr), "", "parametersJsonSchema", &paths)
+		for _, p := range paths {
+			payloadStr, _ = util.RenameKey(payloadStr, p, p[:len(p)-len("parametersJsonSchema")]+"parameters")
+		}
+
+		if useAntigravitySchema {
+			payloadStr = util.CleanJSONSchemaForAntigravity(payloadStr)
+		} else {
+			payloadStr = util.CleanJSONSchemaForGemini(payloadStr)
+		}
+
+		if strings.Contains(modelName, "claude") {
+			updated, _ := sjson.SetBytes([]byte(payloadStr), "request.toolConfig.functionCallingConfig.mode", "VALIDATED")
+			payloadStr = string(updated)
+		} else {
+			payloadStr, _ = sjson.Delete(payloadStr, "request.generationConfig.maxOutputTokens")
+		}
+
+		bodyReader = strings.NewReader(payloadStr)
+		if e.cfg != nil && e.cfg.RequestLog {
+			payloadLog = []byte(payloadStr)
+		}
 	} else {
-		payloadStr = util.CleanJSONSchemaForGemini(payloadStr)
+		if strings.Contains(modelName, "claude") {
+			payload, _ = sjson.SetBytes(payload, "request.toolConfig.functionCallingConfig.mode", "VALIDATED")
+		} else {
+			payload, _ = sjson.DeleteBytes(payload, "request.generationConfig.maxOutputTokens")
+		}
+
+		bodyReader = bytes.NewReader(payload)
+		if e.cfg != nil && e.cfg.RequestLog {
+			payloadLog = append([]byte(nil), payload...)
+		}
 	}
 
 	// if useAntigravitySchema {
@@ -1276,13 +1308,7 @@ func (e *AntigravityExecutor) buildRequest(ctx context.Context, auth *cliproxyau
 	// 	}
 	// }
 
-	if strings.Contains(modelName, "claude") {
-		payloadStr, _ = sjson.Set(payloadStr, "request.toolConfig.functionCallingConfig.mode", "VALIDATED")
-	} else {
-		payloadStr, _ = sjson.Delete(payloadStr, "request.generationConfig.maxOutputTokens")
-	}
-
-	httpReq, errReq := http.NewRequestWithContext(ctx, http.MethodPost, requestURL.String(), strings.NewReader(payloadStr))
+	httpReq, errReq := http.NewRequestWithContext(ctx, http.MethodPost, requestURL.String(), bodyReader)
 	if errReq != nil {
 		return nil, errReq
 	}
@@ -1300,10 +1326,6 @@ func (e *AntigravityExecutor) buildRequest(ctx context.Context, auth *cliproxyau
 		authLabel = auth.Label
 		authType, authValue = auth.AccountInfo()
 	}
-	var payloadLog []byte
-	if e.cfg != nil && e.cfg.RequestLog {
-		payloadLog = []byte(payloadStr)
-	}
 	recordAPIRequest(ctx, e.cfg, upstreamRequestLog{
 		URL:       requestURL.String(),
 		Method:    http.MethodPost,
@@ -1317,6 +1339,21 @@ func (e *AntigravityExecutor) buildRequest(ctx context.Context, auth *cliproxyau
 	})
 
 	return httpReq, nil
+}
+
+// antigravityRequestNeedsSchemaSanitization 判断当前请求是否真的包含
+// 需要重写/清洗的 schema 结构；无工具请求应尽量走原样透传。
+func antigravityRequestNeedsSchemaSanitization(payload []byte) bool {
+	if gjson.GetBytes(payload, "request.tools.0").Exists() {
+		return true
+	}
+	if gjson.GetBytes(payload, "request.generationConfig.responseJsonSchema").Exists() {
+		return true
+	}
+	if gjson.GetBytes(payload, "request.generationConfig.responseSchema").Exists() {
+		return true
+	}
+	return false
 }
 
 func tokenExpiry(metadata map[string]any) time.Time {

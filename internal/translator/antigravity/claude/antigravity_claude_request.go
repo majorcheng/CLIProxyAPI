@@ -147,7 +147,14 @@ func ConvertClaudeRequestToAntigravity(modelName string, inputRawJSON []byte, _ 
 							continue
 						}
 
-						// Google requires the text field even for redacted thinking.
+						// 对空文本 redacted thinking 直接跳过。
+						// Antigravity 会把这类块包成不完整结构，最终触发
+						// `messages.N.content.0.thinking.thinking: Field required` 之类的 400。
+						if thinkingText == "" {
+							continue
+						}
+
+						// 对有内容的 thinking，仍保持显式 text 字段。
 						partJSON := `{}`
 						partJSON, _ = sjson.Set(partJSON, "thought", true)
 						partJSON, _ = sjson.Set(partJSON, "text", thinkingText)

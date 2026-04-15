@@ -1524,6 +1524,11 @@ func authEligibleForMaintenanceDelete(auth *coreauth.Auth, result *coreauth.Resu
 	if auth.Disabled || auth.Status == coreauth.StatusDisabled {
 		return "", false
 	}
+	// 对 Codex 来说，RT refresh 导致的 401 在没有任何 429/额度痕迹时不应被当作可删除的 401。
+	// 这里同时覆盖“原始 refresh 401 文本”与“已归一成 terminal refresh error code 的 401”。
+	if authMaintenanceShouldProtectCodexRefresh401(auth, result, cfg) {
+		return "", false
+	}
 	if reason, ok := authMaintenanceCodexTerminalDeleteReason(auth, result); ok {
 		return reason, true
 	}
@@ -1547,6 +1552,22 @@ func authEligibleForMaintenanceDelete(auth *coreauth.Auth, result *coreauth.Resu
 	return "", false
 }
 
+func authMaintenanceShouldProtectCodexRefresh401(auth *coreauth.Auth, result *coreauth.Result, cfg config.AuthMaintenanceConfig) bool {
+	if !cfg.Refresh401Requires429 || auth == nil {
+		return false
+	}
+	if !strings.EqualFold(strings.TrimSpace(auth.Provider), "codex") {
+		return false
+	}
+	if authMaintenanceHasQuota429(auth, result) {
+		return false
+	}
+	if authMaintenanceCodexTerminalRefresh401(auth, result) {
+		return true
+	}
+	return authMaintenanceRefreshUnauthorized(auth, result)
+}
+
 // authMaintenanceCodexTerminalDeleteReason 只为 Codex 识别“已经走完恢复链且不可挽回”的删除原因。
 func authMaintenanceCodexTerminalDeleteReason(auth *coreauth.Auth, result *coreauth.Result) (string, bool) {
 	if auth == nil || !strings.EqualFold(strings.TrimSpace(auth.Provider), "codex") {
@@ -1566,6 +1587,18 @@ func authMaintenanceCodexTerminalDeleteReason(auth *coreauth.Auth, result *corea
 		return "terminal_request_401_after_recovery", true
 	default:
 		return "", false
+	}
+}
+
+func authMaintenanceCodexTerminalRefresh401(auth *coreauth.Auth, result *coreauth.Result) bool {
+	switch authMaintenanceTerminalErrorCode(auth, result) {
+	case codexauth.RefreshTokenExpiredErrorCode,
+		codexauth.RefreshTokenReusedErrorCode,
+		codexauth.RefreshTokenRevokedErrorCode,
+		codexauth.RefreshUnauthorizedErrorCode:
+		return true
+	default:
+		return false
 	}
 }
 

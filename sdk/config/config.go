@@ -10,7 +10,9 @@ type SDKConfig = internalconfig.SDKConfig
 
 type Config = internalconfig.Config
 
+type APIKeyList = internalconfig.APIKeyList
 type StreamingConfig = internalconfig.StreamingConfig
+type ClientAPIKey = internalconfig.ClientAPIKey
 type TLSConfig = internalconfig.TLSConfig
 type RemoteManagement = internalconfig.RemoteManagement
 type AuthMaintenanceConfig = internalconfig.AuthMaintenanceConfig
@@ -52,6 +54,37 @@ func SaveConfigPreserveCommentsUpdateNestedScalar(configFile string, path []stri
 
 func NormalizeCommentIndentation(data []byte) []byte {
 	return internalconfig.NormalizeCommentIndentation(data)
+}
+
+func NormalizeClientAPIKeys(entries []ClientAPIKey) []ClientAPIKey {
+	return internalconfig.NormalizeClientAPIKeys(entries)
+}
+
+func FindClientAPIKey(entries []ClientAPIKey, key string) (ClientAPIKey, bool) {
+	return internalconfig.FindClientAPIKey(entries, key)
+}
+
+func ClientAPIKeyValues(entries []ClientAPIKey) []string {
+	return internalconfig.ClientAPIKeyValues(entries)
+}
+
+func ClientAPIKeyValuesFromConfig(cfg *SDKConfig) []string {
+	return internalconfig.ClientAPIKeyValuesFromConfig(cfg)
+}
+
+func FindClientAPIKeyInConfig(cfg *SDKConfig, key string) (ClientAPIKey, bool) {
+	return internalconfig.FindClientAPIKeyInConfig(cfg, key)
+}
+
+func ClientAPIKeysFromStrings(keys []string) []ClientAPIKey {
+	return internalconfig.ClientAPIKeysFromStrings(keys)
+}
+
+func SetClientAPIKeyEntries(cfg *SDKConfig, entries []ClientAPIKey) {
+	if cfg == nil {
+		return
+	}
+	cfg.SetClientAPIKeyEntries(entries)
 }
 
 func NormalizeOpenAICompatName(name string) (trimmed string, normalized string, err error) {

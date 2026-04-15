@@ -190,8 +190,7 @@ func TestBuildConfigChangeDetails_NilSafe(t *testing.T) {
 func TestBuildConfigChangeDetails_SecretsAndCounts(t *testing.T) {
 	oldCfg := &config.Config{
 		SDKConfig: sdkconfig.SDKConfig{
-			APIKeys:                     []string{"a"},
-			PriorityZeroDisabledAPIKeys: []string{"a"},
+			APIKeys: []string{"a"},
 		},
 		AmpCode: config.AmpCode{
 			UpstreamAPIKey: "",
@@ -202,8 +201,7 @@ func TestBuildConfigChangeDetails_SecretsAndCounts(t *testing.T) {
 	}
 	newCfg := &config.Config{
 		SDKConfig: sdkconfig.SDKConfig{
-			APIKeys:                     []string{"a", "b", "c"},
-			PriorityZeroDisabledAPIKeys: []string{"a", "b"},
+			APIKeys: []string{"a", "b", "c"},
 		},
 		AmpCode: config.AmpCode{
 			UpstreamAPIKey: "new-key",
@@ -212,28 +210,31 @@ func TestBuildConfigChangeDetails_SecretsAndCounts(t *testing.T) {
 			SecretKey: "new-secret",
 		},
 	}
+	oldCfg.SetClientAPIKeyEntries(sdkconfig.ClientAPIKeysFromStrings([]string{"a"}))
+	newCfg.SetClientAPIKeyEntries(sdkconfig.ClientAPIKeysFromStrings([]string{"a", "b", "c"}))
 
 	details := BuildConfigChangeDetails(oldCfg, newCfg)
 	expectContains(t, details, "api-keys count: 1 -> 3")
-	expectContains(t, details, "priority-zero-disabled-api-keys count: 1 -> 2")
 	expectContains(t, details, "ampcode.upstream-api-key: added")
 	expectContains(t, details, "remote-management.secret-key: created")
 }
 
-func TestBuildConfigChangeDetails_PriorityZeroDisabledAPIKeysRedacted(t *testing.T) {
+func TestBuildConfigChangeDetails_APIKeysRedactedWhenMaxPriorityChanges(t *testing.T) {
 	oldCfg := &config.Config{
 		SDKConfig: sdkconfig.SDKConfig{
-			PriorityZeroDisabledAPIKeys: []string{"a", "b"},
+			APIKeys: []string{"a", "b"},
 		},
 	}
 	newCfg := &config.Config{
 		SDKConfig: sdkconfig.SDKConfig{
-			PriorityZeroDisabledAPIKeys: []string{"a", "c"},
+			APIKeys: []string{"a", "b"},
 		},
 	}
+	oldCfg.SetClientAPIKeyEntries([]sdkconfig.ClientAPIKey{{Key: "a"}, {Key: "b", MaxPriority: intPtr(0)}})
+	newCfg.SetClientAPIKeyEntries([]sdkconfig.ClientAPIKey{{Key: "a"}, {Key: "b", MaxPriority: intPtr(1)}})
 
 	details := BuildConfigChangeDetails(oldCfg, newCfg)
-	expectContains(t, details, "priority-zero-disabled-api-keys: values updated (count unchanged, redacted)")
+	expectContains(t, details, "api-keys: values updated (count unchanged, redacted)")
 }
 
 func TestBuildConfigChangeDetails_PriorityZeroRoutingStrategy(t *testing.T) {
@@ -317,11 +318,13 @@ func TestBuildConfigChangeDetails_FlagsAndKeys(t *testing.T) {
 		SDKConfig: sdkconfig.SDKConfig{
 			RequestLog:                 true,
 			ProxyURL:                   "http://new-proxy",
-			APIKeys:                    []string{" key-1 ", "key-2"},
+			APIKeys:                    []string{"key-1", "key-2"},
 			ForceModelPrefix:           true,
 			NonStreamKeepAliveInterval: 5,
 		},
 	}
+	oldCfg.SetClientAPIKeyEntries([]sdkconfig.ClientAPIKey{{Key: "key-1"}})
+	newCfg.SetClientAPIKeyEntries([]sdkconfig.ClientAPIKey{{Key: " key-1 "}, {Key: "key-2"}})
 
 	details := BuildConfigChangeDetails(oldCfg, newCfg)
 	expectContains(t, details, "debug: false -> true")
@@ -393,7 +396,7 @@ func TestBuildConfigChangeDetails_AllBranches(t *testing.T) {
 		SDKConfig: sdkconfig.SDKConfig{
 			RequestLog: false,
 			ProxyURL:   "http://old-proxy",
-			APIKeys:    []string{" keyA "},
+			APIKeys:    []string{"keyA"},
 		},
 		OAuthExcludedModels: map[string][]string{"p1": {"a"}},
 		OpenAICompatibility: []config.OpenAICompatibility{
@@ -465,6 +468,8 @@ func TestBuildConfigChangeDetails_AllBranches(t *testing.T) {
 			},
 		},
 	}
+	oldCfg.SetClientAPIKeyEntries([]sdkconfig.ClientAPIKey{{Key: " keyA "}})
+	newCfg.SetClientAPIKeyEntries([]sdkconfig.ClientAPIKey{{Key: "keyB"}})
 
 	changes := BuildConfigChangeDetails(oldCfg, newCfg)
 	expectContains(t, changes, "port: 1 -> 2")
@@ -515,6 +520,8 @@ func TestBuildConfigChangeDetails_AllBranches(t *testing.T) {
 	expectContains(t, changes, "remote-management.secret-key: deleted")
 	expectContains(t, changes, "openai-compatibility:")
 }
+
+func intPtr(v int) *int { return &v }
 
 func TestFormatProxyURL(t *testing.T) {
 	tests := []struct {

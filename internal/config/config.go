@@ -237,7 +237,8 @@ type AuthMaintenanceConfig struct {
 	// so QuotaStrikeThreshold does not delay that path.
 	DeleteStatusCodes []int `yaml:"delete-status-codes" json:"delete-status-codes"`
 	// Refresh401Requires429 控制“refresh RT 失败导致的 401”是否需要额外命中 429 才允许删除。
-	// 设为 true 时，这类 refresh 401 不会直接按 401 删除，只有已经具备 429/额度状态时才会进入删除队列。
+	// 设为 true 时，这类 refresh 401（包括已归一成 Codex terminal refresh error code 的终态失败）
+	// 不会直接按 401 删除，只有已经具备 429/额度状态时才会进入删除队列。
 	Refresh401Requires429 bool `yaml:"refresh-401-requires-429" json:"refresh-401-requires-429"`
 	// DeleteQuotaExceeded enables a second delete path for auths that repeatedly hit quota limits.
 	// This is most useful when 429 is not included in DeleteStatusCodes.
@@ -670,6 +671,14 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 		}
 		return nil, fmt.Errorf("failed to parse config file: %w", err)
 	}
+	if err = ValidateNoDeprecatedAPIKeyRoutingField(data); err != nil {
+		return nil, err
+	}
+	if entries, errDecode := DecodeClientAPIKeyEntriesFromYAML(data); errDecode != nil {
+		return nil, fmt.Errorf("failed to decode api-keys entries: %w", errDecode)
+	} else {
+		cfg.SetClientAPIKeyEntries(entries)
+	}
 
 	// NOTE: Startup legacy key migration is intentionally disabled.
 	// Reason: avoid mutating config.yaml during server startup.
@@ -791,8 +800,8 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	// Normalize global OAuth model name aliases.
 	cfg.SanitizeOAuthModelAlias()
 
-	// 规范化“禁止命中 priority=0”的 client api-key 列表。
-	cfg.SanitizePriorityZeroDisabledAPIKeys()
+	// 规范化顶层 client api-key 列表，统一收口 key 与可选 max-priority。
+	cfg.SanitizeClientAPIKeys()
 
 	// Validate raw payload rules and drop invalid entries.
 	cfg.SanitizePayloadRules()
@@ -850,13 +859,13 @@ func normalizePriorityZeroRoutingStrategy(strategy string) string {
 	}
 }
 
-// SanitizePriorityZeroDisabledAPIKeys 负责清理“禁止命中 priority=0”的
-// client api-key 列表，统一做 trim 与去重。
-func (cfg *Config) SanitizePriorityZeroDisabledAPIKeys() {
+// SanitizeClientAPIKeys 负责清理顶层 client api-key 配置，统一做 trim、
+// 去空，并在重复时保留首个配置。
+func (cfg *Config) SanitizeClientAPIKeys() {
 	if cfg == nil {
 		return
 	}
-	cfg.PriorityZeroDisabledAPIKeys = normalizeUniqueTrimmedStrings(cfg.PriorityZeroDisabledAPIKeys)
+	cfg.SetClientAPIKeyEntries(NormalizeClientAPIKeys(cfg.ClientAPIKeyEntries()))
 }
 
 func normalizeUniqueTrimmedStrings(values []string) []string {
@@ -1205,7 +1214,7 @@ func SaveConfigPreserveComments(configFile string, cfg *Config) error {
 	}
 
 	// Marshal the current cfg to YAML, then unmarshal to a yaml.Node we can merge from.
-	rendered, err := yaml.Marshal(persistCfg)
+	rendered, err := MarshalConfigForPersistence(persistCfg)
 	if err != nil {
 		return err
 	}

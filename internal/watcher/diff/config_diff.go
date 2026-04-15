@@ -100,13 +100,8 @@ func BuildConfigChangeDetails(oldCfg, newCfg *config.Config) []string {
 	// API keys (redacted) and counts
 	if len(oldCfg.APIKeys) != len(newCfg.APIKeys) {
 		changes = append(changes, fmt.Sprintf("api-keys count: %d -> %d", len(oldCfg.APIKeys), len(newCfg.APIKeys)))
-	} else if !reflect.DeepEqual(trimStrings(oldCfg.APIKeys), trimStrings(newCfg.APIKeys)) {
+	} else if !reflect.DeepEqual(summarizeClientAPIKeys(oldCfg.ClientAPIKeyEntries()), summarizeClientAPIKeys(newCfg.ClientAPIKeyEntries())) {
 		changes = append(changes, "api-keys: values updated (count unchanged, redacted)")
-	}
-	if len(oldCfg.PriorityZeroDisabledAPIKeys) != len(newCfg.PriorityZeroDisabledAPIKeys) {
-		changes = append(changes, fmt.Sprintf("priority-zero-disabled-api-keys count: %d -> %d", len(oldCfg.PriorityZeroDisabledAPIKeys), len(newCfg.PriorityZeroDisabledAPIKeys)))
-	} else if !reflect.DeepEqual(trimStrings(oldCfg.PriorityZeroDisabledAPIKeys), trimStrings(newCfg.PriorityZeroDisabledAPIKeys)) {
-		changes = append(changes, "priority-zero-disabled-api-keys: values updated (count unchanged, redacted)")
 	}
 	if len(oldCfg.GeminiKey) != len(newCfg.GeminiKey) {
 		changes = append(changes, fmt.Sprintf("gemini-api-key count: %d -> %d", len(oldCfg.GeminiKey), len(newCfg.GeminiKey)))
@@ -384,6 +379,28 @@ func formatProxyURL(raw string) string {
 		return host
 	}
 	return scheme + "://" + host
+}
+
+func summarizeClientAPIKeys(entries []config.ClientAPIKey) []string {
+	if len(entries) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		key := strings.TrimSpace(entry.Key)
+		if key == "" {
+			continue
+		}
+		summary := key
+		if entry.MaxPriority != nil {
+			summary = fmt.Sprintf("%s|max=%d", key, *entry.MaxPriority)
+		}
+		out = append(out, summary)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 func equalStringSet(a, b []string) bool {

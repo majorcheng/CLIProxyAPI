@@ -218,33 +218,33 @@ func requestExecutionMetadata(ctx context.Context) map[string]any {
 // applyClientRoutingPolicyMetadata 将入站 client api-key 的路由限制收口成
 // execution metadata，避免把原始 key 继续透传到 scheduler/auth 层。
 func applyClientRoutingPolicyMetadata(meta map[string]any, ctx context.Context, cfg *config.SDKConfig) {
-	if len(meta) == 0 || !clientAPIKeyDisallowsPriorityZero(ctx, cfg) {
+	maxPriority, ok := clientAPIKeyMaxPriority(ctx, cfg)
+	if len(meta) == 0 || !ok {
 		return
 	}
-	meta[coreexecutor.DisallowPriorityZeroAuthMetadataKey] = true
+	meta[coreexecutor.MaxAuthPriorityMetadataKey] = maxPriority
 }
 
-func clientAPIKeyDisallowsPriorityZero(ctx context.Context, cfg *config.SDKConfig) bool {
-	if ctx == nil || cfg == nil || len(cfg.PriorityZeroDisabledAPIKeys) == 0 {
-		return false
+func clientAPIKeyMaxPriority(ctx context.Context, cfg *config.SDKConfig) (int, bool) {
+	if ctx == nil || cfg == nil || len(config.ClientAPIKeyValuesFromConfig(cfg)) == 0 {
+		return 0, false
 	}
 	ginCtx, ok := ctx.Value("gin").(*gin.Context)
 	if !ok || ginCtx == nil {
-		return false
+		return 0, false
 	}
 	if accessProvider := strings.TrimSpace(stringValueFromGin(ginCtx, "accessProvider")); accessProvider != sdkaccess.DefaultAccessProviderName {
-		return false
+		return 0, false
 	}
 	clientAPIKey := strings.TrimSpace(stringValueFromGin(ginCtx, "apiKey"))
 	if clientAPIKey == "" {
-		return false
+		return 0, false
 	}
-	for _, candidate := range cfg.PriorityZeroDisabledAPIKeys {
-		if strings.TrimSpace(candidate) == clientAPIKey {
-			return true
-		}
+	entry, found := config.FindClientAPIKeyInConfig(cfg, clientAPIKey)
+	if !found || entry.MaxPriority == nil {
+		return 0, false
 	}
-	return false
+	return *entry.MaxPriority, true
 }
 
 func stringValueFromGin(c *gin.Context, key string) string {

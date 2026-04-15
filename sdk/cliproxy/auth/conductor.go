@@ -3401,7 +3401,7 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 		if candidate.Provider != provider || candidate.Disabled {
 			continue
 		}
-		if shouldSkipPriorityZeroAuth(opts.Metadata, candidate) {
+		if shouldSkipAuthByClientPolicy(opts.Metadata, candidate) {
 			continue
 		}
 		if pinnedAuthID != "" && candidate.ID != pinnedAuthID {
@@ -3485,7 +3485,7 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 		if candidate == nil || candidate.Disabled {
 			continue
 		}
-		if shouldSkipPriorityZeroAuth(opts.Metadata, candidate) {
+		if shouldSkipAuthByClientPolicy(opts.Metadata, candidate) {
 			continue
 		}
 		if pinnedAuthID != "" && candidate.ID != pinnedAuthID {

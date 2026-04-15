@@ -160,8 +160,8 @@ var zhStrings = map[string]string{
 	"copy_failed":        "✗ 复制失败",
 	"new_key_prompt":     "  New Key: ",
 	"edit_key_prompt":    "  Edit Key: ",
-	"enter_add":          "    Enter: 添加 • Esc: 取消",
-	"enter_save_esc":     "    Enter: 保存 • Esc: 取消",
+	"enter_add":          "    Enter: 添加 • Esc: 取消（格式：key 或 key|max-priority）",
+	"enter_save_esc":     "    Enter: 保存 • Esc: 取消（格式：key 或 key|max-priority）",
 
 	// ── OAuth ──
 	"oauth_title":        "🔐 OAuth 登录",
@@ -311,8 +311,8 @@ var enStrings = map[string]string{
 	"copy_failed":        "✗ Copy failed",
 	"new_key_prompt":     "  New Key: ",
 	"edit_key_prompt":    "  Edit Key: ",
-	"enter_add":          "    Enter: Add • Esc: Cancel",
-	"enter_save_esc":     "    Enter: Save • Esc: Cancel",
+	"enter_add":          "    Enter: Add • Esc: Cancel (format: key or key|max-priority)",
+	"enter_save_esc":     "    Enter: Save • Esc: Cancel (format: key or key|max-priority)",
 
 	// ── OAuth ──
 	"oauth_title":        "🔐 OAuth Login",

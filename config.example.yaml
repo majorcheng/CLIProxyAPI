@@ -36,16 +36,14 @@ remote-management:
 auth-dir: "~/.cli-proxy-api"
 
 # 用于鉴权的 API Key
+# 支持两种写法：
+# 1) 纯字符串：保持旧行为，不额外限制可用 auth 优先级
+# 2) 对象：可附带 max-priority，表示该 key 只能命中 priority <= max-priority 的 auth
 api-keys:
   - "your-api-key-1"
   - "your-api-key-2"
-  - "your-api-key-3"
-
-# 禁止命中 priority=0 auth 的 client api-key 列表
-# 这里填写的是上面顶层 api-keys 里的入站 key，不是上游 provider 的 token。
-# 命中的 key 仍可访问代理，但请求选路时会直接跳过所有 priority=0 候选。
-# priority-zero-disabled-api-keys:
-#   - "your-api-key-2"
+  - key: "your-api-key-3"
+    max-priority: 0
 
 # 是否启用调试日志
 debug: false
@@ -75,12 +73,14 @@ pprof:
 #   # 并将文件加入“移入垃圾站”的队列。quota-strike-threshold 不会延迟这条路径。
 #   delete-status-codes: [401, 429]
 #   # 对“refresh RT 失败导致的 401”做一层额外保护。
-#   # 默认 true：refresh 401 不会直接按 401 删除，只有该 auth 已经具备 429 痕迹时才删除。
+#   # 默认 true：refresh 401（包括已归一成 Codex terminal refresh error code 的 RT 终态失败）
+#   # 不会直接按 401 删除，只有该 auth 已经具备 429 痕迹时才删除。
 #   # 注意：这只是 refresh 401 的特殊分支，不等于开启了“普通 429 自动删除”。
 #   # 也就是说：如果 delete-status-codes 里没有 429，且 delete-quota-exceeded=false，
 #   # 那么普通 429 仍不会被自动删除；只有“refresh 401 + 已429”这类特殊情况会按 429 归因进入垃圾站。
 #   # 因此你可能会看到文件进入 logs/delete/429/，但这并不代表当前配置已经打开了常规 429 删除。
-#   # 显式设为 false 时，会回到“只要 delete-status-codes 含 401，就直接按 401 删除”的旧语义。
+#   # 显式设为 false 时，带 terminal refresh error code 的 Codex RT 401 会恢复进入删除流程；
+#   # 但普通原始 Codex 401 仍不会仅凭 delete-status-codes 被直接删除。
 #   refresh-401-requires-429: true
 #   # 为重复额度失败启用第二条删除路径。
 #   # 这主要适用于 delete-status-codes 中不包含 429，且你希望 429

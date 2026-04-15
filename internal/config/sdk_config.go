@@ -30,12 +30,14 @@ type SDKConfig struct {
 	// RequestAudit emits per-attempt request/response audit events to an external hook.
 	RequestAudit RequestAuditConfig `yaml:"request-audit" json:"request-audit"`
 
-	// APIKeys is a list of keys for authenticating clients to this proxy server.
-	APIKeys []string `yaml:"api-keys" json:"api-keys"`
+	// APIKeys 保持对外公开 Go API 的旧形状：仍然是纯字符串列表。
+	// 若需要携带 max-priority 等对象化策略，请通过 ClientAPIKeyEntries /
+	// SetClientAPIKeyEntries 这组 helper 读写；YAML 仍兼容字符串或对象混写。
+	APIKeys APIKeyList `yaml:"api-keys,omitempty" json:"api-keys"`
 
-	// PriorityZeroDisabledAPIKeys 列出禁止命中 priority=0 auth 的 client api-key。
-	// 这些 key 仍可访问代理，但请求选路时会直接跳过 priority=0 候选。
-	PriorityZeroDisabledAPIKeys []string `yaml:"priority-zero-disabled-api-keys,omitempty" json:"priority-zero-disabled-api-keys,omitempty"`
+	// clientAPIKeyEntries 存放对象化后的内部策略视图，避免破坏公开 SDK 的
+	// `APIKeys: []string{...}` 结构体初始化方式。
+	clientAPIKeyEntries []ClientAPIKey `yaml:"-" json:"-"`
 
 	// PassthroughHeaders controls whether upstream response headers are forwarded to downstream clients.
 	// Default is false (disabled).

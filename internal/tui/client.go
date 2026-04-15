@@ -239,9 +239,15 @@ func (c *Client) GetLogs(after int64, limit int) ([]string, int64, error) {
 	return lines, latest, nil
 }
 
-// GetAPIKeys fetches the list of API keys.
-// API returns {"api-keys": [...]}.
-func (c *Client) GetAPIKeys() ([]string, error) {
+type clientAPIKeyItem struct {
+	Key         string `json:"key"`
+	MaxPriority *int   `json:"max-priority,omitempty"`
+}
+
+// GetAPIKeys fetches the list of API keys。
+// API 返回 {"api-keys": [...]}，其中每项统一为对象；
+// 同时兼容历史字符串返回，便于平滑升级。
+func (c *Client) GetAPIKeys() ([]clientAPIKeyItem, error) {
 	wrapper, err := c.getJSON("/v0/management/api-keys")
 	if err != nil {
 		return nil, err
@@ -254,23 +260,31 @@ func (c *Client) GetAPIKeys() ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	var result []string
-	if err := json.Unmarshal(raw, &result); err != nil {
+	var result []clientAPIKeyItem
+	if err := json.Unmarshal(raw, &result); err == nil {
+		return result, nil
+	}
+	var legacy []string
+	if err := json.Unmarshal(raw, &legacy); err != nil {
 		return nil, err
+	}
+	result = make([]clientAPIKeyItem, 0, len(legacy))
+	for _, key := range legacy {
+		result = append(result, clientAPIKeyItem{Key: strings.TrimSpace(key)})
 	}
 	return result, nil
 }
 
-// AddAPIKey adds a new API key by sending old=nil, new=key which appends.
-func (c *Client) AddAPIKey(key string) error {
-	body := map[string]any{"old": nil, "new": key}
+// AddAPIKey adds a new API key by sending old=nil, new=entry which appends.
+func (c *Client) AddAPIKey(entry clientAPIKeyItem) error {
+	body := map[string]any{"old": nil, "new": entry}
 	jsonBody, _ := json.Marshal(body)
 	_, err := c.patch("/v0/management/api-keys", strings.NewReader(string(jsonBody)))
 	return err
 }
 
 // EditAPIKey replaces an API key at the given index.
-func (c *Client) EditAPIKey(index int, newValue string) error {
+func (c *Client) EditAPIKey(index int, newValue clientAPIKeyItem) error {
 	body := map[string]any{"index": index, "value": newValue}
 	jsonBody, _ := json.Marshal(body)
 	_, err := c.patch("/v0/management/api-keys", strings.NewReader(string(jsonBody)))

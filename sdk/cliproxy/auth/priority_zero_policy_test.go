@@ -9,17 +9,17 @@ import (
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 )
 
-func TestSchedulerPickSingle_PriorityZeroPolicySkipsZeroBucket(t *testing.T) {
+func TestSchedulerPickSingle_MaxPriorityPolicySkipsHigherBucket(t *testing.T) {
 	t.Parallel()
 
 	scheduler := newSchedulerForTest(
 		&FillFirstSelector{},
-		&Auth{ID: "priority-zero", Provider: "gemini", Attributes: map[string]string{"priority": "0"}},
-		&Auth{ID: "fallback", Provider: "gemini", Attributes: map[string]string{"priority": "-1"}},
+		&Auth{ID: "priority-1", Provider: "gemini", Attributes: map[string]string{"priority": "1"}},
+		&Auth{ID: "allowed", Provider: "gemini", Attributes: map[string]string{"priority": "0"}},
 	)
 
 	opts := cliproxyexecutor.Options{
-		Metadata: map[string]any{cliproxyexecutor.DisallowPriorityZeroAuthMetadataKey: true},
+		Metadata: map[string]any{cliproxyexecutor.MaxAuthPriorityMetadataKey: 0},
 	}
 	got, errPick := scheduler.pickSingle(context.Background(), "gemini", "", opts, nil)
 	if errPick != nil {
@@ -28,24 +28,24 @@ func TestSchedulerPickSingle_PriorityZeroPolicySkipsZeroBucket(t *testing.T) {
 	if got == nil {
 		t.Fatal("pickSingle() auth = nil")
 	}
-	if got.ID != "fallback" {
-		t.Fatalf("pickSingle() auth.ID = %q, want %q", got.ID, "fallback")
+	if got.ID != "allowed" {
+		t.Fatalf("pickSingle() auth.ID = %q, want %q", got.ID, "allowed")
 	}
 }
 
-func TestSchedulerPickSingle_PriorityZeroPolicyDoesNotSpillPinnedAuth(t *testing.T) {
+func TestSchedulerPickSingle_MaxPriorityPolicyDoesNotSpillPinnedAuth(t *testing.T) {
 	t.Parallel()
 
 	scheduler := newSchedulerForTest(
 		&FillFirstSelector{},
-		&Auth{ID: "priority-zero", Provider: "gemini", Attributes: map[string]string{"priority": "0"}},
-		&Auth{ID: "fallback", Provider: "gemini", Attributes: map[string]string{"priority": "-1"}},
+		&Auth{ID: "priority-1", Provider: "gemini", Attributes: map[string]string{"priority": "1"}},
+		&Auth{ID: "fallback", Provider: "gemini", Attributes: map[string]string{"priority": "0"}},
 	)
 
 	opts := cliproxyexecutor.Options{
 		Metadata: map[string]any{
-			cliproxyexecutor.DisallowPriorityZeroAuthMetadataKey: true,
-			cliproxyexecutor.PinnedAuthMetadataKey:               "priority-zero",
+			cliproxyexecutor.MaxAuthPriorityMetadataKey: 0,
+			cliproxyexecutor.PinnedAuthMetadataKey:      "priority-1",
 		},
 	}
 	got, errPick := scheduler.pickSingle(context.Background(), "gemini", "", opts, nil)
@@ -64,17 +64,17 @@ func TestSchedulerPickSingle_PriorityZeroPolicyDoesNotSpillPinnedAuth(t *testing
 	}
 }
 
-func TestSchedulerPickMixed_PriorityZeroPolicyFallsThroughToLowerPriorityProvider(t *testing.T) {
+func TestSchedulerPickMixed_MaxPriorityPolicyFallsThroughToAllowedProvider(t *testing.T) {
 	t.Parallel()
 
 	scheduler := newSchedulerForTest(
 		&FillFirstSelector{},
-		&Auth{ID: "codex-zero", Provider: "codex", Attributes: map[string]string{"priority": "0"}},
-		&Auth{ID: "compat-fallback", Provider: "openai-compat", Attributes: map[string]string{"priority": "-1"}},
+		&Auth{ID: "codex-high", Provider: "codex", Attributes: map[string]string{"priority": "1"}},
+		&Auth{ID: "compat-allowed", Provider: "openai-compat", Attributes: map[string]string{"priority": "0"}},
 	)
 
 	opts := cliproxyexecutor.Options{
-		Metadata: map[string]any{cliproxyexecutor.DisallowPriorityZeroAuthMetadataKey: true},
+		Metadata: map[string]any{cliproxyexecutor.MaxAuthPriorityMetadataKey: 0},
 	}
 	got, provider, errPick := scheduler.pickMixed(context.Background(), []string{"codex", "openai-compat"}, "", opts, nil)
 	if errPick != nil {
@@ -86,30 +86,30 @@ func TestSchedulerPickMixed_PriorityZeroPolicyFallsThroughToLowerPriorityProvide
 	if provider != "openai-compat" {
 		t.Fatalf("pickMixed() provider = %q, want %q", provider, "openai-compat")
 	}
-	if got.ID != "compat-fallback" {
-		t.Fatalf("pickMixed() auth.ID = %q, want %q", got.ID, "compat-fallback")
+	if got.ID != "compat-allowed" {
+		t.Fatalf("pickMixed() auth.ID = %q, want %q", got.ID, "compat-allowed")
 	}
 }
 
-func TestManagerCustomSelector_PriorityZeroPolicyFiltersLegacyCandidates(t *testing.T) {
+func TestManagerCustomSelector_MaxPriorityPolicyFiltersLegacyCandidates(t *testing.T) {
 	t.Parallel()
 
 	selector := &trackingSelector{}
 	manager := NewManager(nil, selector, nil)
 	manager.executors["gemini"] = schedulerTestExecutor{}
-	manager.auths["priority-zero"] = &Auth{
-		ID:         "priority-zero",
+	manager.auths["priority-1"] = &Auth{
+		ID:         "priority-1",
 		Provider:   "gemini",
-		Attributes: map[string]string{"priority": "0"},
+		Attributes: map[string]string{"priority": "1"},
 	}
 	manager.auths["fallback"] = &Auth{
 		ID:         "fallback",
 		Provider:   "gemini",
-		Attributes: map[string]string{"priority": "-1"},
+		Attributes: map[string]string{"priority": "0"},
 	}
 
 	opts := cliproxyexecutor.Options{
-		Metadata: map[string]any{cliproxyexecutor.DisallowPriorityZeroAuthMetadataKey: true},
+		Metadata: map[string]any{cliproxyexecutor.MaxAuthPriorityMetadataKey: 0},
 	}
 	got, _, errPick := manager.pickNext(context.Background(), "gemini", "", opts, map[string]struct{}{})
 	if errPick != nil {

@@ -24,14 +24,14 @@ type dashboardModel struct {
 	lastConfig    map[string]any
 	lastUsage     map[string]any
 	lastAuthFiles []map[string]any
-	lastAPIKeys   []string
+	lastAPIKeys   []clientAPIKeyItem
 }
 
 type dashboardDataMsg struct {
 	config    map[string]any
 	usage     map[string]any
 	authFiles []map[string]any
-	apiKeys   []string
+	apiKeys   []clientAPIKeyItem
 	err       error
 }
 
@@ -121,7 +121,7 @@ func (m dashboardModel) View() string {
 	return m.viewport.View()
 }
 
-func (m dashboardModel) renderDashboard(cfg, usage map[string]any, authFiles []map[string]any, apiKeys []string) string {
+func (m dashboardModel) renderDashboard(cfg, usage map[string]any, authFiles []map[string]any, apiKeys []clientAPIKeyItem) string {
 	var sb strings.Builder
 
 	sb.WriteString(titleStyle.Render(T("dashboard_title")))

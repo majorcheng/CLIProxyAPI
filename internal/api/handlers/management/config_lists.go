@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"strings"
 
 	"github.com/gin-gonic/gin"
@@ -14,6 +15,7 @@ var (
 	errOpenAICompatNotFound         = errors.New("未找到 OpenAI 兼容提供商")
 	errOpenAICompatNameConflict     = errors.New("OpenAI 兼容提供商名称冲突")
 	errOpenAICompatRevisionConflict = errors.New("OpenAI 兼容提供商配置已变化，请刷新后重试")
+	errClientAPIKeyConflict         = errors.New("api key 已存在")
 )
 
 // Generic helpers for list[string]
@@ -111,18 +113,259 @@ func (h *Handler) deleteFromStringList(c *gin.Context, target *[]string, after f
 	c.JSON(400, gin.H{"error": "missing index or value"})
 }
 
+func (h *Handler) putClientAPIKeys(c *gin.Context, set func([]config.ClientAPIKey), after func()) {
+	data, err := c.GetRawData()
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "failed to read body"})
+		return
+	}
+	entries, err := decodeClientAPIKeysPayload(data)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if conflictKey, ok := findDuplicateClientAPIKey(entries, -1); ok {
+		c.JSON(http.StatusConflict, gin.H{"error": "api_key_conflict", "message": fmt.Sprintf("%s: %s", errClientAPIKeyConflict.Error(), conflictKey)})
+		return
+	}
+	set(config.NormalizeClientAPIKeys(entries))
+	if after != nil {
+		after()
+	}
+	h.persist(c)
+}
+
+func (h *Handler) patchClientAPIKeys(c *gin.Context, target *[]config.ClientAPIKey, after func()) {
+	var body struct {
+		Old   *config.ClientAPIKey `json:"old"`
+		New   *config.ClientAPIKey `json:"new"`
+		Index *int                 `json:"index"`
+		Value *config.ClientAPIKey `json:"value"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body"})
+		return
+	}
+	if body.Index != nil && body.Value != nil && *body.Index >= 0 && *body.Index < len(*target) {
+		updated, err := normalizeClientAPIKeyValue(*body.Value)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+		if conflictKey, ok := findDuplicateClientAPIKeyAfterReplace(*target, *body.Index, updated); ok {
+			c.JSON(http.StatusConflict, gin.H{"error": "api_key_conflict", "message": fmt.Sprintf("%s: %s", errClientAPIKeyConflict.Error(), conflictKey)})
+			return
+		}
+		(*target)[*body.Index] = updated
+		*target = config.NormalizeClientAPIKeys(*target)
+		if after != nil {
+			after()
+		}
+		h.persist(c)
+		return
+	}
+	if body.New != nil {
+		updated, err := normalizeClientAPIKeyValue(*body.New)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+		if body.Old != nil {
+			oldKey := strings.TrimSpace(body.Old.Key)
+			for i := range *target {
+				if strings.TrimSpace((*target)[i].Key) == oldKey {
+					if conflictKey, ok := findDuplicateClientAPIKeyAfterReplace(*target, i, updated); ok {
+						c.JSON(http.StatusConflict, gin.H{"error": "api_key_conflict", "message": fmt.Sprintf("%s: %s", errClientAPIKeyConflict.Error(), conflictKey)})
+						return
+					}
+					(*target)[i] = updated
+					*target = config.NormalizeClientAPIKeys(*target)
+					if after != nil {
+						after()
+					}
+					h.persist(c)
+					return
+				}
+			}
+		}
+		if conflictKey, ok := findDuplicateClientAPIKeyAfterReplace(*target, -1, updated); ok {
+			c.JSON(http.StatusConflict, gin.H{"error": "api_key_conflict", "message": fmt.Sprintf("%s: %s", errClientAPIKeyConflict.Error(), conflictKey)})
+			return
+		}
+		*target = config.NormalizeClientAPIKeys(append(*target, updated))
+		if after != nil {
+			after()
+		}
+		h.persist(c)
+		return
+	}
+	c.JSON(http.StatusBadRequest, gin.H{"error": "missing fields"})
+}
+
+func (h *Handler) deleteFromClientAPIKeys(c *gin.Context, target *[]config.ClientAPIKey, after func()) {
+	if idxStr := c.Query("index"); idxStr != "" {
+		var idx int
+		_, err := fmt.Sscanf(idxStr, "%d", &idx)
+		if err == nil && idx >= 0 && idx < len(*target) {
+			*target = append((*target)[:idx], (*target)[idx+1:]...)
+			if after != nil {
+				after()
+			}
+			h.persist(c)
+			return
+		}
+	}
+	if key := strings.TrimSpace(c.Query("key")); key != "" {
+		out := make([]config.ClientAPIKey, 0, len(*target))
+		for _, entry := range *target {
+			if strings.TrimSpace(entry.Key) != key {
+				out = append(out, entry)
+			}
+		}
+		*target = out
+		if after != nil {
+			after()
+		}
+		h.persist(c)
+		return
+	}
+	if value := strings.TrimSpace(c.Query("value")); value != "" {
+		out := make([]config.ClientAPIKey, 0, len(*target))
+		for _, entry := range *target {
+			if strings.TrimSpace(entry.Key) != value {
+				out = append(out, entry)
+			}
+		}
+		*target = out
+		if after != nil {
+			after()
+		}
+		h.persist(c)
+		return
+	}
+	c.JSON(http.StatusBadRequest, gin.H{"error": "missing index or key"})
+}
+
+func decodeClientAPIKeysPayload(data []byte) ([]config.ClientAPIKey, error) {
+	var entries []config.ClientAPIKey
+	if err := json.Unmarshal(data, &entries); err == nil {
+		return sanitizeClientAPIKeysKeepDuplicates(entries), nil
+	}
+	var wrapper struct {
+		Items []config.ClientAPIKey `json:"items"`
+	}
+	if err := json.Unmarshal(data, &wrapper); err == nil && len(wrapper.Items) > 0 {
+		return sanitizeClientAPIKeysKeepDuplicates(wrapper.Items), nil
+	}
+	return nil, errors.New("invalid body")
+}
+
+func normalizeClientAPIKeyValue(entry config.ClientAPIKey) (config.ClientAPIKey, error) {
+	normalized := config.NormalizeClientAPIKeys([]config.ClientAPIKey{entry})
+	if len(normalized) == 0 {
+		return config.ClientAPIKey{}, errors.New("invalid api key entry")
+	}
+	return normalized[0], nil
+}
+
+func sanitizeClientAPIKeysKeepDuplicates(entries []config.ClientAPIKey) []config.ClientAPIKey {
+	if len(entries) == 0 {
+		return nil
+	}
+	out := make([]config.ClientAPIKey, 0, len(entries))
+	for _, entry := range entries {
+		key := strings.TrimSpace(entry.Key)
+		if key == "" {
+			continue
+		}
+		out = append(out, config.ClientAPIKey{
+			Key:         key,
+			MaxPriority: cloneIntPointer(entry.MaxPriority),
+		})
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func getClientAPIKeysResponse(cfg *config.Config, c *gin.Context) any {
+	if shouldReturnClientAPIKeyObjects(c) {
+		return cfg.ClientAPIKeyEntries()
+	}
+	return []string(cfg.APIKeys)
+}
+
+func shouldReturnClientAPIKeyObjects(c *gin.Context) bool {
+	if c == nil || c.Request == nil {
+		return false
+	}
+	queryValue := strings.TrimSpace(c.Query("format"))
+	if strings.EqualFold(queryValue, "object") || strings.EqualFold(queryValue, "objects") {
+		return true
+	}
+	accept := strings.ToLower(strings.TrimSpace(c.GetHeader("Accept")))
+	return strings.Contains(accept, "application/vnd.router-for-me.apikeys+json")
+}
+
+func findDuplicateClientAPIKey(entries []config.ClientAPIKey, skipIndex int) (string, bool) {
+	seen := make(map[string]int, len(entries))
+	for index, entry := range entries {
+		if skipIndex >= 0 && index == skipIndex {
+			continue
+		}
+		key := strings.TrimSpace(entry.Key)
+		if key == "" {
+			continue
+		}
+		if _, ok := seen[key]; ok {
+			return key, true
+		}
+		seen[key] = index
+	}
+	return "", false
+}
+
+func findDuplicateClientAPIKeyAfterReplace(entries []config.ClientAPIKey, replaceIndex int, updated config.ClientAPIKey) (string, bool) {
+	candidate := make([]config.ClientAPIKey, 0, len(entries)+1)
+	if replaceIndex >= 0 && replaceIndex < len(entries) {
+		candidate = append(candidate, entries...)
+		candidate[replaceIndex] = updated
+		return findDuplicateClientAPIKey(candidate, -1)
+	}
+	candidate = append(candidate, entries...)
+	candidate = append(candidate, updated)
+	return findDuplicateClientAPIKey(candidate, -1)
+}
+
+func cloneIntPointer(value *int) *int {
+	if value == nil {
+		return nil
+	}
+	cloned := *value
+	return &cloned
+}
+
 // api-keys
-func (h *Handler) GetAPIKeys(c *gin.Context) { c.JSON(200, gin.H{"api-keys": h.cfg.APIKeys}) }
+func (h *Handler) GetAPIKeys(c *gin.Context) {
+	c.JSON(200, gin.H{"api-keys": getClientAPIKeysResponse(h.cfg, c)})
+}
 func (h *Handler) PutAPIKeys(c *gin.Context) {
-	h.putStringList(c, func(v []string) {
-		h.cfg.APIKeys = append([]string(nil), v...)
+	h.putClientAPIKeys(c, func(v []config.ClientAPIKey) {
+		h.cfg.SetClientAPIKeyEntries(v)
 	}, nil)
 }
 func (h *Handler) PatchAPIKeys(c *gin.Context) {
-	h.patchStringList(c, &h.cfg.APIKeys, func() {})
+	entries := h.cfg.ClientAPIKeyEntries()
+	h.patchClientAPIKeys(c, &entries, func() {
+		h.cfg.SetClientAPIKeyEntries(entries)
+	})
 }
 func (h *Handler) DeleteAPIKeys(c *gin.Context) {
-	h.deleteFromStringList(c, &h.cfg.APIKeys, func() {})
+	entries := h.cfg.ClientAPIKeyEntries()
+	h.deleteFromClientAPIKeys(c, &entries, func() {
+		h.cfg.SetClientAPIKeyEntries(entries)
+	})
 }
 
 // gemini-api-key: []GeminiKey

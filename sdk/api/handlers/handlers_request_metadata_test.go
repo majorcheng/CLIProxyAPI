@@ -21,18 +21,22 @@ func TestApplyClientRoutingPolicyMetadata_MarksPriorityZeroDisabledClientKey(t *
 	meta := map[string]any{"idempotency_key": "req-1"}
 	ctx := context.WithValue(context.Background(), "gin", ginCtx)
 	cfg := &sdkconfig.SDKConfig{
-		PriorityZeroDisabledAPIKeys: []string{" key-b ", "key-b"},
+		APIKeys: []string{"key-b"},
 	}
+	cfg.SetClientAPIKeyEntries([]sdkconfig.ClientAPIKey{
+		{Key: " key-b ", MaxPriority: intPtr(0)},
+		{Key: "key-b", MaxPriority: intPtr(-1)},
+	})
 
 	applyClientRoutingPolicyMetadata(meta, ctx, cfg)
 
-	got, ok := meta[coreexecutor.DisallowPriorityZeroAuthMetadataKey]
+	got, ok := meta[coreexecutor.MaxAuthPriorityMetadataKey]
 	if !ok {
-		t.Fatalf("metadata missing %q", coreexecutor.DisallowPriorityZeroAuthMetadataKey)
+		t.Fatalf("metadata missing %q", coreexecutor.MaxAuthPriorityMetadataKey)
 	}
-	flag, ok := got.(bool)
-	if !ok || !flag {
-		t.Fatalf("metadata[%q] = %#v, want true", coreexecutor.DisallowPriorityZeroAuthMetadataKey, got)
+	value, ok := got.(int)
+	if !ok || value != 0 {
+		t.Fatalf("metadata[%q] = %#v, want 0", coreexecutor.MaxAuthPriorityMetadataKey, got)
 	}
 }
 
@@ -45,13 +49,14 @@ func TestApplyClientRoutingPolicyMetadata_IgnoresNonInlineAccessProvider(t *test
 
 	meta := map[string]any{"idempotency_key": "req-2"}
 	ctx := context.WithValue(context.Background(), "gin", ginCtx)
-	cfg := &sdkconfig.SDKConfig{
-		PriorityZeroDisabledAPIKeys: []string{"key-b"},
-	}
+	cfg := &sdkconfig.SDKConfig{APIKeys: []string{"key-b"}}
+	cfg.SetClientAPIKeyEntries([]sdkconfig.ClientAPIKey{{Key: "key-b", MaxPriority: intPtr(0)}})
 
 	applyClientRoutingPolicyMetadata(meta, ctx, cfg)
 
-	if _, ok := meta[coreexecutor.DisallowPriorityZeroAuthMetadataKey]; ok {
-		t.Fatalf("metadata should not contain %q for non-inline provider", coreexecutor.DisallowPriorityZeroAuthMetadataKey)
+	if _, ok := meta[coreexecutor.MaxAuthPriorityMetadataKey]; ok {
+		t.Fatalf("metadata should not contain %q for non-inline provider", coreexecutor.MaxAuthPriorityMetadataKey)
 	}
 }
+
+func intPtr(v int) *int { return &v }

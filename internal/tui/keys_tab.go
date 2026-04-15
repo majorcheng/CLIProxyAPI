@@ -2,6 +2,7 @@ package tui
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 
 	"github.com/atotto/clipboard"
@@ -15,7 +16,7 @@ import (
 type keysTabModel struct {
 	client   *Client
 	viewport viewport.Model
-	keys     []string
+	keys     []clientAPIKeyItem
 	gemini   []map[string]any
 	claude   []map[string]any
 	codex    []map[string]any
@@ -37,7 +38,7 @@ type keysTabModel struct {
 }
 
 type keysDataMsg struct {
-	apiKeys []string
+	apiKeys []clientAPIKeyItem
 	gemini  []map[string]any
 	claude  []map[string]any
 	codex   []map[string]any
@@ -133,9 +134,15 @@ func (m keysTabModel) Update(msg tea.Msg) (keysTabModel, tea.Cmd) {
 				m.editing = false
 				m.adding = false
 				m.editInput.Blur()
+				entry, errParse := parseClientAPIKeyInput(value)
+				if errParse != nil {
+					m.status = errorStyle.Render("✗ " + errParse.Error())
+					m.viewport.SetContent(m.renderContent())
+					return m, nil
+				}
 				if isAdding {
 					return m, func() tea.Msg {
-						err := m.client.AddAPIKey(value)
+						err := m.client.AddAPIKey(entry)
 						if err != nil {
 							return keyActionMsg{err: err}
 						}
@@ -143,7 +150,7 @@ func (m keysTabModel) Update(msg tea.Msg) (keysTabModel, tea.Cmd) {
 					}
 				}
 				return m, func() tea.Msg {
-					err := m.client.EditAPIKey(editIdx, value)
+					err := m.client.EditAPIKey(editIdx, entry)
 					if err != nil {
 						return keyActionMsg{err: err}
 					}
@@ -213,7 +220,7 @@ func (m keysTabModel) Update(msg tea.Msg) (keysTabModel, tea.Cmd) {
 				m.editing = true
 				m.adding = false
 				m.editIdx = m.cursor
-				m.editInput.SetValue(m.keys[m.cursor])
+				m.editInput.SetValue(formatClientAPIKeyInput(m.keys[m.cursor]))
 				m.editInput.Prompt = T("edit_key_prompt")
 				m.editInput.Focus()
 				m.viewport.SetContent(m.renderContent())
@@ -230,7 +237,7 @@ func (m keysTabModel) Update(msg tea.Msg) (keysTabModel, tea.Cmd) {
 		case "c":
 			// Copy selected key to clipboard
 			if m.cursor < len(m.keys) {
-				key := m.keys[m.cursor]
+				key := strings.TrimSpace(m.keys[m.cursor].Key)
 				if err := clipboard.WriteAll(key); err != nil {
 					m.status = errorStyle.Render(T("copy_failed") + ": " + err.Error())
 				} else {
@@ -308,13 +315,13 @@ func (m keysTabModel) renderContent() string {
 			rowStyle = lipgloss.NewStyle().Bold(true)
 		}
 
-		row := fmt.Sprintf("%s%d. %s", cursor, i+1, maskKey(key))
+		row := fmt.Sprintf("%s%d. %s", cursor, i+1, renderClientAPIKeyRow(key))
 		sb.WriteString(rowStyle.Render(row))
 		sb.WriteString("\n")
 
 		// Delete confirmation
 		if m.confirm == i {
-			sb.WriteString(warningStyle.Render(fmt.Sprintf("    "+T("confirm_delete_key"), maskKey(key))))
+			sb.WriteString(warningStyle.Render(fmt.Sprintf("    "+T("confirm_delete_key"), maskKey(key.Key))))
 			sb.WriteString("\n")
 		}
 
@@ -402,4 +409,41 @@ func maskKey(key string) string {
 		return strings.Repeat("*", len(key))
 	}
 	return key[:4] + strings.Repeat("*", len(key)-8) + key[len(key)-4:]
+}
+
+func parseClientAPIKeyInput(raw string) (clientAPIKeyItem, error) {
+	parts := strings.SplitN(strings.TrimSpace(raw), "|", 2)
+	key := strings.TrimSpace(parts[0])
+	if key == "" {
+		return clientAPIKeyItem{}, fmt.Errorf("API Key 不能为空")
+	}
+	entry := clientAPIKeyItem{Key: key}
+	if len(parts) == 1 {
+		return entry, nil
+	}
+	value := strings.TrimSpace(parts[1])
+	if value == "" {
+		return entry, nil
+	}
+	parsed, err := strconv.Atoi(value)
+	if err != nil {
+		return clientAPIKeyItem{}, fmt.Errorf("max-priority 必须是整数")
+	}
+	entry.MaxPriority = &parsed
+	return entry, nil
+}
+
+func formatClientAPIKeyInput(entry clientAPIKeyItem) string {
+	if entry.MaxPriority == nil {
+		return strings.TrimSpace(entry.Key)
+	}
+	return fmt.Sprintf("%s|%d", strings.TrimSpace(entry.Key), *entry.MaxPriority)
+}
+
+func renderClientAPIKeyRow(entry clientAPIKeyItem) string {
+	label := maskKey(strings.TrimSpace(entry.Key))
+	if entry.MaxPriority == nil {
+		return label
+	}
+	return fmt.Sprintf("%s (max-priority: %d)", label, *entry.MaxPriority)
 }

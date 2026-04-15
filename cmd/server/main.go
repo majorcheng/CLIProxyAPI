@@ -444,6 +444,8 @@ func main() {
 		cfg.AuthDir = resolvedAuthDir
 	}
 	managementasset.SetCurrentConfig(cfg)
+	// 让远端 models catalog 抓取复用全局 proxy-url，避免默认直连导致刷新超时。
+	registry.SetGlobalProxyURL(cfg.ProxyURL)
 
 	// Create login options to be used in authentication flows.
 	options := &cmd.LoginOptions{

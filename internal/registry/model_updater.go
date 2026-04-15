@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/router-for-me/CLIProxyAPI/v6/sdk/proxyutil"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -20,8 +21,8 @@ const (
 )
 
 var modelsURLs = []string{
-	"https://raw.githubusercontent.com/router-for-me/models/refs/heads/main/models.json",
-	"https://models.router-for.me/models.json",
+	"https://raw.githubusercontent.com/router-for-me/CLIProxyAPI/main/internal/registry/models/models.json",
+	"https://github.com/router-for-me/CLIProxyAPI/raw/main/internal/registry/models/models.json",
 }
 
 //go:embed models/models.json
@@ -44,7 +45,41 @@ var (
 	refreshCallbackMu     sync.Mutex
 	refreshCallback       ModelRefreshCallback
 	pendingRefreshChanges []string
+	modelsProxyMu         sync.RWMutex
+	modelsProxyURL        string
 )
+
+// SetGlobalProxyURL configures the proxy used for remote model catalog fetches.
+// It reuses the same proxy-url semantics as the rest of the service so startup
+// and periodic model refresh can succeed behind user-configured outbound proxies.
+func SetGlobalProxyURL(proxyURL string) {
+	modelsProxyMu.Lock()
+	modelsProxyURL = strings.TrimSpace(proxyURL)
+	modelsProxyMu.Unlock()
+}
+
+func globalProxyURLSnapshot() string {
+	modelsProxyMu.RLock()
+	defer modelsProxyMu.RUnlock()
+	return modelsProxyURL
+}
+
+func newModelsHTTPClient() *http.Client {
+	client := &http.Client{Timeout: modelsFetchTimeout}
+	proxyURL := globalProxyURLSnapshot()
+	if proxyURL == "" {
+		return client
+	}
+	transport, _, errBuild := proxyutil.BuildHTTPTransport(proxyURL)
+	if errBuild != nil {
+		log.WithError(errBuild).Warn("models updater: build proxy transport failed, fallback to direct")
+		return client
+	}
+	if transport != nil {
+		client.Transport = transport
+	}
+	return client
+}
 
 // SetModelRefreshCallback registers a callback that is invoked when startup or
 // periodic model refresh detects changes. Only one callback is supported;
@@ -141,7 +176,7 @@ func tryRefreshModels(ctx context.Context, label string) {
 // fetchModelsFromRemote tries all remote URLs and returns the parsed model catalog
 // along with the URL it was fetched from. Returns (nil, "") if all fetches fail.
 func fetchModelsFromRemote(ctx context.Context) (*staticModelsJSON, string) {
-	client := &http.Client{Timeout: modelsFetchTimeout}
+	client := newModelsHTTPClient()
 	for _, url := range modelsURLs {
 		reqCtx, cancel := context.WithTimeout(ctx, modelsFetchTimeout)
 		req, err := http.NewRequestWithContext(reqCtx, "GET", url, nil)

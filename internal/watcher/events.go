@@ -4,11 +4,8 @@ package watcher
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"time"
 
@@ -16,28 +13,10 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
-func matchProvider(provider string, targets []string) (string, bool) {
-	p := strings.ToLower(strings.TrimSpace(provider))
-	for _, t := range targets {
-		if strings.EqualFold(p, strings.TrimSpace(t)) {
-			return p, true
-		}
-	}
-	return p, false
-}
-
 func (w *Watcher) start(ctx context.Context) error {
-	if errAddConfig := w.watcher.Add(w.configPath); errAddConfig != nil {
-		log.Errorf("failed to watch config file %s: %v", w.configPath, errAddConfig)
-		return errAddConfig
+	if err := w.addWatchTargets(); err != nil {
+		return err
 	}
-	log.Debugf("watching config file: %s", w.configPath)
-
-	if errAddAuthDir := w.watcher.Add(w.authDir); errAddAuthDir != nil {
-		log.Errorf("failed to watch auth directory %s: %v", w.authDir, errAddAuthDir)
-		return errAddAuthDir
-	}
-	log.Debugf("watching auth directory: %s", w.authDir)
 
 	go w.processEvents(ctx)
 
@@ -123,48 +102,6 @@ func (w *Watcher) handleEvent(event fsnotify.Event) {
 		w.clearAuthPathSuppression(normalizedName)
 		w.scheduleAuthWrite(normalizedName, event.Name)
 	}
-}
-
-func (w *Watcher) authFileUnchanged(path string) (bool, error) {
-	data, errRead := os.ReadFile(path)
-	if errRead != nil {
-		return false, errRead
-	}
-	if len(data) == 0 {
-		return false, nil
-	}
-	sum := sha256.Sum256(data)
-	curHash := hex.EncodeToString(sum[:])
-
-	normalized := w.normalizeAuthPath(path)
-	w.clientsMutex.RLock()
-	prevHash, ok := w.lastAuthHashes[normalized]
-	w.clientsMutex.RUnlock()
-	if ok && prevHash == curHash {
-		return true, nil
-	}
-	return false, nil
-}
-
-func (w *Watcher) isKnownAuthFile(path string) bool {
-	normalized := w.normalizeAuthPath(path)
-	w.clientsMutex.RLock()
-	defer w.clientsMutex.RUnlock()
-	_, ok := w.lastAuthHashes[normalized]
-	return ok
-}
-
-func (w *Watcher) normalizeAuthPath(path string) string {
-	trimmed := strings.TrimSpace(path)
-	if trimmed == "" {
-		return ""
-	}
-	cleaned := filepath.Clean(trimmed)
-	if runtime.GOOS == "windows" {
-		cleaned = strings.TrimPrefix(cleaned, `\\?\`)
-		cleaned = strings.ToLower(cleaned)
-	}
-	return cleaned
 }
 
 func (w *Watcher) shouldDebounceRemove(normalizedPath string, now time.Time) bool {

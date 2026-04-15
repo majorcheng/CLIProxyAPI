@@ -321,6 +321,85 @@ func TestStartFailsWhenConfigMissing(t *testing.T) {
 	}
 }
 
+func TestStartAddsConfigDirectoryWatcherAndAuthDirectoryWatcher(t *testing.T) {
+	tmpDir := t.TempDir()
+	authDir := filepath.Join(tmpDir, "auth")
+	if err := os.MkdirAll(authDir, 0o755); err != nil {
+		t.Fatalf("failed to create auth dir: %v", err)
+	}
+	configPath := filepath.Join(tmpDir, "config.yaml")
+	if err := os.WriteFile(configPath, []byte("auth_dir: "+authDir), 0o644); err != nil {
+		t.Fatalf("failed to create config file: %v", err)
+	}
+
+	w, err := NewWatcher(configPath, authDir, nil)
+	if err != nil {
+		t.Fatalf("failed to create watcher: %v", err)
+	}
+	defer w.Stop()
+	w.SetConfig(&config.Config{AuthDir: authDir})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := w.Start(ctx); err != nil {
+		t.Fatalf("expected Start to succeed: %v", err)
+	}
+
+	watchList := w.watcher.WatchList()
+	expectedConfigDir := w.normalizeAuthPath(filepath.Dir(configPath))
+	expectedAuthDir := w.normalizeAuthPath(authDir)
+	foundConfigDir := false
+	foundAuthDir := false
+	for _, path := range watchList {
+		normalized := w.normalizeAuthPath(path)
+		if normalized == expectedConfigDir {
+			foundConfigDir = true
+		}
+		if normalized == expectedAuthDir {
+			foundAuthDir = true
+		}
+	}
+	if !foundConfigDir {
+		t.Fatalf("expected watcher to include config dir %s, got %v", expectedConfigDir, watchList)
+	}
+	if !foundAuthDir {
+		t.Fatalf("expected watcher to include auth dir %s, got %v", expectedAuthDir, watchList)
+	}
+}
+
+func TestStartDeduplicatesSharedConfigAndAuthDirectoryWatch(t *testing.T) {
+	tmpDir := t.TempDir()
+	configPath := filepath.Join(tmpDir, "config.yaml")
+	if err := os.WriteFile(configPath, []byte("auth_dir: "+tmpDir), 0o644); err != nil {
+		t.Fatalf("failed to create config file: %v", err)
+	}
+
+	w, err := NewWatcher(configPath, tmpDir, nil)
+	if err != nil {
+		t.Fatalf("failed to create watcher: %v", err)
+	}
+	defer w.Stop()
+	w.SetConfig(&config.Config{AuthDir: tmpDir})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := w.Start(ctx); err != nil {
+		t.Fatalf("expected Start to succeed: %v", err)
+	}
+
+	watchList := w.watcher.WatchList()
+	expectedDir := w.normalizeAuthPath(tmpDir)
+	count := 0
+	for _, path := range watchList {
+		if w.normalizeAuthPath(path) == expectedDir {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Fatalf("expected shared directory to be watched once, got %d entries: %v", count, watchList)
+	}
+}
+
 func TestDispatchRuntimeAuthUpdateEnqueuesAndUpdatesState(t *testing.T) {
 	queue := make(chan AuthUpdate, 4)
 	w := &Watcher{}
@@ -1062,6 +1141,67 @@ func TestHandleEventConfigChangeSchedulesReload(t *testing.T) {
 	time.Sleep(400 * time.Millisecond)
 	if atomic.LoadInt32(&reloads) != 1 {
 		t.Fatalf("expected config change to trigger reload once, got %d", reloads)
+	}
+}
+
+func TestStartWithRenameReplaceConfigTriggersReload(t *testing.T) {
+	tmpDir := t.TempDir()
+	authDir := filepath.Join(tmpDir, "auth")
+	if err := os.MkdirAll(authDir, 0o755); err != nil {
+		t.Fatalf("failed to create auth dir: %v", err)
+	}
+	configPath := filepath.Join(tmpDir, "config.yaml")
+	writeConfig := func(port int) {
+		data := []byte(fmt.Sprintf("port: %d\nauth_dir: %s\n", port, authDir))
+		if err := os.WriteFile(configPath, data, 0o644); err != nil {
+			t.Fatalf("failed to write config file: %v", err)
+		}
+	}
+	writeConfig(8080)
+
+	reloadCh := make(chan int, 4)
+	w, err := NewWatcher(configPath, authDir, func(cfg *config.Config) {
+		reloadCh <- cfg.Port
+	})
+	if err != nil {
+		t.Fatalf("failed to create watcher: %v", err)
+	}
+	defer w.Stop()
+	w.SetConfig(&config.Config{Port: 8080, AuthDir: authDir})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := w.Start(ctx); err != nil {
+		t.Fatalf("expected Start to succeed: %v", err)
+	}
+
+	select {
+	case port := <-reloadCh:
+		if port != 8080 {
+			t.Fatalf("expected initial reload port 8080, got %d", port)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for initial reload")
+	}
+
+	tempPath := filepath.Join(tmpDir, "config.yaml.tmp")
+	if err := os.WriteFile(tempPath, []byte(fmt.Sprintf("port: %d\nauth_dir: %s\n", 9090, authDir)), 0o644); err != nil {
+		t.Fatalf("failed to write temp config: %v", err)
+	}
+	if err := os.Rename(tempPath, configPath); err != nil {
+		t.Fatalf("failed to rename temp config into place: %v", err)
+	}
+
+	deadline := time.After(5 * time.Second)
+	for {
+		select {
+		case port := <-reloadCh:
+			if port == 9090 {
+				return
+			}
+		case <-deadline:
+			t.Fatal("timed out waiting for rename-based config reload")
+		}
 	}
 }
 

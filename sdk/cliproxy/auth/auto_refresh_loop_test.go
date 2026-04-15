@@ -141,13 +141,35 @@ func TestNextRefreshCheckAt_RefreshEvaluatorFallback(t *testing.T) {
 
 func TestNextRefreshCheckAt_CodexUsesAccessTokenExpiryWindow(t *testing.T) {
 	now := time.Date(2026, 4, 12, 0, 0, 0, 0, time.UTC)
-	expiry := now.Add(10 * time.Hour)
+	expiry := now.Add(24 * time.Hour)
 	auth := &Auth{
 		ID:       "codex-exp",
 		Provider: "codex",
 		Metadata: map[string]any{
 			"refresh_token": "rt",
 			"access_token":  testJWTWithExp(expiry),
+		},
+	}
+
+	got, ok := nextRefreshCheckAt(now, auth, 15*time.Minute)
+	if !ok {
+		t.Fatalf("nextRefreshCheckAt() ok = false, want true")
+	}
+	want := expiry.Add(-codexProactiveRefreshWindow)
+	if !got.Equal(want) {
+		t.Fatalf("nextRefreshCheckAt() = %s, want %s", got, want)
+	}
+}
+
+func TestNextRefreshCheckAt_CodexUsesMetadataExpiryWindow(t *testing.T) {
+	now := time.Date(2026, 4, 12, 0, 0, 0, 0, time.UTC)
+	expiry := now.Add(24 * time.Hour)
+	auth := &Auth{
+		ID:       "codex-expired-meta",
+		Provider: "codex",
+		Metadata: map[string]any{
+			"refresh_token": "rt",
+			"expired":       expiry.Format(time.RFC3339),
 		},
 	}
 

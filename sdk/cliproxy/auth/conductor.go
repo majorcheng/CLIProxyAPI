@@ -72,8 +72,8 @@ const (
 	// unlimitedRetrySafetyCap bounds legacy "retry all credentials" mode so a
 	// single unhealthy request cannot fan out across thousands of auth files.
 	unlimitedRetrySafetyCap = 32
-	// Codex 按官方思路优先看 AT 自身 exp；本地策略只在到期前 3 小时内做主动 refresh。
-	codexProactiveRefreshWindow = 3 * time.Hour
+	// Codex 按官方思路优先看 AT 自身 exp；本地策略只在到期前 12 小时内做主动 refresh。
+	codexProactiveRefreshWindow = 12 * time.Hour
 	// 当 Codex access token 缺少可解析 exp 时，回退到官方约 8 天的 stale 判定窗口。
 	codexLastRefreshStaleWindow = 8 * 24 * time.Hour
 )
@@ -3853,7 +3853,7 @@ func (m *Manager) shouldRefreshCodexFromTokenJSON(a *Auth, now, lastRefresh, exp
 	}
 
 	// Codex 默认不再使用 provider 级固定 lead：
-	// 1. 优先解析 access token 自身的 exp，并只在到期前 3 小时内主动 refresh；
+	// 1. 优先解析 access token 自身的 exp，并只在到期前 12 小时内主动 refresh；
 	// 2. 若拿不到 exp，再退回到官方客户端近似的 last_refresh 8 天 stale 规则；
 	// 3. 若两类时间信号都没有，则保持静默，不做探测式 refresh。
 	if tokenExpiry, ok := authCodexAccessTokenExpiry(a); ok && !tokenExpiry.IsZero() {

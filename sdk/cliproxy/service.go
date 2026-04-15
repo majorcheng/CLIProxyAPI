@@ -2177,6 +2177,9 @@ func (s *Service) Run(ctx context.Context) error {
 			return
 		}
 
+		// 远端 models catalog 抓取与主服务保持同一份全局 proxy-url 配置。
+		registry.SetGlobalProxyURL(newCfg.ProxyURL)
+
 		nextStrategy := strings.ToLower(strings.TrimSpace(newCfg.Routing.Strategy))
 		normalizeStrategy := func(strategy string) string {
 			switch strategy {

@@ -1,6 +1,7 @@
 package registry
 
 import (
+	"reflect"
 	"testing"
 	"time"
 )
@@ -148,31 +149,38 @@ func TestLookupModelInfoReturnsCloneForStaticDefinitions(t *testing.T) {
 	}
 }
 
-func TestCodexPlanStaticModelsIncludeGPT54Mini(t *testing.T) {
+// collectModelIDs 把静态模型切片收口成 ID 列表，便于直接断言套餐模型清单。
+func collectModelIDs(models []*ModelInfo) []string {
+	ids := make([]string, 0, len(models))
+	for _, model := range models {
+		if model != nil {
+			ids = append(ids, model.ID)
+		}
+	}
+	return ids
+}
+
+func TestCodexPlanStaticModelsMatchSelectivePortedCatalog(t *testing.T) {
 	tests := []struct {
-		name   string
-		models []*ModelInfo
+		name    string
+		models  []*ModelInfo
+		wantIDs []string
 	}{
-		{name: "codex-free", models: GetCodexFreeModels()},
-		{name: "codex-team", models: GetCodexTeamModels()},
-		{name: "codex-plus", models: GetCodexPlusModels()},
-		{name: "codex-pro", models: GetCodexProModels()},
+		{name: "codex-free", models: GetCodexFreeModels(), wantIDs: []string{"gpt-5.2", "gpt-5.3-codex", "gpt-5.4", "gpt-5.4-mini"}},
+		{name: "codex-team", models: GetCodexTeamModels(), wantIDs: []string{"gpt-5.2", "gpt-5.3-codex", "gpt-5.4", "gpt-5.4-mini"}},
+		{name: "codex-plus", models: GetCodexPlusModels(), wantIDs: []string{"gpt-5.2", "gpt-5.3-codex", "gpt-5.3-codex-spark", "gpt-5.4", "gpt-5.4-mini"}},
+		{name: "codex-pro", models: GetCodexProModels(), wantIDs: []string{"gpt-5.2", "gpt-5.3-codex", "gpt-5.3-codex-spark", "gpt-5.4", "gpt-5.4-mini"}},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			found := false
-			for _, model := range tt.models {
-				if model != nil && model.ID == "gpt-5.4-mini" {
-					found = true
-					if model.Thinking == nil || len(model.Thinking.Levels) == 0 {
-						t.Fatalf("expected gpt-5.4-mini thinking levels in %s", tt.name)
-					}
-					break
-				}
+			gotIDs := collectModelIDs(tt.models)
+			if !reflect.DeepEqual(gotIDs, tt.wantIDs) {
+				t.Fatalf("static model ids = %v, want %v", gotIDs, tt.wantIDs)
 			}
-			if !found {
-				t.Fatalf("expected gpt-5.4-mini in %s static models", tt.name)
+			last := tt.models[len(tt.models)-1]
+			if last == nil || last.ID != "gpt-5.4-mini" || last.Thinking == nil || len(last.Thinking.Levels) == 0 {
+				t.Fatalf("expected gpt-5.4-mini with thinking levels at tail of %s, got %+v", tt.name, last)
 			}
 		})
 	}

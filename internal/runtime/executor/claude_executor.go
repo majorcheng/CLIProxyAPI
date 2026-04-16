@@ -911,6 +911,11 @@ func applyClaudeHeaders(r *http.Request, auth *cliproxyauth.Auth, apiKey string,
 			baseBetas += ",oauth-2025-04-20"
 		}
 	}
+	// interleaved-thinking 是 Claude thinking block 正常返回的关键 beta，
+	// 即使客户端自带 Anthropic-Beta，也要兜底补齐，避免上游只看到自定义 beta 后丢失该能力。
+	if !strings.Contains(baseBetas, "interleaved-thinking") {
+		baseBetas += ",interleaved-thinking-2025-05-14"
+	}
 
 	hasClaude1MHeader := false
 	if ginHeaders != nil {

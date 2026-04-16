@@ -683,6 +683,27 @@ func TestApplyClaudeHeaders_APIKeyModeAddsClaudeSessionHeaders(t *testing.T) {
 	}
 }
 
+func TestApplyClaudeHeaders_PreservesIncomingBetasAndBackfillsInterleavedThinking(t *testing.T) {
+	auth := &cliproxyauth.Auth{
+		ID: "auth-beta-backfill",
+		Attributes: map[string]string{
+			"api_key": "key-beta-backfill",
+		},
+	}
+
+	req := newClaudeHeaderTestRequest(t, http.Header{
+		"Anthropic-Beta": []string{"custom-beta-1,oauth-2025-04-20"},
+	})
+	applyClaudeHeaders(req, auth, "key-beta-backfill", false, nil, &config.Config{})
+
+	betas := req.Header.Get("Anthropic-Beta")
+	for _, flag := range []string{"custom-beta-1", "oauth-2025-04-20", "interleaved-thinking-2025-05-14"} {
+		if !strings.Contains(betas, flag) {
+			t.Fatalf("Anthropic-Beta missing %q: %q", flag, betas)
+		}
+	}
+}
+
 func TestApplyClaudeHeaders_OAuthModeSkipsBrowserAccessHeader(t *testing.T) {
 	auth := &cliproxyauth.Auth{
 		ID:       "auth-oauth-mode",

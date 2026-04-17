@@ -253,6 +253,12 @@ type RoutingConfig struct {
 	// Strategy selects the credential selection strategy.
 	// Supported values: "round-robin" (default), "fill-first", "success-rate", "simhash".
 	Strategy string `yaml:"strategy,omitempty" json:"strategy,omitempty"`
+	// ClaudeCodeSessionAffinity 为旧配置别名，保留给历史用户平滑迁移。
+	ClaudeCodeSessionAffinity bool `yaml:"claude-code-session-affinity,omitempty" json:"claude-code-session-affinity,omitempty"`
+	// SessionAffinity 控制是否启用通用 session -> auth 粘连路由。
+	SessionAffinity bool `yaml:"session-affinity,omitempty" json:"session-affinity,omitempty"`
+	// SessionAffinityTTL 控制 session -> auth 绑定的存活时间，默认 1h。
+	SessionAffinityTTL string `yaml:"session-affinity-ttl,omitempty" json:"session-affinity-ttl,omitempty"`
 	// PriorityZeroStrategy 仅在当前命中的最高 ready priority bucket 为 0 时覆盖 Strategy。
 	// Supported values: "" (follow Strategy), "round-robin", "fill-first".
 	PriorityZeroStrategy string `yaml:"priority-zero-strategy,omitempty" json:"priority-zero-strategy,omitempty"`

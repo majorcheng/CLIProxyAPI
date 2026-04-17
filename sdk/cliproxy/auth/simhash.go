@@ -31,7 +31,7 @@ type requestBodyAnalysis struct {
 }
 
 func ensureRequestSimHashMetadata(opts cliproxyexecutor.Options, selector Selector) cliproxyexecutor.Options {
-	if _, ok := selector.(*SimHashSelector); !ok {
+	if simHashSelectorOf(selector) == nil {
 		return opts
 	}
 	if hasRequestSimHashMetadata(opts.Metadata) {

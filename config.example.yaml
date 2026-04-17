@@ -204,6 +204,9 @@ quota-exceeded:
 # 多个凭证同时匹配时的选路策略。
 routing:
   strategy: "round-robin" # round-robin（默认）、fill-first、success-rate、simhash
+  # session-affinity: true # 为 true 时，同一 session 会优先粘到同一 auth；若本轮从 A 切到 B 并成功，后续会继续粘在 B
+  # session-affinity-ttl: "1h" # session -> auth 绑定的存活时间；活跃命中会自动续期
+  # claude-code-session-affinity: true # 旧配置别名，保留兼容；新配置统一使用 session-affinity
   # priority-zero-strategy: "fill-first" # 仅当当前命中的最高 priority bucket 为 0 时覆盖 strategy；支持 round-robin / fill-first，留空表示跟随 strategy
   # max-inflight-per-auth: 5    # 单个 auth 同时允许的最大进行中请求数；0 表示不限制
   # success-rate:

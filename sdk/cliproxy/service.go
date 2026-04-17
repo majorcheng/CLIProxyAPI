@@ -16,6 +16,7 @@ import (
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/api"
 	codexauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/codex"
+	internalconfig "github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/executor"
 	internalusage "github.com/router-for-me/CLIProxyAPI/v6/internal/usage"
@@ -2152,16 +2153,18 @@ func (s *Service) Run(ctx context.Context) error {
 
 	var watcherWrapper *WatcherWrapper
 	reloadCallback := func(newCfg *config.Config) {
-		previousStrategy := ""
+		previousSelectorSnapshot := routingSelectorConfigSnapshot{}
 		previousUsageEnabled := false
 		previousUsagePersistenceInterval := time.Duration(0)
 		previousUsageRetentionDays := 0
+		previousSimHashConfig := internalconfig.RoutingSimHashConfig{}
 		s.cfgMu.RLock()
 		if s.cfg != nil {
-			previousStrategy = strings.ToLower(strings.TrimSpace(s.cfg.Routing.Strategy))
+			previousSelectorSnapshot = routingSelectorSnapshot(s.cfg)
 			previousUsageEnabled = s.cfg.UsageStatisticsEnabled
 			previousUsagePersistenceInterval = usagePersistenceIntervalForConfig(s.cfg)
 			previousUsageRetentionDays = s.cfg.UsageStatisticsRetentionDays
+			previousSimHashConfig = s.cfg.Routing.SimHash
 		}
 		s.cfgMu.RUnlock()
 
@@ -2177,39 +2180,13 @@ func (s *Service) Run(ctx context.Context) error {
 		// 远端 models catalog 抓取与主服务保持同一份全局 proxy-url 配置。
 		registry.SetGlobalProxyURL(newCfg.ProxyURL)
 
-		nextStrategy := strings.ToLower(strings.TrimSpace(newCfg.Routing.Strategy))
-		normalizeStrategy := func(strategy string) string {
-			switch strategy {
-			case "fill-first", "fillfirst", "ff":
-				return "fill-first"
-			case "success-rate", "successrate", "sr":
-				return "success-rate"
-			case "simhash", "sh":
-				return "simhash"
-			default:
-				return "round-robin"
-			}
-		}
-		previousStrategy = normalizeStrategy(previousStrategy)
-		nextStrategy = normalizeStrategy(nextStrategy)
-		if s.coreManager != nil && previousStrategy != nextStrategy {
-			var selector coreauth.Selector
-			switch nextStrategy {
-			case "fill-first":
-				selector = &coreauth.FillFirstSelector{}
-			case "success-rate":
-				selector = coreauth.NewSuccessRateSelector(
-					newCfg.Routing.SuccessRate.HalfLifeSeconds,
-					newCfg.Routing.SuccessRate.ExploreRate,
-				)
-			case "simhash":
-				selector = coreauth.NewSimHashSelector(newCfg.Routing.SimHash)
-			default:
-				selector = &coreauth.RoundRobinSelector{}
-			}
-			s.coreManager.SetSelector(selector)
-		} else if s.coreManager != nil && nextStrategy == "simhash" {
-			if selector, ok := s.coreManager.Selector().(*coreauth.SimHashSelector); ok && selector != nil {
+		nextSelectorSnapshot := routingSelectorSnapshot(newCfg)
+		if s.coreManager != nil && previousSelectorSnapshot != nextSelectorSnapshot {
+			s.coreManager.SetSelector(buildRoutingSelector(newCfg))
+		} else if s.coreManager != nil && nextSelectorSnapshot.strategy == "simhash" && previousSimHashConfig != newCfg.Routing.SimHash {
+			if routingSessionAffinityEnabled(newCfg) {
+				s.coreManager.SetSelector(buildRoutingSelector(newCfg))
+			} else if selector, ok := s.coreManager.Selector().(*coreauth.SimHashSelector); ok && selector != nil {
 				selector.SetConfig(newCfg.Routing.SimHash)
 			}
 		}

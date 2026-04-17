@@ -209,3 +209,90 @@
 
 - 恢复 `internal/thinking/provider/iflow/apply.go::isEnableThinkingModel` 对 `qwen3-max-preview` 的 enable-thinking 适配，并新增 `test/thinking_iflow_qwen3_test.go`，锁定真实模型 ID 的 suffix / body 两条转换路径。
 - 新增 `sdk/cliproxy/auth/provider_support.go::ValidatePersistedAuthProvider` 统一拒绝已移除的 `qwen` provider，并接到 `sdk/auth/filestore.go::readAuthFile`、`internal/store/{gitstore,objectstore}.go::readAuthFile`、`internal/watcher/synthesizer/file.go::synthesizeFileAuths`、`internal/api/handlers/management/auth_files.go::{listAuthFilesFromDisk,buildAuthFileEntry,buildAuthFromFileData}`，避免旧文件再被读入、展示或导入成可用 auth。
+
+---
+
+# session sticky 语义排查与移植记录（2026-04-17）
+
+## Observations
+
+- `sdk/cliproxy/auth/conductor.go::executeMixedOnce`、`executeCountMixedOnce`、`executeStreamMixedOnce` 在单次请求内部会把失败 auth 记入 `tried`，并继续挑下一个 auth，因此当前请求内确实可以从 tokenA 切到 tokenB。
+- `sdk/cliproxy/auth/conductor.go::publishSelectedAuthMetadata` 只会把本次请求选中的 auth ID 写回 `opts.Metadata[selected_auth_id]`，当前代码里没有任何跨请求 `session -> auth` 持久/运行态绑定逻辑。
+- `sdk/cliproxy/auth/selector.go::RoundRobinSelector.Pick` 与 `FillFirstSelector.Pick` 只依据当前 ready 候选集合和本地游标选 auth；`sdk/cliproxy/auth/conductor.go::useSchedulerFastPath` 对内建 selector 会走 scheduler fast path，语义同样是按 ready bucket 重新选，不会记住“上次该 session 成功落在哪个 auth”。
+- `sdk/cliproxy/auth/conductor.go::applyAuthFailureState` 会把 408/500/502/503/504 这类暂态故障打成 `Unavailable + NextRetryAfter`；恢复后 auth 会重新回到 ready 集合，所以当前同一 session 后续请求会再次按默认 selector 命中恢复后的 tokenA。
+- `sdk/cliproxy/auth/conductor.go::isRequestInvalidError` 会把 caller-side 400/422 识别为 request-invalid 并阻断继续重试；模型支持类 400 保持可继续切 auth。用户提到的“400 出错后切到 B”只在这类可切换 400 上成立。
+- 上游 `upstream/main` 仍保留完整 session-affinity 能力：`internal/config/config.go::RoutingConfig` 暴露 `session-affinity` / `session-affinity-ttl` / `claude-code-session-affinity`，`sdk/cliproxy/auth/selector.go::SessionAffinitySelector.Pick` 会在绑定 auth 不可用时 fallback 选新 auth 并把 cache 立刻重写到新 auth。
+- 当前分支已经有两个相关前提：`sdk/api/handlers/handlers.go::requestExecutionMetadata` 已不再伪造 `Idempotency-Key`，且 `sdk/api/handlers/handlers.go::WithExecutionSessionID` / `internal/runtime/executor/codex_request_plan.go::codexPromptCacheID` 已分别提供 execution session 与 prompt cache continuity 的局部连续性支持。
+
+## Hypotheses
+
+### H1: 当前 sticky 缺口的根因是“缺少跨请求 session->auth 绑定”，导致 A 故障期间切到 B 只在当前请求生效，下一请求又会按默认 selector 从恢复后的 A 重新开始（ROOT HYPOTHESIS）
+- Supports: 当前分支没有 `SessionAffinitySelector`、`SessionCache`、`session-affinity` 配置项，也没有在请求成功后把 session 绑定改写到成功 auth 的代码路径。
+- Conflicts: 对显式 `PinnedAuthMetadataKey` 或 websocket execution session 这类调用方自带 pin 的请求，当前已经可以保持同一 auth；但这只覆盖局部调用路径。
+- Test: 移植 session-affinity 后补一条回归：同一 session 第一次请求 A 失败、B 成功，第二次请求在 A 恢复后仍继续命中 B。
+
+### H2: 直接把上游 session-affinity selector 原样搬进当前分支会打断 success-rate / simhash / priority-zero 等现有扩展选路语义
+- Supports: 当前分支比上游新增了 `success-rate`、`simhash`、`priority-zero-strategy`，而 `ensureRequestSimHashMetadata` 目前只识别裸 `*SimHashSelector`；`useSchedulerFastPath` 也只对裸 `RoundRobin/FillFirst` 开 fast path。
+- Conflicts: 若我们给包装器补 `UnwrapSelector` / metadata 透传 / legacy 局部覆盖，能够在最小改动下保留这些语义。
+- Test: 包装 simhash 时继续写入 `request_simhash`；round-robin/fill-first + session-affinity 时继续保住 priority-zero 覆盖；success-rate 包装后继续透传 `ObserveResult`。
+
+### H3: 只做 Codex continuity key 继续不改 sticky routing，也能满足这次目标
+- Supports: `internal/runtime/executor/codex_request_plan.go::codexPromptCacheID` 已提供 prompt cache continuity。
+- Conflicts: continuity key 只保证同一 auth 上游 cache identity 稳定，不能决定“后续请求继续落到 B”；用户目标是 auth 绑定迁移后保持新 auth。
+- Test: 否决，不采用。
+
+## Root Cause
+
+- 当前 sticky 缺口的根因是：本仓运行态只有“单次请求内失败后继续尝试其它 auth”的能力，没有“同一 session 成功切到新 auth 后，把后续请求继续绑定到这个成功 auth”的跨请求绑定层，因此 A 短暂故障恢复后，同一 session 会重新回到 A，直接损失 prompt cache / 上下文连续性的收益。
+
+## Fix
+
+- 移植上游 `SessionAffinitySelector`、`SessionCache`、多格式 session ID 提取、`session-affinity` / `session-affinity-ttl` / `claude-code-session-affinity` 配置入口与热重载支持。
+- 在当前分支额外补一层“成功后立即重绑”语义：请求最终成功落到某个 auth 时，根据已提取的 session ID 立刻刷新 `session -> auth` 映射，确保 A 失败切到 B 后，后续继续稳定落到 B。
+- 为保持当前分支扩展语义，额外补三个适配点：
+  1. `simhash` 包装时继续识别并注入 `request_simhash`；
+  2. `success-rate` 包装时继续透传 `ObserveResult`；
+  3. `round-robin/fill-first + priority-zero-strategy` 与 session-affinity 组合时，在 legacy 路径补一个局部 priority-zero 覆盖包装器。
+
+---
+
+# 2026-04-17 session affinity reviewer 回归修复
+
+## Observations
+
+- `sdk/cliproxy/auth/session_affinity.go::pickAndBind` 与 `pickFromFallbackCache` 会在 selector 选出 auth 后立刻写 `SessionCache`，请求执行结果尚未产生。
+- `sdk/cliproxy/auth/conductor.go::{executeMixedOnce,executeCountMixedOnce,executeStreamMixedOnce}` 已经在成功返回路径调用 `bindSessionAffinityFromMetadata(...)`，成功态重绑能力本来就存在。
+- `sdk/cliproxy/auth/conductor.go::isBuiltInSelector` 与 `sdk/cliproxy/auth/scheduler.go::selectorStrategy` 只识别裸 `*RoundRobinSelector` / `*FillFirstSelector`，开启 sticky 包装后 mixed 请求会脱离 scheduler fast path。
+- `sdk/cliproxy/auth/scheduler.go::pickMixed` 保留 mixed fill-first 的 provider 顺序和 Codex websocket 优先语义；`sdk/cliproxy/auth/conductor.go::pickNextMixedLegacy` 使用全局扁平候选集合。
+
+## Hypotheses
+
+### H1: 失败请求污染 session cache，根因是 selector 选中时机与成功落地时机混在一起（ROOT HYPOTHESIS）
+- Supports: `pickAndBind`/`pickFromFallbackCache` 先写 cache，`executeMixedOnce` 成功路径再次写 cache。
+- Conflicts: 缓存命中需要继续刷新 TTL，这部分能力仍要保留。
+- Test: 去掉 Pick 阶段写缓存，只保留缓存命中时的 TTL 刷新与成功路径 `BindSelectedAuth` 写入；新增“失败请求不建绑定”测试。
+
+### H2: mixed fill-first 语义漂移，根因是 sticky 包装让 built-in selector 失去 scheduler fast path 身份
+- Supports: `isBuiltInSelector` 与 `selectorStrategy` 直接看具体类型，包装后走 legacy mixed path。
+- Conflicts: 单 provider 场景仍会保持正确，因为 scheduler/legacy 在单 provider 上差异较小。
+- Test: 让 built-in 检测支持 unwrap 包装层，并新增 mixed fill-first provider 顺序回归测试。
+
+### H3: mixed websocket 优先语义漂移，根因与 H2 相同，codex websocket 偏好只在 scheduler mixed path 生效
+- Supports: `pickMixed` 里有 `preferWebsocketForProvider(providerKey)`；legacy mixed path 传入 provider=`mixed`。
+- Conflicts: 单 provider 的直接 selector 仍会保留 `preferCodexWebsocketAuths`。
+- Test: 在 sticky+fill-first 下新增 mixed codex websocket 回归测试。
+
+## Experiments
+
+- 按 H1 修改 `sdk/cliproxy/auth/session_affinity.go`：`Pick` 只读取绑定并刷新命中 TTL，新的绑定统一通过成功路径 `BindSelectedAuth` 落缓存；新增 `TestSessionAffinitySelector_FailedPickDoesNotCreateBinding` 与 TTL 刷新测试验证行为。
+- 按 H2/H3 修改 `sdk/cliproxy/auth/selector_wrappers.go`、`sdk/cliproxy/auth/scheduler.go`、`sdk/cliproxy/auth/conductor.go`：built-in 判定和 scheduler strategy 统一支持 unwrap 包装层；新增 wrapped fill-first mixed provider 顺序与 codex websocket 回归测试。
+
+## Root Cause
+
+- reviewer 指出的三条回归共用两处根因：一是 `SessionAffinitySelector` 在请求成功前提前写入 cache，二是 built-in selector 识别没有穿透包装层，导致 mixed 请求离开 scheduler fast path。
+
+## Fix
+
+- `sdk/cliproxy/auth/session_affinity.go::Pick` 现在只消费已存在的成功绑定；primary/fallback cache 命中继续刷新 TTL，新绑定统一由 `BindSelectedAuth` 在成功路径写入，失败请求不会再污染 sticky 关系。
+- `sdk/cliproxy/auth/selector_wrappers.go::builtInSelectorStrategy` 提供统一 unwrap 能力，`sdk/cliproxy/auth/scheduler.go::{newAuthScheduler,selectorStrategy}` 与 `sdk/cliproxy/auth/conductor.go::isBuiltInSelector` 改为复用该能力，因此 `SessionAffinitySelector`、`PriorityZeroOverrideSelector` 等包装后的 RR/FF 继续保留 scheduler fast path 语义。
+- 新增回归测试覆盖：失败请求不建绑定、成功绑定后的 TTL 刷新、wrapped fill-first mixed provider 顺序、wrapped fill-first mixed codex websocket 偏好。

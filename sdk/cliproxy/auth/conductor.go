@@ -230,12 +230,8 @@ func NewManager(store Store, selector Selector, hook Hook) *Manager {
 }
 
 func isBuiltInSelector(selector Selector) bool {
-	switch selector.(type) {
-	case *RoundRobinSelector, *FillFirstSelector:
-		return true
-	default:
-		return false
-	}
+	_, ok := builtInSelectorStrategy(selector)
+	return ok
 }
 
 func (m *Manager) syncSchedulerFromSnapshot(auths []*Auth) {
@@ -350,12 +346,17 @@ func (m *Manager) SetSelector(selector Selector) {
 	if selector == nil {
 		selector = &RoundRobinSelector{}
 	}
+	var oldSelector Selector
 	m.mu.Lock()
+	oldSelector = m.selector
 	m.selector = selector
 	m.mu.Unlock()
 	if m.scheduler != nil {
 		m.scheduler.setSelector(selector)
 		m.syncScheduler()
+	}
+	if oldSelector != nil && oldSelector != selector {
+		stopSelector(oldSelector)
 	}
 }
 
@@ -1487,6 +1488,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 	}
 	routeModel := req.Model
 	opts = ensureRequestedModelMetadata(opts, routeModel)
+	opts = ensureSessionAffinityMetadata(opts, m.selector)
 	opts = ensureRequestSimHashMetadata(opts, m.selector)
 	tried := make(map[string]struct{})
 	attempted := make(map[string]struct{})
@@ -1573,6 +1575,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			}
 			audit.SetClientResponse(execCtx, resp.Payload)
 			m.MarkResult(execCtx, result)
+			bindSessionAffinityFromMetadata(m.selector, opts.Metadata, sessionAffinityProviderScope(providers, provider), routeModel, auth.ID)
 			release()
 			return resp, nil
 		}
@@ -1600,6 +1603,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 	}
 	routeModel := req.Model
 	opts = ensureRequestedModelMetadata(opts, routeModel)
+	opts = ensureSessionAffinityMetadata(opts, m.selector)
 	opts = ensureRequestSimHashMetadata(opts, m.selector)
 	tried := make(map[string]struct{})
 	attempted := make(map[string]struct{})
@@ -1686,6 +1690,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 			}
 			audit.SetClientResponse(execCtx, resp.Payload)
 			m.MarkResult(execCtx, result)
+			bindSessionAffinityFromMetadata(m.selector, opts.Metadata, sessionAffinityProviderScope(providers, provider), routeModel, auth.ID)
 			release()
 			return resp, nil
 		}
@@ -1713,6 +1718,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 	}
 	routeModel := req.Model
 	opts = ensureRequestedModelMetadata(opts, routeModel)
+	opts = ensureSessionAffinityMetadata(opts, m.selector)
 	opts = ensureRequestSimHashMetadata(opts, m.selector)
 	tried := make(map[string]struct{})
 	attempted := make(map[string]struct{})
@@ -1791,8 +1797,17 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 			lastErr = errStream
 			continue
 		}
+		bindSessionAffinityFromMetadata(m.selector, opts.Metadata, sessionAffinityProviderScope(providers, provider), routeModel, auth.ID)
 		return streamResult, nil
 	}
+}
+
+func sessionAffinityProviderScope(providers []string, provider string) string {
+	scope := sessionAffinityScopeForProviders(providers)
+	if scope != "" {
+		return scope
+	}
+	return provider
 }
 
 func ensureRequestedModelMetadata(opts cliproxyexecutor.Options, requestedModel string) cliproxyexecutor.Options {
@@ -3437,6 +3452,9 @@ func (m *Manager) pickNext(ctx context.Context, provider, model string, opts cli
 	if !m.useSchedulerFastPath() {
 		return m.pickNextLegacy(ctx, provider, model, opts, tried)
 	}
+	if selected, executor, ok := m.pickBoundSingleFastPath(ctx, provider, model, opts, tried); ok {
+		return selected, executor, nil
+	}
 	executor, okExecutor := m.Executor(provider)
 	if !okExecutor {
 		return nil, nil, &Error{Code: "executor_not_found", Message: "executor not registered"}
@@ -3557,6 +3575,9 @@ func (m *Manager) pickNextMixed(ctx context.Context, providers []string, model s
 	if len(eligibleProviders) == 0 {
 		return nil, nil, "", &Error{Code: "auth_not_found", Message: "no auth available"}
 	}
+	if selected, executor, resolvedProvider, ok := m.pickBoundMixedFastPath(ctx, eligibleProviders, model, opts, tried); ok {
+		return selected, executor, resolvedProvider, nil
+	}
 
 	selected, providerKey, errPick := m.scheduler.pickMixed(ctx, eligibleProviders, model, opts, tried)
 	if errPick != nil && model != "" && shouldRetrySchedulerPick(errPick) {
@@ -3574,6 +3595,124 @@ func (m *Manager) pickNextMixed(ctx context.Context, providers []string, model s
 		return nil, nil, "", &Error{Code: "executor_not_found", Message: "executor not registered"}
 	}
 	return m.finalizePickedAuth(selected), executor, resolvedProvider, nil
+}
+
+func (m *Manager) pickBoundSingleFastPath(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Auth, ProviderExecutor, bool) {
+	affinity := sessionAffinitySelectorOf(m.selector)
+	if affinity == nil || pinnedAuthIDFromMetadata(opts.Metadata) != "" {
+		return nil, nil, false
+	}
+	candidates, executor, _, ok := m.collectAffinityCandidates([]string{provider}, model, opts, tried)
+	if !ok {
+		return nil, nil, false
+	}
+	selected, hit := affinity.pickBoundAuth(ctx, provider, model, opts, candidates)
+	if !hit || selected == nil {
+		return nil, nil, false
+	}
+	return m.finalizePickedAuth(selected.Clone()), executor, true
+}
+
+func (m *Manager) pickBoundMixedFastPath(ctx context.Context, providers []string, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Auth, ProviderExecutor, string, bool) {
+	affinity := sessionAffinitySelectorOf(m.selector)
+	if affinity == nil || pinnedAuthIDFromMetadata(opts.Metadata) != "" {
+		return nil, nil, "", false
+	}
+	candidates, _, executors, ok := m.collectAffinityCandidates(providers, model, opts, tried)
+	if !ok {
+		return nil, nil, "", false
+	}
+	scope := sessionAffinityScopeForProviders(providers)
+	selected, hit := affinity.pickBoundAuth(ctx, scope, model, opts, candidates)
+	if !hit || selected == nil {
+		return nil, nil, "", false
+	}
+	providerKey := strings.TrimSpace(strings.ToLower(selected.Provider))
+	executor, resolvedProvider, ok := m.executorForAuth(providerKey, selected)
+	if !ok {
+		return nil, nil, "", false
+	}
+	if _, allowed := executors[providerKey]; !allowed {
+		return nil, nil, "", false
+	}
+	return m.finalizePickedAuth(selected.Clone()), executor, resolvedProvider, true
+}
+
+func (m *Manager) collectAffinityCandidates(providers []string, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) ([]*Auth, ProviderExecutor, map[string]ProviderExecutor, bool) {
+	if m == nil {
+		return nil, nil, nil, false
+	}
+	modelKey := strings.TrimSpace(model)
+	if modelKey != "" {
+		parsed := thinking.ParseSuffix(modelKey)
+		if parsed.ModelName != "" {
+			modelKey = strings.TrimSpace(parsed.ModelName)
+		}
+	}
+	providerSet := make(map[string]struct{}, len(providers))
+	for _, provider := range providers {
+		providerKey := strings.TrimSpace(strings.ToLower(provider))
+		if providerKey == "" {
+			continue
+		}
+		providerSet[providerKey] = struct{}{}
+	}
+	if len(providerSet) == 0 {
+		return nil, nil, nil, false
+	}
+
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	registryRef := registry.GetGlobalRegistry()
+	candidates := make([]*Auth, 0, len(m.auths))
+	executors := make(map[string]ProviderExecutor, len(providerSet))
+	var singleExecutor ProviderExecutor
+	for providerKey := range providerSet {
+		executor, ok := m.executors[providerKey]
+		if !ok {
+			continue
+		}
+		executors[providerKey] = executor
+		singleExecutor = executor
+	}
+	if len(executors) == 0 {
+		return nil, nil, nil, false
+	}
+	for _, candidate := range m.auths {
+		if candidate == nil || candidate.Disabled {
+			continue
+		}
+		if shouldSkipAuthByClientPolicy(opts.Metadata, candidate) {
+			continue
+		}
+		providerKey := strings.TrimSpace(strings.ToLower(candidate.Provider))
+		if _, ok := executors[providerKey]; !ok {
+			continue
+		}
+		if len(tried) > 0 {
+			if _, used := tried[candidate.ID]; used {
+				continue
+			}
+		}
+		if modelKey != "" && registryRef != nil && !registryRef.ClientSupportsModel(candidate.ID, modelKey) {
+			continue
+		}
+		candidates = append(candidates, candidate)
+	}
+	if len(candidates) == 0 {
+		return nil, nil, nil, false
+	}
+	return candidates, singleExecutor, executors, true
+}
+
+func sessionAffinityScopeForProviders(providers []string) string {
+	if len(providers) > 1 {
+		return "mixed"
+	}
+	if len(providers) == 1 {
+		return providers[0]
+	}
+	return ""
 }
 
 func (m *Manager) finalizePickedAuth(authCopy *Auth) *Auth {
@@ -3681,14 +3820,17 @@ func (m *Manager) RefreshAuthNow(ctx context.Context, id string) (*Auth, error) 
 
 // StopAutoRefresh cancels the background refresh loop, if running.
 func (m *Manager) StopAutoRefresh() {
+	var currentSelector Selector
 	m.mu.Lock()
 	cancel := m.refreshCancel
 	m.refreshCancel = nil
 	m.refreshLoop = nil
+	currentSelector = m.selector
 	m.mu.Unlock()
 	if cancel != nil {
 		cancel()
 	}
+	stopSelector(currentSelector)
 }
 
 func (m *Manager) queueRefreshReschedule(authID string) {

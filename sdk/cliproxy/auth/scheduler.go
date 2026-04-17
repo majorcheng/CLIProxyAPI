@@ -208,8 +208,12 @@ func restoreModelSchedulerCursors(shard *modelScheduler, state modelSchedulerCur
 
 // newAuthScheduler constructs an empty scheduler configured for the supplied selector strategy.
 func newAuthScheduler(selector Selector) *authScheduler {
+	strategy, ok := builtInSelectorStrategy(selector)
+	if !ok {
+		strategy = schedulerStrategyCustom
+	}
 	return &authScheduler{
-		strategy:        selectorStrategy(selector),
+		strategy:        strategy,
 		providers:       make(map[string]*providerScheduler),
 		providerAliases: make(map[string]string),
 		authProviders:   make(map[string]string),
@@ -219,14 +223,10 @@ func newAuthScheduler(selector Selector) *authScheduler {
 
 // selectorStrategy maps a selector implementation to the scheduler semantics it should emulate.
 func selectorStrategy(selector Selector) schedulerStrategy {
-	switch selector.(type) {
-	case *FillFirstSelector:
-		return schedulerStrategyFillFirst
-	case nil, *RoundRobinSelector:
-		return schedulerStrategyRoundRobin
-	default:
-		return schedulerStrategyCustom
+	if strategy, ok := builtInSelectorStrategy(selector); ok {
+		return strategy
 	}
+	return schedulerStrategyCustom
 }
 
 // setSelector updates the active built-in strategy and resets mixed-provider cursors.

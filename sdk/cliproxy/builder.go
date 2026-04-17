@@ -234,30 +234,11 @@ func (b *Builder) Build() (*Service, error) {
 			proxySetter.SetGlobalProxyURL(b.cfg.ProxyURL)
 		}
 
-		strategy := ""
-		if b.cfg != nil {
-			strategy = strings.ToLower(strings.TrimSpace(b.cfg.Routing.Strategy))
-		}
-		var selector coreauth.Selector
-		switch strategy {
-		case "fill-first", "fillfirst", "ff":
-			selector = &coreauth.FillFirstSelector{}
-		case "success-rate", "successrate", "sr":
-			selector = coreauth.NewSuccessRateSelector(
-				b.cfg.Routing.SuccessRate.HalfLifeSeconds,
-				b.cfg.Routing.SuccessRate.ExploreRate,
-			)
-		case "simhash", "sh":
-			selector = coreauth.NewSimHashSelector(b.cfg.Routing.SimHash)
-		default:
-			selector = &coreauth.RoundRobinSelector{}
-		}
-
 		var hook coreauth.Hook
 		if auditHook := audit.NewHook(&b.cfg.RequestAudit); auditHook != nil {
 			hook = &requestAuditHook{sink: auditHook}
 		}
-		coreManager = coreauth.NewManager(tokenStore, selector, hook)
+		coreManager = coreauth.NewManager(tokenStore, buildRoutingSelector(b.cfg), hook)
 	}
 	// Attach a default RoundTripper provider so providers can opt-in per-auth transports.
 	coreManager.SetRoundTripperProvider(newDefaultRoundTripperProvider())

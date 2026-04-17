@@ -433,6 +433,22 @@ func TestBuildAuthFromFileData_CodexPlanTypeFromIDToken(t *testing.T) {
 	}
 }
 
+func TestBuildAuthFromFileData_RejectsRemovedQwenProvider(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	gin.SetMode(gin.TestMode)
+
+	authDir := t.TempDir()
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, nil)
+
+	_, err := h.buildAuthFromFileData(
+		filepath.Join(authDir, "qwen.json"),
+		[]byte(`{"type":"qwen","email":"legacy@example.com"}`),
+	)
+	if err == nil {
+		t.Fatal("expected buildAuthFromFileData() to reject removed qwen provider")
+	}
+}
+
 func TestDeleteAuthFile_BatchQuery(t *testing.T) {
 	t.Setenv("MANAGEMENT_PASSWORD", "")
 	gin.SetMode(gin.TestMode)

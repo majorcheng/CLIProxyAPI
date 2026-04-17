@@ -168,6 +168,7 @@ func (s *FileTokenStore) List(ctx context.Context) ([]*cliproxyauth.Auth, error)
 		}
 		auth, err := s.readAuthFile(path, dir)
 		if err != nil {
+			log.WithError(err).Warnf("auth filestore: skip auth %s", path)
 			return nil
 		}
 		if auth != nil {
@@ -226,6 +227,9 @@ func (s *FileTokenStore) readAuthFile(path, baseDir string) (*cliproxyauth.Auth,
 	provider = strings.TrimSpace(provider)
 	if provider == "" {
 		return nil, nil
+	}
+	if err = cliproxyauth.ValidatePersistedAuthProvider(provider); err != nil {
+		return nil, err
 	}
 	s.hydrateProjectID(path, provider, metadata)
 	info, err := os.Stat(path)

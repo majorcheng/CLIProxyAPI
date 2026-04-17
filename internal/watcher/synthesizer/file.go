@@ -13,6 +13,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/auth/codex"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/geminicli"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
+	log "github.com/sirupsen/logrus"
 )
 
 // FileSynthesizer generates Auth entries from OAuth JSON files.
@@ -80,6 +81,10 @@ func synthesizeFileAuths(ctx *SynthesisContext, fullPath string, data []byte) []
 		return nil
 	}
 	provider := strings.ToLower(t)
+	if err := coreauth.ValidatePersistedAuthProvider(provider); err != nil {
+		log.WithError(err).Warnf("watcher: skip unsupported auth file %s", fullPath)
+		return nil
+	}
 	if provider == "gemini" {
 		provider = "gemini-cli"
 	}

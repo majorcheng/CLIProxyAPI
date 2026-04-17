@@ -576,6 +576,9 @@ func (s *ObjectTokenStore) readAuthFile(path, baseDir string) (*cliproxyauth.Aut
 	if provider == "" {
 		return nil, nil
 	}
+	if err = cliproxyauth.ValidatePersistedAuthProvider(provider); err != nil {
+		return nil, err
+	}
 	info, err := os.Stat(path)
 	if err != nil {
 		return nil, fmt.Errorf("stat auth file: %w", err)

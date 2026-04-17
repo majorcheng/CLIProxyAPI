@@ -141,9 +141,9 @@ type Config struct {
 	// OAuthExcludedModels defines per-provider global model exclusions applied to OAuth/file-backed auth entries.
 	OAuthExcludedModels map[string][]string `yaml:"oauth-excluded-models,omitempty" json:"oauth-excluded-models,omitempty"`
 
-	// OAuthModelAlias defines global model name aliases for OAuth/file-backed auth channels.
-	// These aliases affect both model listing and model routing for supported channels:
-	// gemini-cli, vertex, aistudio, antigravity, claude, codex, qwen, iflow.
+	// OAuthModelAlias 定义基于 OAuth/文件凭证通道的全局模型别名。
+	// 这些别名会同时影响支持通道的模型列表与请求路由：
+	// gemini-cli、vertex、aistudio、antigravity、claude、codex、iflow。
 	//
 	// NOTE: This does not apply to existing per-credential model alias features under:
 	// gemini-api-key, codex-api-key, claude-api-key, openai-compatibility, vertex-api-key, and ampcode.

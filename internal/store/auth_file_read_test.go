@@ -43,6 +43,40 @@ func TestObjectTokenStoreReadAuthFileIgnoresNonAuthJSON(t *testing.T) {
 	}
 }
 
+func TestGitTokenStoreReadAuthFileRejectsRemovedQwenProvider(t *testing.T) {
+	tempDir := t.TempDir()
+	path := filepath.Join(tempDir, "qwen.json")
+	if err := os.WriteFile(path, []byte(`{"type":"qwen","email":"legacy@example.com"}`), 0o600); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	store := &GitTokenStore{}
+	auth, err := store.readAuthFile(path, tempDir)
+	if err == nil {
+		t.Fatal("expected readAuthFile() to reject removed qwen provider")
+	}
+	if auth != nil {
+		t.Fatalf("readAuthFile() = %#v, want nil", auth)
+	}
+}
+
+func TestObjectTokenStoreReadAuthFileRejectsRemovedQwenProvider(t *testing.T) {
+	tempDir := t.TempDir()
+	path := filepath.Join(tempDir, "qwen.json")
+	if err := os.WriteFile(path, []byte(`{"type":"qwen","email":"legacy@example.com"}`), 0o600); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	store := &ObjectTokenStore{}
+	auth, err := store.readAuthFile(path, tempDir)
+	if err == nil {
+		t.Fatal("expected readAuthFile() to reject removed qwen provider")
+	}
+	if auth != nil {
+		t.Fatalf("readAuthFile() = %#v, want nil", auth)
+	}
+}
+
 func TestGitTokenStoreReadAuthFileRestoresRuntimeState(t *testing.T) {
 	testTokenStoreReadAuthFileRestoresRuntimeState(t, func() authFileReader {
 		return &GitTokenStore{}

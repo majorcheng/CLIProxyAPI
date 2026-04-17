@@ -175,3 +175,37 @@
 
 - `sdk/api/handlers/handlers.go::applyClientRoutingPolicyMetadata` 已改为仅在 `meta == nil` 或根本未命中 `max-priority` 时才早退；对“长度为 0 的非 nil map”继续写入 `coreexecutor.MaxAuthPriorityMetadataKey`。
 - `sdk/api/handlers/handlers_request_metadata_test.go` 已新增 `TestApplyClientRoutingPolicyMetadata_AllowsEmptyMetadataFromRequestExecutionMetadata`，锁定“无 `Idempotency-Key` 的真实请求路径”不再回归。
+
+## 2026-04-17 Qwen 移除 reviewer 回归修复
+
+### Observations
+
+- `internal/registry/models/models.json` 当前仍在 `iflow` 渠道保留 `qwen3-max-preview`，并带有 `thinking.levels`。
+- `internal/thinking/provider/iflow/apply.go::isEnableThinkingModel` 在上一版移植里把 `qwen3-max-preview` 从 enable-thinking 白名单删掉了，导致 `internal/thinking/apply.go::ApplyThinking` 接受 suffix / body thinking 配置后，最终不会把它转换成 `chat_template_kwargs.enable_thinking`。
+- `sdk/auth/filestore.go::readAuthFile`、`internal/watcher/synthesizer/file.go::synthesizeFileAuths`、`internal/api/handlers/management/auth_files.go::buildAuthFromFileData` 仍会接受 `type: "qwen"` 的旧 auth JSON，因此升级后会把已下线 provider 当成正常凭证继续读入或导入。
+
+### Hypotheses
+
+#### H1: iFlow thinking 回归的根因是把仍属于 `iflow` 目录的 `qwen3-max-preview` 误当成顶层 Qwen provider 一并删掉（ROOT HYPOTHESIS）
+- Supports: registry 里该模型仍属于 `iflow`；删除白名单后，thinking 配置会在 `ApplyThinking` 后被静默丢掉。
+- Conflicts: 若上游也同步删除了 `iflow` 下这个模型，则白名单删除才合理；但当前分支没有跟进 iFlow 整体移除。
+- Test: 恢复 `internal/thinking/provider/iflow/apply.go::isEnableThinkingModel` 对 `qwen3-max-preview` 的支持，并补真实模型 ID 的 thinking 转换测试。
+
+#### H2: 僵尸认证的根因是“读取路径仍接受 qwen，运行路径已拆掉”，导致遗留文件看起来仍是有效 auth（ROOT HYPOTHESIS）
+- Supports: reviewer 指到的三处读取/导入链都还接受 `type: "qwen"`；而 executor、refresh lead、model 注册已全部移除。
+- Conflicts: 若系统在更上游还有统一 provider 拦截，则这些文件可能只是读入后被再次拒绝；但当前代码里没有这样的统一拒绝。
+- Test: 在文件读取、watcher 合成、management 导入三条路径上显式拒绝 `qwen`，并补回归测试，确认不会再把旧文件注册成 auth。
+
+#### H3: 只修 management 导入就足够
+- Supports: 用户最容易碰到的是上传旧 auth 文件。
+- Conflicts: 旧 `auth-dir` 中历史文件仍会在重启或 watcher 扫描时被读入，不能解决升级场景。
+- Test: 否决，不采用。
+
+### Root Cause
+
+- 本次 reviewer 指出的两个问题都成立，而且是两条独立回归：一是 `internal/thinking/provider/iflow/apply.go::isEnableThinkingModel` 误删了仍属于 `iflow` 模型目录的 `qwen3-max-preview`，导致 thinking 配置被静默丢弃；二是旧 `qwen` auth 文件在 `sdk/auth/filestore.go`、`internal/watcher/synthesizer/file.go` 与 `internal/api/handlers/management/auth_files.go` 里仍被接受，形成“读取成功但运行期不可用”的僵尸认证。
+
+### Fix
+
+- 恢复 `internal/thinking/provider/iflow/apply.go::isEnableThinkingModel` 对 `qwen3-max-preview` 的 enable-thinking 适配，并新增 `test/thinking_iflow_qwen3_test.go`，锁定真实模型 ID 的 suffix / body 两条转换路径。
+- 新增 `sdk/cliproxy/auth/provider_support.go::ValidatePersistedAuthProvider` 统一拒绝已移除的 `qwen` provider，并接到 `sdk/auth/filestore.go::readAuthFile`、`internal/store/{gitstore,objectstore}.go::readAuthFile`、`internal/watcher/synthesizer/file.go::synthesizeFileAuths`、`internal/api/handlers/management/auth_files.go::{listAuthFilesFromDisk,buildAuthFileEntry,buildAuthFromFileData}`，避免旧文件再被读入、展示或导入成可用 auth。

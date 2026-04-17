@@ -26,7 +26,7 @@ func reasoningEffortCandidateProviders(provider string) []string {
 		return []string{"claude"}
 	case "codex":
 		return []string{"codex", "openai"}
-	case "openai", "qwen", "kimi":
+	case "openai", "kimi":
 		return []string{"openai"}
 	case "iflow":
 		return []string{"iflow", "openai"}

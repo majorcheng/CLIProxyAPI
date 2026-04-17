@@ -335,7 +335,7 @@ nonstream-keepalive-interval: 0
 #       # 客户端在模型列表中仍然只会看到一个 alias。
 #       # 对该 alias 的请求会在下面的多个上游名称之间做 round-robin，
 #       # 如果选中的上游在产出内容前失败，请求会继续尝试同一 alias 池中的下一个上游模型。
-#       - name: "qwen3.5-plus"
+#       - name: "deepseek-v3.1"
 #         alias: "claude-opus-4.66"
 #       - name: "glm-5"
 #         alias: "claude-opus-4.66"
@@ -396,7 +396,7 @@ nonstream-keepalive-interval: 0
 
 # 全局 OAuth 模型名别名（按 channel 维度）
 # 这些别名会同时影响模型列表展示和请求路由时使用的模型 ID。
-# 支持的 channel：gemini-cli、vertex、aistudio、antigravity、claude、codex、qwen、iflow、kimi。
+# 支持的 channel：gemini-cli、vertex、aistudio、antigravity、claude、codex、iflow、kimi。
 # 注意：别名不会作用于 gemini-api-key、codex-api-key、claude-api-key、openai-compatibility、vertex-api-key 或 ampcode。
 # 你可以为同一个上游名称重复配置多个别名，以暴露多个客户端模型名。
 # oauth-model-alias:
@@ -419,9 +419,6 @@ nonstream-keepalive-interval: 0
 #   codex:
 #     - name: "gpt-5"
 #       alias: "g5"
-#   qwen:
-#     - name: "qwen3-coder-plus"
-#       alias: "qwen-plus"
 #   iflow:
 #     - name: "glm-4.7"
 #       alias: "glm-god"
@@ -446,8 +443,6 @@ nonstream-keepalive-interval: 0
 #     - "claude-3-5-haiku-20241022"
 #   codex:
 #     - "gpt-5-codex-mini"
-#   qwen:
-#     - "vision-model"
 #   iflow:
 #     - "tstars2.0"
 #   kimi:

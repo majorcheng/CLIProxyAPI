@@ -209,7 +209,7 @@ func (e *IFlowExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 	}
 
 	body = preserveReasoningContentInMessages(body)
-	// Ensure tools array exists to avoid provider quirks similar to Qwen's behaviour.
+	// 某些上游在空 tools 数组上行为不稳定，这里统一补齐以保持兼容。
 	toolsResult := gjson.GetBytes(body, "tools")
 	if toolsResult.Exists() && toolsResult.IsArray() && len(toolsResult.Array()) == 0 {
 		body = ensureToolsArray(body)

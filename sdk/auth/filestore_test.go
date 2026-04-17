@@ -264,6 +264,23 @@ func TestFileTokenStoreReadAuthFile_HydratesGeminiProjectID(t *testing.T) {
 	}
 }
 
+func TestFileTokenStoreReadAuthFile_RejectsRemovedQwenProvider(t *testing.T) {
+	tempDir := t.TempDir()
+	authPath := filepath.Join(tempDir, "qwen.json")
+	if err := os.WriteFile(authPath, []byte(`{"type":"qwen","email":"legacy@example.com"}`), 0o600); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	store := NewFileTokenStore()
+	auth, err := store.readAuthFile(authPath, tempDir)
+	if err == nil {
+		t.Fatal("expected readAuthFile() to reject removed qwen provider")
+	}
+	if auth != nil {
+		t.Fatalf("readAuthFile() auth = %#v, want nil", auth)
+	}
+}
+
 func TestFileTokenStoreListIgnoresNonAuthJSON(t *testing.T) {
 	tempDir := t.TempDir()
 	store := NewFileTokenStore()

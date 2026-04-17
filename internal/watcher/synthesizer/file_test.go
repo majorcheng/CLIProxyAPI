@@ -240,6 +240,35 @@ func TestFileSynthesizer_Synthesize_GeminiProviderMapping(t *testing.T) {
 	}
 }
 
+func TestFileSynthesizer_Synthesize_SkipsRemovedQwenProvider(t *testing.T) {
+	tempDir := t.TempDir()
+
+	authData := map[string]any{
+		"type":  "qwen",
+		"email": "legacy@example.com",
+	}
+	data, _ := json.Marshal(authData)
+	if err := os.WriteFile(filepath.Join(tempDir, "qwen-auth.json"), data, 0o644); err != nil {
+		t.Fatalf("failed to write auth file: %v", err)
+	}
+
+	synth := NewFileSynthesizer()
+	ctx := &SynthesisContext{
+		Config:      &config.Config{},
+		AuthDir:     tempDir,
+		Now:         time.Now(),
+		IDGenerator: NewStableIDGenerator(),
+	}
+
+	auths, err := synth.Synthesize(ctx)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(auths) != 0 {
+		t.Fatalf("expected removed qwen auth file to be skipped, got %d auths", len(auths))
+	}
+}
+
 func TestFileSynthesizer_Synthesize_SkipsInvalidFiles(t *testing.T) {
 	tempDir := t.TempDir()
 

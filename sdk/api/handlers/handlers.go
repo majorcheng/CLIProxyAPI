@@ -14,7 +14,6 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/google/uuid"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
@@ -190,19 +189,19 @@ func PassthroughHeadersEnabled(cfg *config.SDKConfig) bool {
 }
 
 func requestExecutionMetadata(ctx context.Context) map[string]any {
-	// Idempotency-Key is an optional client-supplied header used to correlate retries.
-	// It is forwarded as execution metadata; when absent we generate a UUID.
+	// Idempotency-Key 是可选的客户端重试关联键。
+	// 缺失时不再伪造 UUID，避免把“无幂等键请求”误写成伪 idempotency metadata。
 	key := ""
 	if ctx != nil {
 		if ginCtx, ok := ctx.Value("gin").(*gin.Context); ok && ginCtx != nil && ginCtx.Request != nil {
 			key = strings.TrimSpace(ginCtx.GetHeader("Idempotency-Key"))
 		}
 	}
-	if key == "" {
-		key = uuid.NewString()
-	}
 
-	meta := map[string]any{idempotencyKeyMetadataKey: key}
+	meta := make(map[string]any)
+	if key != "" {
+		meta[idempotencyKeyMetadataKey] = key
+	}
 	if pinnedAuthID := pinnedAuthIDFromContext(ctx); pinnedAuthID != "" {
 		meta[coreexecutor.PinnedAuthMetadataKey] = pinnedAuthID
 	}
@@ -219,7 +218,9 @@ func requestExecutionMetadata(ctx context.Context) map[string]any {
 // execution metadata，避免把原始 key 继续透传到 scheduler/auth 层。
 func applyClientRoutingPolicyMetadata(meta map[string]any, ctx context.Context, cfg *config.SDKConfig) {
 	maxPriority, ok := clientAPIKeyMaxPriority(ctx, cfg)
-	if len(meta) == 0 || !ok {
+	// 空 map 也是合法 metadata 容器；当它还没有任何字段时，
+	// max_auth_priority 可能正是本次请求需要写入的第一条 metadata。
+	if meta == nil || !ok {
 		return
 	}
 	meta[coreexecutor.MaxAuthPriorityMetadataKey] = maxPriority

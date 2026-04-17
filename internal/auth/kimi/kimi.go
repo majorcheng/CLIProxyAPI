@@ -102,10 +102,24 @@ func NewDeviceFlowClient(cfg *config.Config) *DeviceFlowClient {
 
 // NewDeviceFlowClientWithDeviceID creates a new device flow client with the specified device ID.
 func NewDeviceFlowClientWithDeviceID(cfg *config.Config, deviceID string) *DeviceFlowClient {
+	return NewDeviceFlowClientWithDeviceIDAndProxyURL(cfg, deviceID, "")
+}
+
+// NewDeviceFlowClientWithDeviceIDAndProxyURL creates a new device flow client with a proxy override.
+// auth 级 proxyURL 非空时优先于全局配置，保证设备流 refresh 与账号出口一致。
+func NewDeviceFlowClientWithDeviceIDAndProxyURL(cfg *config.Config, deviceID string, proxyURL string) *DeviceFlowClient {
 	client := &http.Client{Timeout: 30 * time.Second}
+	effectiveProxyURL := strings.TrimSpace(proxyURL)
+	var sdkCfg config.SDKConfig
 	if cfg != nil {
-		client = util.SetProxy(&cfg.SDKConfig, client)
+		sdkCfg = cfg.SDKConfig
+		if effectiveProxyURL == "" {
+			effectiveProxyURL = strings.TrimSpace(cfg.ProxyURL)
+		}
 	}
+	sdkCfg.ProxyURL = effectiveProxyURL
+	client = util.SetProxy(&sdkCfg, client)
+
 	resolvedDeviceID := strings.TrimSpace(deviceID)
 	if resolvedDeviceID == "" {
 		resolvedDeviceID = getOrCreateDeviceID()

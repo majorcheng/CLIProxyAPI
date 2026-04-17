@@ -640,7 +640,8 @@ func (e *ClaudeExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (
 	if refreshToken == "" {
 		return auth, nil
 	}
-	svc := claudeauth.NewClaudeAuth(e.cfg)
+	// refresh 必须优先复用 auth 自身 proxy_url，避免 OAuth 交换流量跑偏出口。
+	svc := claudeauth.NewClaudeAuthWithProxyURL(e.cfg, auth.ProxyURL)
 	td, err := svc.RefreshTokens(ctx, refreshToken)
 	if err != nil {
 		return nil, err

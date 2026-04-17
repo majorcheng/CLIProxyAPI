@@ -151,3 +151,27 @@
   - `TestApplyClientRoutingPolicyMetadata_UsesAuthenticatedPrincipalFromGin`
   - `TestApplyClientRoutingPolicyMetadata_RequestFallbackKeepsFirstAuthenticatedCandidate`
 - `sdk/api/handlers/handlers_request_metadata_test.go::TestApplyClientRoutingPolicyMetadata_IgnoresNonInlineAccessProvider` 也已补成带真实 request 的形态，验证非 inline provider 不会再被 request fallback 绕过。
+
+
+## 2026-04-17 reviewer 回归修复（空 metadata 跳过 max-priority）
+
+### Observations
+
+- `sdk/api/handlers/handlers.go::requestExecutionMetadata` 现在在请求未携带 `Idempotency-Key`、也没有 execution session / pinned auth 等附加信息时，会返回一个长度为 0 的非 nil metadata map。
+- `sdk/api/handlers/handlers.go::applyClientRoutingPolicyMetadata` 仍保留 `if len(meta) == 0 || !ok { return }` 的早退条件，因此这类普通请求即使已经命中受限 client key，也不会写入 `max_auth_priority`。
+- `sdk/api/handlers/handlers_request_metadata_test.go` 之前的路由策略测试都手工预填了 `idempotency_key`，没有覆盖“真实请求先走 requestExecutionMetadata，再从空 map 开始写入第一条 metadata”这条路径。
+
+### Hypothesis
+
+#### H1: `applyClientRoutingPolicyMetadata` 错把“空 map”当成“不可写 metadata”，导致 client key 的 `max-priority` 约束在普通请求上被跳过（ROOT HYPOTHESIS）
+- Supports: `requestExecutionMetadata` 返回的是可写的空 map，而不是 nil；按当前实现，`max_auth_priority` 本来就可能是该请求写入的第一条 metadata。
+- Test: 新增一条回归测试，先构造只带 `Authorization: Bearer key-direct` 的请求，再依次调用 `requestExecutionMetadata` 和 `applyClientRoutingPolicyMetadata`，确认空 map 也能成功写入 `max_auth_priority=5`，同时不伪造 `idempotency_key`。
+
+### Root Cause
+
+- 本次 selective port 把 `requestExecutionMetadata` 收口成“缺少 `Idempotency-Key` 时不再伪造 UUID”，但 `applyClientRoutingPolicyMetadata` 仍沿用旧的 `len(meta) == 0` 早退条件，导致空 metadata map 根本拿不到 `max_auth_priority` 这条首个 metadata，进而让 client key 的 `max-priority` 路由限制在大多数普通请求上失效。
+
+### Fix
+
+- `sdk/api/handlers/handlers.go::applyClientRoutingPolicyMetadata` 已改为仅在 `meta == nil` 或根本未命中 `max-priority` 时才早退；对“长度为 0 的非 nil map”继续写入 `coreexecutor.MaxAuthPriorityMetadataKey`。
+- `sdk/api/handlers/handlers_request_metadata_test.go` 已新增 `TestApplyClientRoutingPolicyMetadata_AllowsEmptyMetadataFromRequestExecutionMetadata`，锁定“无 `Idempotency-Key` 的真实请求路径”不再回归。

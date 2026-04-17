@@ -545,7 +545,8 @@ func (e *CodexExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*
 	if refreshToken == "" {
 		return auth, nil
 	}
-	svc := codexauth.NewCodexAuth(e.cfg)
+	// refresh 必须优先复用 auth 自身 proxy_url，避免多出口场景下错走全局代理。
+	svc := codexauth.NewCodexAuthWithProxyURL(e.cfg, auth.ProxyURL)
 	td, err := svc.RefreshTokensWithRetry(ctx, refreshToken, 3)
 	if err != nil {
 		return nil, err

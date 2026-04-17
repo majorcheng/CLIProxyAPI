@@ -112,6 +112,38 @@ func TestApplyClientRoutingPolicyMetadata_ReadsBearerKeyDirectlyFromRequest(t *t
 	}
 }
 
+func TestApplyClientRoutingPolicyMetadata_AllowsEmptyMetadataFromRequestExecutionMetadata(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	ginCtx, _ := gin.CreateTestContext(recorder)
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	req.Header.Set("Authorization", "Bearer key-direct")
+	ginCtx.Request = req
+
+	ctx := context.WithValue(context.Background(), "gin", ginCtx)
+	meta := requestExecutionMetadata(ctx)
+	if len(meta) != 0 {
+		t.Fatalf("requestExecutionMetadata() = %#v, want empty metadata map", meta)
+	}
+
+	cfg := &sdkconfig.SDKConfig{APIKeys: []string{"key-direct"}}
+	cfg.SetClientAPIKeyEntries([]sdkconfig.ClientAPIKey{{Key: "key-direct", MaxPriority: intPtr(5)}})
+
+	applyClientRoutingPolicyMetadata(meta, ctx, cfg)
+
+	if _, ok := meta[idempotencyKeyMetadataKey]; ok {
+		t.Fatalf("metadata should not fabricate %q: %#v", idempotencyKeyMetadataKey, meta)
+	}
+	got, ok := meta[coreexecutor.MaxAuthPriorityMetadataKey]
+	if !ok {
+		t.Fatalf("metadata missing %q after empty metadata path", coreexecutor.MaxAuthPriorityMetadataKey)
+	}
+	value, ok := got.(int)
+	if !ok || value != 5 {
+		t.Fatalf("metadata[%q] = %#v, want 5", coreexecutor.MaxAuthPriorityMetadataKey, got)
+	}
+}
+
 func TestApplyClientRoutingPolicyMetadata_ReadsQueryKeyDirectlyFromRequest(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	recorder := httptest.NewRecorder()

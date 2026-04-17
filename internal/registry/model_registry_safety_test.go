@@ -185,3 +185,19 @@ func TestCodexPlanStaticModelsMatchSelectivePortedCatalog(t *testing.T) {
 		})
 	}
 }
+
+func TestLookupStaticModelInfo_ClaudeOpus47Exists(t *testing.T) {
+	info := LookupStaticModelInfo("claude-opus-4-7")
+	if info == nil {
+		t.Fatalf("LookupStaticModelInfo returned nil for claude-opus-4-7")
+	}
+	if info.DisplayName != "Claude Opus 4.7" {
+		t.Fatalf("display name = %q, want %q", info.DisplayName, "Claude Opus 4.7")
+	}
+	if info.MaxCompletionTokens != 128000 {
+		t.Fatalf("max completion tokens = %d, want %d", info.MaxCompletionTokens, 128000)
+	}
+	if info.Thinking == nil {
+		t.Fatalf("thinking config should not be nil")
+	}
+}

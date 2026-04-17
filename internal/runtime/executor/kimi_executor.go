@@ -455,7 +455,8 @@ func (e *KimiExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*c
 		return auth, nil
 	}
 
-	client := kimiauth.NewDeviceFlowClientWithDeviceID(e.cfg, resolveKimiDeviceID(auth))
+	// refresh 必须优先复用 auth 自身 proxy_url，避免设备流 token 刷新出口与账号不一致。
+	client := kimiauth.NewDeviceFlowClientWithDeviceIDAndProxyURL(e.cfg, resolveKimiDeviceID(auth), auth.ProxyURL)
 	td, err := client.RefreshToken(ctx, refreshToken)
 	if err != nil {
 		return nil, err

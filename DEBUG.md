@@ -91,3 +91,63 @@
 - 部署模板修复：`docker-compose.yml` 改为目录级挂载，把宿主机服务目录挂到容器内独立路径 `/data/service/CLIProxyAPI`，并通过 `command: ["./CLIProxyAPI", "--config", "/data/service/CLIProxyAPI/config.yaml"]` 显式指定配置文件，避免单文件 bind mount 与旧 inode 脱钩。
 - watcher 修复：新增 `internal/watcher/watch_targets.go`，由 `addWatchTargets()` 统一在启动时校验配置文件存在、监听配置父目录，并在 `configDir == authDir` 时去重；`internal/watcher/events.go::handleEvent` 保持只认精确 `configPath` 的 `Write|Create|Rename` 事件，`internal/watcher/config_reload.go` 的整文件 hash/full reload 语义保持不变。
 - 回归测试：补充 `internal/watcher/watcher_test.go::TestStartAddsConfigDirectoryWatcherAndAuthDirectoryWatcher`、`TestStartDeduplicatesSharedConfigAndAuthDirectoryWatch`、`TestStartWithRenameReplaceConfigTriggersReload`，验证目录监听、共享目录去重以及 rename 覆盖保存热加载。
+
+---
+
+# priority 请求期路由限制排查记录（2026-04-17）
+
+## Observations
+
+- `sdk/api/handlers/handlers.go::applyClientRoutingPolicyMetadata` 会在 `ExecuteWithAuthManager` / `ExecuteCountWithAuthManager` / `ExecuteStreamWithAuthManager` 中把 client key 的 `max-priority` 写入 `max_auth_priority` metadata。
+- `sdk/api/handlers/handlers.go::clientAPIKeyMaxPriority` 当前强依赖 gin context 上的 `accessProvider == config-inline` 和 `apiKey` 字段；只要这两个字段在 live 请求上没有按预期写入，就不会下发 `max_auth_priority`。
+- 现场 `/data/service/CLIProxyAPI/config.yaml` 中，`sk-94e0...e8e0` 配置为 `max-priority: 0`，`sk-1f1f...5bc6` 配置为 `max-priority: 100`。
+- 现场 `/data/service/CLIProxyAPI/auths/codex-james.one@vmails.net-plus.json` 当前顶层 `priority` 为 `5`；`/data/service/CLIProxyAPI/auths/codex-thomas@vmails.net-plus.json` 当前顶层 `priority` 为 `10`。
+- 现场 `/data/service/CLIProxyAPI/logs/main.log` 已确认 `codex-james.one@vmails.net-plus.json` 会被真正选中，但集中出现在 `gpt-5.2`；`codex-thomas@vmails.net-plus.json` 则长期出现在 `gpt-5.4`。
+
+## Hypotheses
+
+### H1: `max-priority` 没成功下发到请求 metadata，根因是 `clientAPIKeyMaxPriority` 过度依赖 gin 上的 `accessProvider/apiKey`（ROOT HYPOTHESIS）
+- Supports: 现场 `sk-94e0...e8e0` 已配置 `max-priority: 0`，但请求仍命中 `priority > 0` 的 Codex auth；而 `clientAPIKeyMaxPriority` 当前只有在 gin 中的两个字段同时命中时才会返回上限。
+- Conflicts: 还没有在 live 进程里直接打印出“这次请求 gin 没带 accessProvider/apiKey”，因此最后一跳仍是代码推断。
+- Test: 将 `clientAPIKeyMaxPriority` 改成优先直接从 HTTP request 提取入站 key，并用 `sdk/config.FindClientAPIKeyInConfig` 对照配置查 `max-priority`；补 Bearer/query key 回归测试。
+
+### H2: `priority=5` 本身没有失效，真正影响选路的是“更高 priority bucket 仍被视为可用”
+- Supports: `sdk/cliproxy/auth/selector.go::getAvailableAuths` 与 `sdk/cliproxy/auth/scheduler.go::highestReadyPriorityLocked` 都只会选当前最高 ready priority bucket；只要更高桶仍 ready，5 桶就不会被考虑。
+- Conflicts: 这解释的是整体 priority 语义，不能单独解释 `sk-94e0...e8e0` 的 `max-priority: 0` 为什么完全没拦住高桶。
+- Test: 继续只读核对更高 priority auth 的模型态/冷却态与实际日志是否一致。
+
+## Root Cause
+
+- 当前已确认的首要根因是：`sdk/api/handlers/handlers.go::clientAPIKeyMaxPriority` 把 client key 路由限制绑定在 gin 上的 `accessProvider/apiKey` 两个运行时字段上，而不是直接从请求里解析入站 key 再对照配置查策略，导致 live 请求稍有偏差就会完全跳过 `max_auth_priority` 注入。
+
+## Fix
+
+- 将 `sdk/api/handlers/handlers.go::clientAPIKeyMaxPriority` 改为优先直接从 `ginCtx.Request` 提取候选 client key（`Authorization` / `X-Goog-Api-Key` / `X-Api-Key` / query `key` / query `auth_token`），并用 `sdk/config.FindClientAPIKeyInConfig` 命中配置后返回 `MaxPriority`。
+- 保留现有 `applyClientRoutingPolicyMetadata -> max_auth_priority -> shouldSkipAuthByClientPolicy` 下游链路不变，只修正“请求期策略注入”这一跳。
+- 增补 `sdk/api/handlers/handlers_request_metadata_test.go` 回归测试，覆盖 Bearer key、query key、未知 key 忽略与 gin fallback。
+
+## 2026-04-17 reviewer 回归复核
+
+### Observations
+
+- `internal/api/server.go::AuthMiddleware` 在鉴权成功时会把真实 principal 写入 gin：`apiKey=result.Principal`、`accessProvider=result.Provider`。
+- `internal/access/config_access/provider.go::Authenticate` 会按固定顺序选择“首个命中的 client key”：`Authorization -> X-Goog-Api-Key -> X-Api-Key -> query key -> query auth_token`。
+- 上一版修复把 `sdk/api/handlers/handlers.go::clientAPIKeyMaxPriority` 改成优先扫描整个 request；这会产生两个偏差：
+  1. 若 gin 已经记录真实 principal，request 中其它候选 key 仍可能被误拿来绑定 `max_auth_priority`；
+  2. 若 `accessProvider != config-inline`，request fast path 仍可能绕过非 inline provider 的忽略语义。
+
+### Root Cause
+
+- 回归根因是：`sdk/api/handlers/handlers.go::clientAPIKeyMaxPriority` 把“从 request 兜底恢复 principal”放到了“尊重 gin 中真实鉴权结果”之前，导致 request 中额外携带的其它 key 有机会覆盖本次请求真正完成鉴权的 principal。
+
+### Fix
+
+- `sdk/api/handlers/handlers.go::clientAPIKeyMaxPriority` 现已改为：
+  1. 先检查 gin 中的 `accessProvider`；若它明确不是 `config-inline`，则直接忽略 `max-priority`；
+  2. 若 gin 中已有 `apiKey`，只对这个真实 principal 调用 `lookupClientAPIKeyMaxPriority(...)`；
+  3. 只有 gin 尚未提供鉴权结果时，才调用 `clientAPIKeyMaxPriorityFromRequest(...)` 兜底。
+- `sdk/api/handlers/handlers.go::clientAPIKeyMaxPriorityFromRequest` 现已改为先通过 `authenticatedClientAPIKeyFromRequest(...)` 按 `config_access/provider.go::Authenticate` 相同顺序恢复“首个命中的 client key”，再查询这个 key 的 `max-priority`；不再扫描到任意带上限的 key 就提前返回。
+- `sdk/api/handlers/handlers_request_metadata_test.go` 已新增两条回归测试：
+  - `TestApplyClientRoutingPolicyMetadata_UsesAuthenticatedPrincipalFromGin`
+  - `TestApplyClientRoutingPolicyMetadata_RequestFallbackKeepsFirstAuthenticatedCandidate`
+- `sdk/api/handlers/handlers_request_metadata_test.go::TestApplyClientRoutingPolicyMetadata_IgnoresNonInlineAccessProvider` 也已补成带真实 request 的形态，验证非 inline provider 不会再被 request fallback 绕过。

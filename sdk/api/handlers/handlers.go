@@ -233,11 +233,43 @@ func clientAPIKeyMaxPriority(ctx context.Context, cfg *config.SDKConfig) (int, b
 	if !ok || ginCtx == nil {
 		return 0, false
 	}
-	if accessProvider := strings.TrimSpace(stringValueFromGin(ginCtx, "accessProvider")); accessProvider != sdkaccess.DefaultAccessProviderName {
+	if accessProvider := strings.TrimSpace(stringValueFromGin(ginCtx, "accessProvider")); accessProvider != "" && accessProvider != sdkaccess.DefaultAccessProviderName {
 		return 0, false
 	}
-	clientAPIKey := strings.TrimSpace(stringValueFromGin(ginCtx, "apiKey"))
-	if clientAPIKey == "" {
+	// 当 gin 已经带上鉴权结果时，必须以真正完成鉴权的 principal 为准；
+	// 不能再从 request 中扫描其它候选 key，否则会把别的 key 的策略误绑到本次请求。
+	if maxPriority, found := lookupClientAPIKeyMaxPriority(cfg, stringValueFromGin(ginCtx, "apiKey")); found {
+		return maxPriority, true
+	}
+	return clientAPIKeyMaxPriorityFromRequest(ginCtx.Request, cfg)
+}
+
+// clientAPIKeyMaxPriorityFromRequest 只在 gin 尚未提供鉴权结果时兜底；
+// 它会按 config-access provider 的候选顺序还原“首个命中的 client key”，
+// 再读取该 key 对应的 max-priority，避免把后续候选误当成当前 principal。
+func clientAPIKeyMaxPriorityFromRequest(req *http.Request, cfg *config.SDKConfig) (int, bool) {
+	clientAPIKey, found := authenticatedClientAPIKeyFromRequest(req, cfg)
+	if !found {
+		return 0, false
+	}
+	return lookupClientAPIKeyMaxPriority(cfg, clientAPIKey)
+}
+
+func authenticatedClientAPIKeyFromRequest(req *http.Request, cfg *config.SDKConfig) (string, bool) {
+	if req == nil || cfg == nil {
+		return "", false
+	}
+	for _, candidate := range clientAPIKeyCandidatesFromRequest(req) {
+		if _, found := config.FindClientAPIKeyInConfig(cfg, candidate); found {
+			return candidate, true
+		}
+	}
+	return "", false
+}
+
+func lookupClientAPIKeyMaxPriority(cfg *config.SDKConfig, clientAPIKey string) (int, bool) {
+	clientAPIKey = strings.TrimSpace(clientAPIKey)
+	if clientAPIKey == "" || cfg == nil {
 		return 0, false
 	}
 	entry, found := config.FindClientAPIKeyInConfig(cfg, clientAPIKey)
@@ -245,6 +277,60 @@ func clientAPIKeyMaxPriority(ctx context.Context, cfg *config.SDKConfig) (int, b
 		return 0, false
 	}
 	return *entry.MaxPriority, true
+}
+
+func clientAPIKeyCandidatesFromRequest(req *http.Request) []string {
+	if req == nil {
+		return nil
+	}
+	candidates := []string{
+		bearerTokenFromHeader(req.Header.Get("Authorization")),
+		req.Header.Get("X-Goog-Api-Key"),
+		req.Header.Get("X-Api-Key"),
+	}
+	if req.URL != nil {
+		query := req.URL.Query()
+		candidates = append(candidates, query.Get("key"), query.Get("auth_token"))
+	}
+	return normalizeUniqueTrimmedStrings(candidates)
+}
+
+func bearerTokenFromHeader(header string) string {
+	header = strings.TrimSpace(header)
+	if header == "" {
+		return ""
+	}
+	parts := strings.SplitN(header, " ", 2)
+	if len(parts) != 2 {
+		return header
+	}
+	if !strings.EqualFold(strings.TrimSpace(parts[0]), "bearer") {
+		return header
+	}
+	return strings.TrimSpace(parts[1])
+}
+
+func normalizeUniqueTrimmedStrings(values []string) []string {
+	if len(values) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(values))
+	seen := make(map[string]struct{}, len(values))
+	for _, value := range values {
+		trimmed := strings.TrimSpace(value)
+		if trimmed == "" {
+			continue
+		}
+		if _, exists := seen[trimmed]; exists {
+			continue
+		}
+		seen[trimmed] = struct{}{}
+		out = append(out, trimmed)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 func stringValueFromGin(c *gin.Context, key string) string {

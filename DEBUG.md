@@ -296,3 +296,92 @@
 - `sdk/cliproxy/auth/session_affinity.go::Pick` 现在只消费已存在的成功绑定；primary/fallback cache 命中继续刷新 TTL，新绑定统一由 `BindSelectedAuth` 在成功路径写入，失败请求不会再污染 sticky 关系。
 - `sdk/cliproxy/auth/selector_wrappers.go::builtInSelectorStrategy` 提供统一 unwrap 能力，`sdk/cliproxy/auth/scheduler.go::{newAuthScheduler,selectorStrategy}` 与 `sdk/cliproxy/auth/conductor.go::isBuiltInSelector` 改为复用该能力，因此 `SessionAffinitySelector`、`PriorityZeroOverrideSelector` 等包装后的 RR/FF 继续保留 scheduler fast path 语义。
 - 新增回归测试覆盖：失败请求不建绑定、成功绑定后的 TTL 刷新、wrapped fill-first mixed provider 顺序、wrapped fill-first mixed codex websocket 偏好。
+
+
+# 2026-04-18 v6.9.29 selective port 测试失败排查
+
+## Observations
+
+- 新增定向测试 `internal/api/handlers/management/config_auth_index_test.go::TestGetOpenAICompatIncludesEntryAndFallbackAuthIndex` 首次运行直接 panic，报错为 `testing: test using t.Setenv ... can not use t.Parallel`。
+- 触发点在 `internal/api/handlers/management/openai_compat_management_test.go::newOpenAICompatTestHandler`；该 helper 内部调用了 `t.Setenv("MANAGEMENT_PASSWORD", "")`。
+- 失败测试当前声明了 `t.Parallel()`，因此在测试框架层就被拒绝，和业务实现本身无关。
+
+## Hypotheses
+
+### H1: 测试失败的根因是并行测试与 `t.Setenv` 组合冲突（ROOT HYPOTHESIS）
+- Supports: panic 栈直接落在 `testing.(*T).Setenv`，并明确指出与 `t.Parallel` 组合非法。
+- Conflicts: 暂无。
+- Test: 去掉该测试的 `t.Parallel()`，重新跑同一组 management 定向测试。
+
+### H2: helper 需要重写成不使用 `t.Setenv`
+- Supports: 这样可以继续保留并行。
+- Conflicts: 现有仓库已有多处直接复用该 helper，重写范围更大，超出本次最小修补边界。
+- Test: 当前先不采用，保留为备选。
+
+### H3: panic 只是第一层，后面还会有业务断言失败
+- Supports: 当前只看到框架级 panic，还没真正执行到业务断言。
+- Conflicts: 需要重新跑测试才能确认。
+- Test: 去掉 `t.Parallel()` 后继续跑原命令。
+
+## Experiments
+
+- 实验 1：按 H1 去掉 `TestGetOpenAICompatIncludesEntryAndFallbackAuthIndex` 的 `t.Parallel()`，再重跑 management 定向测试；结果：panic 消失，原命令通过，说明这是纯测试框架约束问题。
+
+## Root Cause
+
+- 本轮测试失败的根因是：`TestGetOpenAICompatIncludesEntryAndFallbackAuthIndex` 复用了 `newOpenAICompatTestHandler`，而该 helper 内部调用 `t.Setenv`；Go 1.26 测试框架明确禁止 `t.Setenv` 与 `t.Parallel` 组合，因此测试在进入业务断言前就被框架直接 panic。
+
+## Fix
+
+- 去掉 `internal/api/handlers/management/config_auth_index_test.go::TestGetOpenAICompatIncludesEntryAndFallbackAuthIndex` 的 `t.Parallel()`，继续复用现有 helper，保持本轮修补范围只落在 v6.9.29 selective port 主线与最小测试修正。
+
+
+# 2026-04-18 reviewer 修复阶段测试编译失败排查
+
+## Observations
+
+- reviewer 修复后首次运行 management 定向测试时，编译器报错 `internal/api/handlers/management/config_auth_index_test.go:240:86: undefined: bytes`。
+- 新增失败点位于 `TestPatchOpenAICompatResponseIncludesAuthIndex`，该测试使用了 `bytes.NewBufferString(...)` 构造 PATCH 请求体。
+- 当前 `internal/api/handlers/management/config_auth_index_test.go` 的 import 列表里缺少 `bytes`。
+
+## Hypotheses
+
+### H1: 根因是测试新增了 `bytes.NewBufferString`，但忘了补 `bytes` import（ROOT HYPOTHESIS）
+- Supports: 编译报错直接指向 `undefined: bytes`，且测试正文确实新用了 `bytes.NewBufferString`。
+- Conflicts: 暂无。
+- Test: 给 `config_auth_index_test.go` 补 `bytes` import，重跑同一条 management 定向测试命令。
+
+### H2: 其它测试文件也有隐藏的 import/命名冲突
+- Supports: 当前只跑到第一处编译错误，后续问题还没暴露。
+- Conflicts: 需要先修复 H1 后再验证。
+- Test: 修完 H1 后继续重跑原命令。
+
+## Experiments
+
+- 实验 1：按 H1 给 `config_auth_index_test.go` 补 `bytes` import，再重跑 management 定向测试，观察是否进入业务断言。
+
+
+# 2026-04-18 reviewer fix 二次排查
+
+## Observations
+
+- management 定向测试 `TestAPIKeysManagement_DefaultsToLegacyStringsButSupportsObjectFormatAndPatchDelete` 当前失败，GET `?format=object` 返回 `{"api-keys":[{"key":"alpha"},{"key":"beta"}]}`，缺少 `beta.max-priority=0`。
+- 读取链已从 `internal/api/handlers/management/config_lists.go::GetAPIKeys` 切到 `internal/api/handlers/management/handler.go::currentConfigSnapshot`。
+- `currentConfigSnapshot` 当前用 `yaml.Marshal` / `yaml.Unmarshal` 克隆 `h.cfg`；而 `internal/config/sdk_config.go::SDKConfig.clientAPIKeyEntries` 带 `yaml:"-"`，对象化 `api-keys` 视图在快照里会丢失。
+- management 包内仍有多条直接读取 `h.cfg` / `h.authManager` 的路径，reviewer 点名的热更新竞态风险在 `config_basic.go`、`logs.go`、`quota.go`、`usage.go`、`oauth_callback.go`、`vertex_import.go`、`api_tools.go`、`auth_files.go` 等文件里仍可见。
+
+## Hypotheses
+
+### H1: `currentConfigSnapshot` 丢掉 `clientAPIKeyEntries`，导致对象化 GET 响应退化成纯字符串视图（ROOT HYPOTHESIS）
+- Supports: 失败只出现在 `?format=object`，缺失字段正好来自 `clientAPIKeyEntries.MaxPriority`。
+- Conflicts: 纯字符串 GET 仍然正确，说明公开 `APIKeys` 视图没有损坏。
+- Test: 在快照阶段显式恢复 `SetClientAPIKeyEntries(h.cfg.ClientAPIKeyEntries())`，重跑同一条 management 定向测试。
+
+### H2: reviewer 高优先级发现继续成立，根因是 management 读路径仍大量绕过 `currentConfigSnapshot/currentAuthManager`
+- Supports: grep 结果仍能看到多个 handler/helper 直接访问 `h.cfg` / `h.authManager`。
+- Conflicts: reviewer 明确点名的 `Middleware`、`managementCallbackURL`、`ListAuthFiles`、`authByIndex` 已修。
+- Test: 把剩余公开 handler 与核心 helper 收口到快照/manager accessor，随后跑 management 定向测试与全仓编译验证。
+
+## Experiments
+
+- 实验 1：先修 `currentConfigSnapshot` 的 `api-keys` 对象视图恢复，再继续收口剩余 management 读路径，之后重跑 reviewer 相关 management 定向测试。

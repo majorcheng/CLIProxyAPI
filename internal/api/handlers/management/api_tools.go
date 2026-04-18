@@ -425,10 +425,10 @@ func (h *Handler) refreshAntigravityOAuthAccessToken(ctx context.Context, auth *
 	}
 	auth.Metadata["type"] = "antigravity"
 
-	if h != nil && h.authManager != nil {
+	if manager := h.currentAuthManager(); manager != nil {
 		auth.LastRefreshedAt = now
 		auth.UpdatedAt = now
-		_, _ = h.authManager.Update(ctx, auth)
+		_, _ = manager.Update(ctx, auth)
 	}
 
 	return strings.TrimSpace(tokenResp.AccessToken), nil
@@ -614,10 +614,11 @@ func tokenValueFromMetadata(metadata map[string]any) string {
 
 func (h *Handler) authByIndex(authIndex string) *coreauth.Auth {
 	authIndex = strings.TrimSpace(authIndex)
-	if authIndex == "" || h == nil || h.authManager == nil {
+	manager := h.currentAuthManager()
+	if authIndex == "" || manager == nil {
 		return nil
 	}
-	auths := h.authManager.List()
+	auths := manager.List()
 	for _, auth := range auths {
 		if auth == nil {
 			continue
@@ -637,8 +638,8 @@ func (h *Handler) apiCallTransport(auth *coreauth.Auth) http.RoundTripper {
 			proxyCandidates = append(proxyCandidates, proxyStr)
 		}
 	}
-	if h != nil && h.cfg != nil {
-		if proxyStr := strings.TrimSpace(h.cfg.ProxyURL); proxyStr != "" {
+	if cfg := h.currentConfigSnapshot(); cfg != nil {
+		if proxyStr := strings.TrimSpace(cfg.ProxyURL); proxyStr != "" {
 			proxyCandidates = append(proxyCandidates, proxyStr)
 		}
 	}

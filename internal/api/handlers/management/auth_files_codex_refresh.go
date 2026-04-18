@@ -23,8 +23,8 @@ type codexAuthRefreshRequest struct {
 
 // RefreshCodexAuthFile 手动触发一次指定 Codex 凭证的 RT 刷新，并同步返回最新状态。
 func (h *Handler) RefreshCodexAuthFile(c *gin.Context) {
-	if h == nil || h.authManager == nil {
-		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "core auth manager unavailable"})
+	manager := h.requireAuthManager(c)
+	if manager == nil {
 		return
 	}
 
@@ -58,7 +58,7 @@ func (h *Handler) RefreshCodexAuthFile(c *gin.Context) {
 		return
 	}
 
-	refreshed, errRefresh := h.authManager.RefreshAuthNow(c.Request.Context(), target.ID)
+	refreshed, errRefresh := manager.RefreshAuthNow(c.Request.Context(), target.ID)
 	if errRefresh != nil {
 		response := gin.H{"error": "Codex RT 刷新失败: " + errRefresh.Error()}
 		if entry := h.codexRefreshResponseEntry(refreshed); entry != nil {
@@ -121,13 +121,14 @@ func (h *Handler) resolveCodexRefreshTarget(authIndex string, name string) (*cor
 
 func (h *Handler) authByName(name string) *coreauth.Auth {
 	name = strings.TrimSpace(name)
-	if name == "" || h == nil || h.authManager == nil {
+	manager := h.currentAuthManager()
+	if name == "" || h == nil || manager == nil {
 		return nil
 	}
-	if auth, ok := h.authManager.GetByID(name); ok {
+	if auth, ok := manager.GetByID(name); ok {
 		return auth
 	}
-	if auth, ok := h.authManager.FindByFileName(name); ok {
+	if auth, ok := manager.FindByFileName(name); ok {
 		return auth
 	}
 	return nil

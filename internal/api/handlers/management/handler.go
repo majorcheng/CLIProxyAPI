@@ -21,6 +21,7 @@ import (
 	sdkAuth "github.com/router-for-me/CLIProxyAPI/v6/sdk/auth"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	"golang.org/x/crypto/bcrypt"
+	"gopkg.in/yaml.v3"
 )
 
 type attemptInfo struct {
@@ -39,7 +40,7 @@ const attemptMaxIdleTime = 2 * time.Hour
 type Handler struct {
 	cfg                 *config.Config
 	configFilePath      string
-	mu                  sync.Mutex
+	mu                  sync.RWMutex
 	attemptsMu          sync.Mutex
 	failedAttempts      map[string]*attemptInfo // keyed by client IP
 	authManager         *coreauth.Manager
@@ -107,15 +108,110 @@ func NewHandlerWithoutConfigFilePath(cfg *config.Config, manager *coreauth.Manag
 	return NewHandler(cfg, "", manager)
 }
 
+// currentAuthManager 返回当前 live auth manager 指针快照。
+// Manager 自身具备并发保护，因此这里只需要保证读取到的指针与热更新写入同步。
+func (h *Handler) currentAuthManager() *coreauth.Manager {
+	if h == nil {
+		return nil
+	}
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return h.authManager
+}
+
+// currentConfigSnapshot 返回一份脱离共享状态的配置快照。
+// management 读路径会把这份快照传给后续 helper / auth 构造器，
+// 避免热更新或管理写请求在中途替换/修改 h.cfg 时产生跨代读写竞争。
+func (h *Handler) currentConfigSnapshot() *config.Config {
+	if h == nil {
+		return nil
+	}
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	if h.cfg == nil {
+		return nil
+	}
+	clientAPIKeyEntries := h.cfg.ClientAPIKeyEntries()
+	data, err := yaml.Marshal(h.cfg)
+	if err != nil {
+		cloned := *h.cfg
+		cloned.SetClientAPIKeyEntries(clientAPIKeyEntries)
+		return &cloned
+	}
+	var cloned config.Config
+	if err = yaml.Unmarshal(data, &cloned); err != nil {
+		fallback := *h.cfg
+		fallback.SetClientAPIKeyEntries(clientAPIKeyEntries)
+		return &fallback
+	}
+	cloned.SetClientAPIKeyEntries(clientAPIKeyEntries)
+	return &cloned
+}
+
+// requireConfigSnapshot 读取当前配置快照，并在缺失时统一返回管理接口错误。
+func (h *Handler) requireConfigSnapshot(c *gin.Context) *config.Config {
+	cfg := h.currentConfigSnapshot()
+	if cfg != nil {
+		return cfg
+	}
+	if c != nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "configuration unavailable"})
+	}
+	return nil
+}
+
+// requireAuthManager 读取当前 live auth manager，并在缺失时统一返回管理接口错误。
+func (h *Handler) requireAuthManager(c *gin.Context) *coreauth.Manager {
+	manager := h.currentAuthManager()
+	if manager != nil {
+		return manager
+	}
+	if c != nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "core auth manager unavailable"})
+	}
+	return nil
+}
+
+// mutateConfig 在持锁状态下更新共享配置并立即落盘。
+// 调用方只需要提供纯内存态修改逻辑，统一由这里串行化写入与持久化。
+func (h *Handler) mutateConfig(c *gin.Context, mutate func(*config.Config)) bool {
+	if h == nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "handler unavailable"})
+		return false
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.cfg == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "configuration unavailable"})
+		return false
+	}
+	mutate(h.cfg)
+	return h.persistLocked(c)
+}
+
 // SetConfig updates the in-memory config reference when the server hot-reloads.
-func (h *Handler) SetConfig(cfg *config.Config) { h.cfg = cfg }
+func (h *Handler) SetConfig(cfg *config.Config) {
+	if h == nil {
+		return
+	}
+	h.mu.Lock()
+	h.cfg = cfg
+	h.mu.Unlock()
+}
 
 // SetConfigApplied registers a callback that applies freshly persisted config
 // to the live runtime after management mutations succeed.
 func (h *Handler) SetConfigApplied(apply func(*config.Config)) { h.configApplied = apply }
 
 // SetAuthManager updates the auth manager reference used by management endpoints.
-func (h *Handler) SetAuthManager(manager *coreauth.Manager) { h.authManager = manager }
+func (h *Handler) SetAuthManager(manager *coreauth.Manager) {
+	if h == nil {
+		return
+	}
+	h.mu.Lock()
+	h.authManager = manager
+	h.mu.Unlock()
+}
 
 // SetUsageStatistics allows replacing the usage statistics reference.
 func (h *Handler) SetUsageStatistics(stats *usage.RequestStatistics) { h.usageStats = stats }
@@ -168,7 +264,7 @@ func (h *Handler) Middleware() gin.HandlerFunc {
 
 		clientIP := c.ClientIP()
 		localClient := clientIP == "127.0.0.1" || clientIP == "::1"
-		cfg := h.cfg
+		cfg := h.currentConfigSnapshot()
 		var (
 			allowRemote bool
 			secretHash  string
@@ -296,6 +392,12 @@ func (h *Handler) Middleware() gin.HandlerFunc {
 func (h *Handler) persist(c *gin.Context) bool {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	return h.persistLocked(c)
+}
+
+// persistLocked saves the current in-memory config to disk.
+// 调用方需要先持有 h.mu，避免“改内存态”和“写回磁盘”之间被别的请求插队。
+func (h *Handler) persistLocked(c *gin.Context) bool {
 	// Preserve comments when writing
 	if err := config.SaveConfigPreserveComments(h.configFilePath, h.cfg); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to save config: %v", err)})
@@ -314,8 +416,10 @@ func (h *Handler) updateBoolField(c *gin.Context, set func(bool)) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body"})
 		return
 	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
 	set(*body.Value)
-	h.persist(c)
+	h.persistLocked(c)
 }
 
 func (h *Handler) updateIntField(c *gin.Context, set func(int)) {
@@ -326,8 +430,10 @@ func (h *Handler) updateIntField(c *gin.Context, set func(int)) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body"})
 		return
 	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
 	set(*body.Value)
-	h.persist(c)
+	h.persistLocked(c)
 }
 
 func (h *Handler) updateStringField(c *gin.Context, set func(string)) {
@@ -338,6 +444,8 @@ func (h *Handler) updateStringField(c *gin.Context, set func(string)) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body"})
 		return
 	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
 	set(*body.Value)
-	h.persist(c)
+	h.persistLocked(c)
 }

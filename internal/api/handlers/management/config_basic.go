@@ -24,11 +24,12 @@ const (
 )
 
 func (h *Handler) GetConfig(c *gin.Context) {
-	if h == nil || h.cfg == nil {
+	cfg := h.currentConfigSnapshot()
+	if cfg == nil {
 		c.JSON(200, gin.H{})
 		return
 	}
-	c.JSON(200, new(*h.cfg))
+	c.JSON(200, cfg)
 }
 
 type releaseInfo struct {
@@ -40,8 +41,8 @@ type releaseInfo struct {
 func (h *Handler) GetLatestVersion(c *gin.Context) {
 	client := &http.Client{Timeout: 10 * time.Second}
 	proxyURL := ""
-	if h != nil && h.cfg != nil {
-		proxyURL = strings.TrimSpace(h.cfg.ProxyURL)
+	if cfg := h.currentConfigSnapshot(); cfg != nil {
+		proxyURL = strings.TrimSpace(cfg.ProxyURL)
 	}
 	if proxyURL != "" {
 		sdkCfg := &sdkconfig.SDKConfig{ProxyURL: proxyURL}
@@ -185,12 +186,22 @@ func (h *Handler) GetConfigYAML(c *gin.Context) {
 }
 
 // Debug
-func (h *Handler) GetDebug(c *gin.Context) { c.JSON(200, gin.H{"debug": h.cfg.Debug}) }
+func (h *Handler) GetDebug(c *gin.Context) {
+	cfg := h.requireConfigSnapshot(c)
+	if cfg == nil {
+		return
+	}
+	c.JSON(200, gin.H{"debug": cfg.Debug})
+}
 func (h *Handler) PutDebug(c *gin.Context) { h.updateBoolField(c, func(v bool) { h.cfg.Debug = v }) }
 
 // UsageStatisticsEnabled
 func (h *Handler) GetUsageStatisticsEnabled(c *gin.Context) {
-	c.JSON(200, gin.H{"usage-statistics-enabled": h.cfg.UsageStatisticsEnabled})
+	cfg := h.requireConfigSnapshot(c)
+	if cfg == nil {
+		return
+	}
+	c.JSON(200, gin.H{"usage-statistics-enabled": cfg.UsageStatisticsEnabled})
 }
 func (h *Handler) PutUsageStatisticsEnabled(c *gin.Context) {
 	h.updateBoolField(c, func(v bool) { h.cfg.UsageStatisticsEnabled = v })
@@ -198,7 +209,11 @@ func (h *Handler) PutUsageStatisticsEnabled(c *gin.Context) {
 
 // UsageStatisticsPersistIntervalSeconds
 func (h *Handler) GetUsageStatisticsPersistIntervalSeconds(c *gin.Context) {
-	c.JSON(200, gin.H{"usage-statistics-persist-interval-seconds": h.cfg.UsageStatisticsPersistIntervalSeconds})
+	cfg := h.requireConfigSnapshot(c)
+	if cfg == nil {
+		return
+	}
+	c.JSON(200, gin.H{"usage-statistics-persist-interval-seconds": cfg.UsageStatisticsPersistIntervalSeconds})
 }
 func (h *Handler) PutUsageStatisticsPersistIntervalSeconds(c *gin.Context) {
 	var body struct {
@@ -212,13 +227,18 @@ func (h *Handler) PutUsageStatisticsPersistIntervalSeconds(c *gin.Context) {
 	if value < 0 {
 		value = 0
 	}
-	h.cfg.UsageStatisticsPersistIntervalSeconds = value
-	h.persist(c)
+	h.mutateConfig(c, func(cfg *config.Config) {
+		cfg.UsageStatisticsPersistIntervalSeconds = value
+	})
 }
 
 // UsageStatisticsRetentionDays
 func (h *Handler) GetUsageStatisticsRetentionDays(c *gin.Context) {
-	c.JSON(200, gin.H{"usage-statistics-retention-days": h.cfg.UsageStatisticsRetentionDays})
+	cfg := h.requireConfigSnapshot(c)
+	if cfg == nil {
+		return
+	}
+	c.JSON(200, gin.H{"usage-statistics-retention-days": cfg.UsageStatisticsRetentionDays})
 }
 func (h *Handler) PutUsageStatisticsRetentionDays(c *gin.Context) {
 	var body struct {
@@ -232,13 +252,18 @@ func (h *Handler) PutUsageStatisticsRetentionDays(c *gin.Context) {
 	if value < 0 {
 		value = 0
 	}
-	h.cfg.UsageStatisticsRetentionDays = value
-	h.persist(c)
+	h.mutateConfig(c, func(cfg *config.Config) {
+		cfg.UsageStatisticsRetentionDays = value
+	})
 }
 
 // LoggingToFile
 func (h *Handler) GetLoggingToFile(c *gin.Context) {
-	c.JSON(200, gin.H{"logging-to-file": h.cfg.LoggingToFile})
+	cfg := h.requireConfigSnapshot(c)
+	if cfg == nil {
+		return
+	}
+	c.JSON(200, gin.H{"logging-to-file": cfg.LoggingToFile})
 }
 func (h *Handler) PutLoggingToFile(c *gin.Context) {
 	h.updateBoolField(c, func(v bool) { h.cfg.LoggingToFile = v })
@@ -246,7 +271,11 @@ func (h *Handler) PutLoggingToFile(c *gin.Context) {
 
 // LogsMaxTotalSizeMB
 func (h *Handler) GetLogsMaxTotalSizeMB(c *gin.Context) {
-	c.JSON(200, gin.H{"logs-max-total-size-mb": h.cfg.LogsMaxTotalSizeMB})
+	cfg := h.requireConfigSnapshot(c)
+	if cfg == nil {
+		return
+	}
+	c.JSON(200, gin.H{"logs-max-total-size-mb": cfg.LogsMaxTotalSizeMB})
 }
 func (h *Handler) PutLogsMaxTotalSizeMB(c *gin.Context) {
 	var body struct {
@@ -260,13 +289,18 @@ func (h *Handler) PutLogsMaxTotalSizeMB(c *gin.Context) {
 	if value < 0 {
 		value = 0
 	}
-	h.cfg.LogsMaxTotalSizeMB = value
-	h.persist(c)
+	h.mutateConfig(c, func(cfg *config.Config) {
+		cfg.LogsMaxTotalSizeMB = value
+	})
 }
 
 // ErrorLogsMaxFiles
 func (h *Handler) GetErrorLogsMaxFiles(c *gin.Context) {
-	c.JSON(200, gin.H{"error-logs-max-files": h.cfg.ErrorLogsMaxFiles})
+	cfg := h.requireConfigSnapshot(c)
+	if cfg == nil {
+		return
+	}
+	c.JSON(200, gin.H{"error-logs-max-files": cfg.ErrorLogsMaxFiles})
 }
 func (h *Handler) PutErrorLogsMaxFiles(c *gin.Context) {
 	var body struct {
@@ -280,19 +314,30 @@ func (h *Handler) PutErrorLogsMaxFiles(c *gin.Context) {
 	if value < 0 {
 		value = 10
 	}
-	h.cfg.ErrorLogsMaxFiles = value
-	h.persist(c)
+	h.mutateConfig(c, func(cfg *config.Config) {
+		cfg.ErrorLogsMaxFiles = value
+	})
 }
 
 // Request log
-func (h *Handler) GetRequestLog(c *gin.Context) { c.JSON(200, gin.H{"request-log": h.cfg.RequestLog}) }
+func (h *Handler) GetRequestLog(c *gin.Context) {
+	cfg := h.requireConfigSnapshot(c)
+	if cfg == nil {
+		return
+	}
+	c.JSON(200, gin.H{"request-log": cfg.RequestLog})
+}
 func (h *Handler) PutRequestLog(c *gin.Context) {
 	h.updateBoolField(c, func(v bool) { h.cfg.RequestLog = v })
 }
 
 // Websocket auth
 func (h *Handler) GetWebsocketAuth(c *gin.Context) {
-	c.JSON(200, gin.H{"ws-auth": h.cfg.WebsocketAuth})
+	cfg := h.requireConfigSnapshot(c)
+	if cfg == nil {
+		return
+	}
+	c.JSON(200, gin.H{"ws-auth": cfg.WebsocketAuth})
 }
 func (h *Handler) PutWebsocketAuth(c *gin.Context) {
 	h.updateBoolField(c, func(v bool) { h.cfg.WebsocketAuth = v })
@@ -300,7 +345,11 @@ func (h *Handler) PutWebsocketAuth(c *gin.Context) {
 
 // Request retry
 func (h *Handler) GetRequestRetry(c *gin.Context) {
-	c.JSON(200, gin.H{"request-retry": h.cfg.RequestRetry})
+	cfg := h.requireConfigSnapshot(c)
+	if cfg == nil {
+		return
+	}
+	c.JSON(200, gin.H{"request-retry": cfg.RequestRetry})
 }
 func (h *Handler) PutRequestRetry(c *gin.Context) {
 	h.updateIntField(c, func(v int) { h.cfg.RequestRetry = v })
@@ -308,7 +357,11 @@ func (h *Handler) PutRequestRetry(c *gin.Context) {
 
 // Max invalid request retries
 func (h *Handler) GetMaxInvalidRequestRetries(c *gin.Context) {
-	c.JSON(200, gin.H{"max-invalid-request-retries": h.cfg.MaxInvalidRequestRetries})
+	cfg := h.requireConfigSnapshot(c)
+	if cfg == nil {
+		return
+	}
+	c.JSON(200, gin.H{"max-invalid-request-retries": cfg.MaxInvalidRequestRetries})
 }
 func (h *Handler) PutMaxInvalidRequestRetries(c *gin.Context) {
 	h.updateIntField(c, func(v int) {
@@ -321,7 +374,11 @@ func (h *Handler) PutMaxInvalidRequestRetries(c *gin.Context) {
 
 // Max retry interval
 func (h *Handler) GetMaxRetryInterval(c *gin.Context) {
-	c.JSON(200, gin.H{"max-retry-interval": h.cfg.MaxRetryInterval})
+	cfg := h.requireConfigSnapshot(c)
+	if cfg == nil {
+		return
+	}
+	c.JSON(200, gin.H{"max-retry-interval": cfg.MaxRetryInterval})
 }
 func (h *Handler) PutMaxRetryInterval(c *gin.Context) {
 	h.updateIntField(c, func(v int) { h.cfg.MaxRetryInterval = v })
@@ -329,7 +386,11 @@ func (h *Handler) PutMaxRetryInterval(c *gin.Context) {
 
 // ForceModelPrefix
 func (h *Handler) GetForceModelPrefix(c *gin.Context) {
-	c.JSON(200, gin.H{"force-model-prefix": h.cfg.ForceModelPrefix})
+	cfg := h.requireConfigSnapshot(c)
+	if cfg == nil {
+		return
+	}
+	c.JSON(200, gin.H{"force-model-prefix": cfg.ForceModelPrefix})
 }
 func (h *Handler) PutForceModelPrefix(c *gin.Context) {
 	h.updateBoolField(c, func(v bool) { h.cfg.ForceModelPrefix = v })
@@ -365,9 +426,13 @@ func normalizePriorityZeroRoutingStrategy(strategy string) (string, bool) {
 
 // RoutingStrategy
 func (h *Handler) GetRoutingStrategy(c *gin.Context) {
-	strategy, ok := normalizeRoutingStrategy(h.cfg.Routing.Strategy)
+	cfg := h.requireConfigSnapshot(c)
+	if cfg == nil {
+		return
+	}
+	strategy, ok := normalizeRoutingStrategy(cfg.Routing.Strategy)
 	if !ok {
-		c.JSON(200, gin.H{"strategy": strings.TrimSpace(h.cfg.Routing.Strategy)})
+		c.JSON(200, gin.H{"strategy": strings.TrimSpace(cfg.Routing.Strategy)})
 		return
 	}
 	c.JSON(200, gin.H{"strategy": strategy})
@@ -385,15 +450,20 @@ func (h *Handler) PutRoutingStrategy(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid strategy"})
 		return
 	}
-	h.cfg.Routing.Strategy = normalized
-	h.persist(c)
+	h.mutateConfig(c, func(cfg *config.Config) {
+		cfg.Routing.Strategy = normalized
+	})
 }
 
 // PriorityZeroRoutingStrategy
 func (h *Handler) GetPriorityZeroRoutingStrategy(c *gin.Context) {
-	strategy, ok := normalizePriorityZeroRoutingStrategy(h.cfg.Routing.PriorityZeroStrategy)
+	cfg := h.requireConfigSnapshot(c)
+	if cfg == nil {
+		return
+	}
+	strategy, ok := normalizePriorityZeroRoutingStrategy(cfg.Routing.PriorityZeroStrategy)
 	if !ok {
-		c.JSON(200, gin.H{"priority-zero-strategy": strings.TrimSpace(h.cfg.Routing.PriorityZeroStrategy)})
+		c.JSON(200, gin.H{"priority-zero-strategy": strings.TrimSpace(cfg.Routing.PriorityZeroStrategy)})
 		return
 	}
 	c.JSON(200, gin.H{"priority-zero-strategy": strategy})
@@ -412,16 +482,24 @@ func (h *Handler) PutPriorityZeroRoutingStrategy(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid strategy"})
 		return
 	}
-	h.cfg.Routing.PriorityZeroStrategy = normalized
-	h.persist(c)
+	h.mutateConfig(c, func(cfg *config.Config) {
+		cfg.Routing.PriorityZeroStrategy = normalized
+	})
 }
 
 // Proxy URL
-func (h *Handler) GetProxyURL(c *gin.Context) { c.JSON(200, gin.H{"proxy-url": h.cfg.ProxyURL}) }
+func (h *Handler) GetProxyURL(c *gin.Context) {
+	cfg := h.requireConfigSnapshot(c)
+	if cfg == nil {
+		return
+	}
+	c.JSON(200, gin.H{"proxy-url": cfg.ProxyURL})
+}
 func (h *Handler) PutProxyURL(c *gin.Context) {
 	h.updateStringField(c, func(v string) { h.cfg.ProxyURL = v })
 }
 func (h *Handler) DeleteProxyURL(c *gin.Context) {
-	h.cfg.ProxyURL = ""
-	h.persist(c)
+	h.mutateConfig(c, func(cfg *config.Config) {
+		cfg.ProxyURL = ""
+	})
 }

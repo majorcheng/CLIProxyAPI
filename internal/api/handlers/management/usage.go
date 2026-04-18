@@ -70,8 +70,8 @@ func (h *Handler) ImportUsageStatistics(c *gin.Context) {
 
 	result := h.usageStats.MergeSnapshot(payload.Usage)
 	retentionDays := 0
-	if h.cfg != nil && h.cfg.UsageStatisticsRetentionDays > 0 {
-		retentionDays = h.cfg.UsageStatisticsRetentionDays
+	if cfg := h.currentConfigSnapshot(); cfg != nil && cfg.UsageStatisticsRetentionDays > 0 {
+		retentionDays = cfg.UsageStatisticsRetentionDays
 	}
 	h.usageStats.ApplyRetention(time.Now(), retentionDays)
 	snapshot := h.usageStats.Snapshot()

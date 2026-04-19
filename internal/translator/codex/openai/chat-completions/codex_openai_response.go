@@ -8,6 +8,8 @@ package chat_completions
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"strings"
 	"time"
 
 	"github.com/tidwall/gjson"
@@ -28,6 +30,7 @@ type ConvertCliToOpenAIParams struct {
 	HasToolCallAnnounced      bool
 	ReverseToolNameMap        map[string]string
 	BaseChunkTemplate         string
+	LastImageHashByItemID     map[string][32]byte
 }
 
 // 保持空 delta 模板，避免工具调用 chunk 带出多余 null 字段，
@@ -73,6 +76,15 @@ func buildFunctionCallChunk(index int, callID, name, arguments string, includeId
 	return template
 }
 
+// buildImageDeltaChunk 使用逐字段写入构造流式图片 chunk，
+// 让 output_format 派生出的 data URL 始终经过 JSON 转义。
+func buildImageDeltaChunk(imageURL string) string {
+	imagePayload := `{"index":0,"type":"image_url","image_url":{"url":""}}`
+	imagePayload, _ = sjson.Set(imagePayload, "index", 0)
+	imagePayload, _ = sjson.Set(imagePayload, "image_url.url", imageURL)
+	return imagePayload
+}
+
 // ConvertCodexResponseToOpenAI translates a single chunk of a streaming response from the
 // Codex API format to the OpenAI Chat Completions streaming format.
 // It processes various Codex event types and transforms them into OpenAI-compatible JSON responses.
@@ -96,6 +108,7 @@ func ConvertCodexResponseToOpenAI(_ context.Context, modelName string, originalR
 			FunctionCallIndex:         -1,
 			HasReceivedArgumentsDelta: false,
 			HasToolCallAnnounced:      false,
+			LastImageHashByItemID:     make(map[string][32]byte),
 		}
 		p.ensureBaseChunkTemplate(modelName)
 		*param = p
@@ -161,6 +174,26 @@ func ConvertCodexResponseToOpenAI(_ context.Context, modelName string, originalR
 			template, _ = sjson.Set(template, "choices.0.delta.role", "assistant")
 			template, _ = sjson.Set(template, "choices.0.delta.content", deltaResult.String())
 		}
+	} else if dataType == "response.image_generation_call.partial_image" {
+		// partial_image 走 OpenAI images delta，且按 item_id + 内容哈希去重。
+		itemID := rootResult.Get("item_id").String()
+		b64 := rootResult.Get("partial_image_b64").String()
+		if b64 == "" {
+			return []string{}
+		}
+		if itemID != "" {
+			if params.LastImageHashByItemID == nil {
+				params.LastImageHashByItemID = make(map[string][32]byte)
+			}
+			hash := sha256.Sum256([]byte(b64))
+			if last, ok := params.LastImageHashByItemID[itemID]; ok && last == hash {
+				return []string{}
+			}
+			params.LastImageHashByItemID[itemID] = hash
+		}
+		imageURL := buildCodexImageDataURL(rootResult.Get("output_format").String(), b64)
+		template, _ = sjson.Set(template, "choices.0.delta.role", "assistant")
+		template, _ = sjson.SetRaw(template, "choices.0.delta.images", "["+buildImageDeltaChunk(imageURL)+"]")
 	} else if dataType == "response.completed" {
 		finishReason := "stop"
 		if params.FunctionCallIndex != -1 {
@@ -208,7 +241,32 @@ func ConvertCodexResponseToOpenAI(_ context.Context, modelName string, originalR
 
 	} else if dataType == "response.output_item.done" {
 		itemResult := rootResult.Get("item")
-		if !itemResult.Exists() || itemResult.Get("type").String() != "function_call" {
+		if !itemResult.Exists() {
+			return []string{}
+		}
+		if itemResult.Get("type").String() == "image_generation_call" {
+			// 最终成图沿用同一 images delta 语义，避免 GPT 客户端流式/非流式分裂。
+			itemID := itemResult.Get("id").String()
+			b64 := itemResult.Get("result").String()
+			if b64 == "" {
+				return []string{}
+			}
+			if itemID != "" {
+				if params.LastImageHashByItemID == nil {
+					params.LastImageHashByItemID = make(map[string][32]byte)
+				}
+				hash := sha256.Sum256([]byte(b64))
+				if last, ok := params.LastImageHashByItemID[itemID]; ok && last == hash {
+					return []string{}
+				}
+				params.LastImageHashByItemID[itemID] = hash
+			}
+			imageURL := buildCodexImageDataURL(itemResult.Get("output_format").String(), b64)
+			template, _ = sjson.Set(template, "choices.0.delta.role", "assistant")
+			template, _ = sjson.SetRaw(template, "choices.0.delta.images", "["+buildImageDeltaChunk(imageURL)+"]")
+			return []string{template}
+		}
+		if itemResult.Get("type").String() != "function_call" {
 			return []string{}
 		}
 
@@ -304,6 +362,7 @@ func ConvertCodexResponseToOpenAINonStream(_ context.Context, _ string, original
 		var contentText string
 		var reasoningText string
 		var toolCalls []string
+		var images []string
 
 		for _, outputItem := range outputArray {
 			outputType := outputItem.Get("type").String()
@@ -331,6 +390,16 @@ func ConvertCodexResponseToOpenAINonStream(_ context.Context, _ string, original
 						}
 					}
 				}
+			case "image_generation_call":
+				// 非流式响应把生成图片收口到 message.images，保持和上游 data URL 语义一致。
+				b64 := outputItem.Get("result").String()
+				if b64 == "" {
+					break
+				}
+				imageTemplate := `{"index":0,"type":"image_url","image_url":{"url":""}}`
+				imageTemplate, _ = sjson.Set(imageTemplate, "index", len(images))
+				imageTemplate, _ = sjson.Set(imageTemplate, "image_url.url", buildCodexImageDataURL(outputItem.Get("output_format").String(), b64))
+				images = append(images, imageTemplate)
 			case "function_call":
 				// Handle function call content
 				functionCallTemplate := `{"id": "","type": "function","function": {"name": "","arguments": ""}}`
@@ -371,6 +440,15 @@ func ConvertCodexResponseToOpenAINonStream(_ context.Context, _ string, original
 			template, _ = sjson.SetRaw(template, "choices.0.message.tool_calls", `[]`)
 			for _, toolCall := range toolCalls {
 				template, _ = sjson.SetRaw(template, "choices.0.message.tool_calls.-1", toolCall)
+			}
+			template, _ = sjson.Set(template, "choices.0.message.role", "assistant")
+		}
+
+		// Add generated images if any
+		if len(images) > 0 {
+			template, _ = sjson.SetRaw(template, "choices.0.message.images", `[]`)
+			for _, image := range images {
+				template, _ = sjson.SetRaw(template, "choices.0.message.images.-1", image)
 			}
 			template, _ = sjson.Set(template, "choices.0.message.role", "assistant")
 		}
@@ -426,4 +504,29 @@ func buildReverseMapFromOriginalOpenAI(original []byte) map[string]string {
 		}
 	}
 	return rev
+}
+
+func buildCodexImageDataURL(outputFormat, b64 string) string {
+	return "data:" + mimeTypeFromCodexOutputFormat(outputFormat) + ";base64," + b64
+}
+
+func mimeTypeFromCodexOutputFormat(outputFormat string) string {
+	if outputFormat == "" {
+		return "image/png"
+	}
+	if strings.Contains(outputFormat, "/") {
+		return outputFormat
+	}
+	switch strings.ToLower(outputFormat) {
+	case "png":
+		return "image/png"
+	case "jpg", "jpeg":
+		return "image/jpeg"
+	case "webp":
+		return "image/webp"
+	case "gif":
+		return "image/gif"
+	default:
+		return "image/png"
+	}
 }

@@ -385,3 +385,68 @@
 ## Experiments
 
 - 实验 1：先修 `currentConfigSnapshot` 的 `api-keys` 对象视图恢复，再继续收口剩余 management 读路径，之后重跑 reviewer 相关 management 定向测试。
+
+
+## 2026-04-19 v6.9.30 Codex 图片生成 translator 调试记录
+
+### Observations
+- 定向测试 `timeout 60s go test ./internal/translator/codex/gemini ./internal/translator/codex/openai/chat-completions -run 'Image|EmptyOutput|ToolCall|FirstChunk|SetsToolCallsFinishReason' -count=1` 首轮失败点固定在 `internal/translator/codex/gemini/codex_gemini_response_test.go::TestConvertCodexResponseToGemini_NonStreamImageGenerationCallAddsInlineDataPart`。
+- 失败现象是 `inlineData.data = ""`，说明流式路径已写入图片逻辑，Gemini non-stream 路径仍未把 `image_generation_call` 落到 `candidates.0.content.parts`。
+- `internal/translator/codex/gemini/codex_gemini_response.go::ConvertCodexResponseToGeminiNonStream` 的 `switch itemType` 现场只有 `reasoning` / `message` / `function_call` 三支，缺少 `image_generation_call`。
+
+### Hypotheses
+- H1: Gemini non-stream 漏掉 `case "image_generation_call"`，因此最终响应不会写入 `inlineData`。
+  - Supports: 失败只出现在 Gemini non-stream；源码 switch 缺失该分支。
+  - Conflicts: 无。
+  - Test: 只补一个 `case "image_generation_call"`，再跑同一组定向测试。
+- H2: 测试断言路径写错，真实图片被写到了其它字段。
+  - Supports: 无。
+  - Conflicts: `sed` 现场能看到 non-stream 根本没有图片分支。
+  - Test: 打印完整输出 JSON 并查找 `inlineData`。
+- H3: `mimeTypeFromCodexOutputFormat` 返回空导致断言链路中断。
+  - Supports: 失败值是空字符串。
+  - Conflicts: `inlineData.data` 为空早于 mimeType 参与。
+  - Test: 单独断言 data 字段是否进入模板。
+
+### Experiments
+- 实验 E1：只读检查 `ConvertCodexResponseToGeminiNonStream` 的 `switch itemType`。结果：确认缺少 `image_generation_call` 分支，支持 H1。
+- 实验 E2：最小补丁加入 `case "image_generation_call"`，把 `result` 转成 `inlineData` part。结果：待重新跑原失败测试验证。
+
+### Root Cause
+- Gemini non-stream translator 漏掉了 `image_generation_call` 分支，导致最终图片响应没有写入 `inlineData` part。
+
+### Fix
+- 在 `internal/translator/codex/gemini/codex_gemini_response.go::ConvertCodexResponseToGeminiNonStream` 增加 `image_generation_call` 分支，并复用同一 `mimeTypeFromCodexOutputFormat` 助手生成 `inlineData`。
+
+
+## 2026-04-20 reviewer fix：v6.9.30 图片 translator 二次调试
+
+### Observations
+- reviewer 已确认两条可复现缺陷：
+  1. `internal/translator/codex/openai/chat-completions/codex_openai_response.go::ConvertCodexResponseToOpenAI` 把 `imageURL` 直接拼进 `sjson.SetRaw(...)` 的 JSON 字符串，`output_format` 若含引号或反斜杠，会生成非法 JSON。
+  2. `internal/translator/codex/gemini/codex_gemini_response.go::ConvertCodexResponseToGemini` 在 `partial_image` / `image_generation_call` 分支直接早返回，绕过了函数尾部 `LastStorageOutput` flush，tool call 与图片事件顺序会漂移。
+- 当前工作树里 5 个变更文件都与上一轮 `v6.9.30` selective port 相关，本轮边界继续收口在这 4 个 translator 源码/测试文件与 `DEBUG.md`。
+
+### Hypotheses
+- H1: OpenAI 流式图片分支的根因是使用字符串拼接构造 `choices.0.delta.images`，因此任何未经 JSON 转义的 `imageURL` 都可能破坏 chunk 结构。
+  - Supports: reviewer 已给出带引号的 `output_format` 最小复现。
+  - Conflicts: 无。
+  - Test: 改成先构造 `imagePayload` 再用 `sjson.Set` / `SetRaw` 注入，新增带引号 `output_format` 的测试。
+- H2: Gemini 顺序问题的根因是图片分支直接 `return`，没有走尾部 `LastStorageOutput` flush。
+  - Supports: 现有函数只在统一尾部 flush；图片分支都提前返回。
+  - Conflicts: 无。
+  - Test: 增加 `function_call done -> partial_image -> completed` 顺序测试，修复后应先吐 tool call 再吐图片。
+- H3: 只在图片分支前局部 flush 就足够，无需重构整个返回协议。
+  - Supports: 当前功能缺口集中在两条早返回路径。
+  - Conflicts: 若后续再新增类似早返回事件，还会重复踩坑。
+  - Test: 提炼一个小 helper 统一“带 flush 返回”的逻辑，复用到两条图片分支。
+
+### Experiments
+- E1: 先做只读核对，确认 OpenAI 流式图片路径当前仍用 `template + imageURL + SetRaw(...)` 形式构造 `delta.images`。
+- E2: 只读核对 Gemini 流式函数，确认 `LastStorageOutput` 只在函数尾部 flush，图片分支当前直接返回。
+
+### Root Cause
+- OpenAI 流式图片 chunk 使用字符串拼接构造 JSON，且 Gemini 图片分支在早返回时绕过了 `LastStorageOutput` flush。
+
+### Fix
+- OpenAI 流式图片改为 `buildImageDeltaChunk(...)` 逐字段写入；Gemini 图片返回改为统一走 `withPendingStorageOutput(...)`，先输出缓存 tool call 再输出图片 chunk。

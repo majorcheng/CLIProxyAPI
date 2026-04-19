@@ -7,7 +7,9 @@ package gemini
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/tidwall/gjson"
@@ -25,6 +27,18 @@ type ConvertCodexResponseToGeminiParams struct {
 	ResponseID         string
 	LastStorageOutput  string
 	HasOutputTextDelta bool
+	LastImageHashByID  map[string][32]byte
+}
+
+// withPendingStorageOutput 保证此前缓存的 tool call 会在图片 chunk 之前先输出，
+// 避免新增图片事件打乱既有 function_call -> image 的时序。
+func withPendingStorageOutput(params *ConvertCodexResponseToGeminiParams, chunk string) []string {
+	if params == nil || params.LastStorageOutput == "" {
+		return []string{chunk}
+	}
+	stored := params.LastStorageOutput
+	params.LastStorageOutput = ""
+	return []string{stored, chunk}
 }
 
 // ConvertCodexResponseToGemini converts Codex streaming response format to Gemini format.
@@ -48,6 +62,7 @@ func ConvertCodexResponseToGemini(_ context.Context, modelName string, originalR
 			ResponseID:         "",
 			LastStorageOutput:  "",
 			HasOutputTextDelta: false,
+			LastImageHashByID:  make(map[string][32]byte),
 		}
 	}
 
@@ -71,10 +86,59 @@ func ConvertCodexResponseToGemini(_ context.Context, modelName string, originalR
 	}
 	template, _ = sjson.Set(template, "responseId", params.ResponseID)
 
+	// partial_image 会连续推送同一张图的增量快照；这里按 item_id 去重，避免下游重复渲染。
+	if typeStr == "response.image_generation_call.partial_image" {
+		itemID := rootResult.Get("item_id").String()
+		b64 := rootResult.Get("partial_image_b64").String()
+		if b64 == "" {
+			return []string{}
+		}
+		if itemID != "" {
+			if params.LastImageHashByID == nil {
+				params.LastImageHashByID = make(map[string][32]byte)
+			}
+			hash := sha256.Sum256([]byte(b64))
+			if last, ok := params.LastImageHashByID[itemID]; ok && last == hash {
+				return []string{}
+			}
+			params.LastImageHashByID[itemID] = hash
+		}
+
+		part := `{"inlineData":{"data":"","mimeType":""}}`
+		part, _ = sjson.Set(part, "inlineData.data", b64)
+		part, _ = sjson.Set(part, "inlineData.mimeType", mimeTypeFromCodexOutputFormat(rootResult.Get("output_format").String()))
+		template, _ = sjson.SetRaw(template, "candidates.0.content.parts.-1", part)
+		return withPendingStorageOutput(params, template)
+	}
+
 	// Handle function call completion
 	if typeStr == "response.output_item.done" {
 		itemResult := rootResult.Get("item")
 		itemType := itemResult.Get("type").String()
+		// output_item.done 会补发最终成图；若内容与最后一帧 partial_image 相同，这里直接抑制重复输出。
+		if itemType == "image_generation_call" {
+			itemID := itemResult.Get("id").String()
+			b64 := itemResult.Get("result").String()
+			if b64 == "" {
+				return []string{}
+			}
+			if itemID != "" {
+				if params.LastImageHashByID == nil {
+					params.LastImageHashByID = make(map[string][32]byte)
+				}
+				hash := sha256.Sum256([]byte(b64))
+				if last, ok := params.LastImageHashByID[itemID]; ok && last == hash {
+					return []string{}
+				}
+				params.LastImageHashByID[itemID] = hash
+			}
+
+			part := `{"inlineData":{"data":"","mimeType":""}}`
+			part, _ = sjson.Set(part, "inlineData.data", b64)
+			part, _ = sjson.Set(part, "inlineData.mimeType", mimeTypeFromCodexOutputFormat(itemResult.Get("output_format").String()))
+			template, _ = sjson.SetRaw(template, "candidates.0.content.parts.-1", part)
+			return withPendingStorageOutput(params, template)
+		}
 		if itemType == "function_call" {
 			// Create function call part
 			functionCall := `{"functionCall":{"name":"","args":{}}}`
@@ -268,6 +332,18 @@ func ConvertCodexResponseToGeminiNonStream(_ context.Context, modelName string, 
 						})
 					}
 
+				case "image_generation_call":
+					// 非流式 Gemini 需要把图片落成 inlineData part，和文本/工具调用并列返回。
+					flushPendingFunctionCalls()
+					b64 := value.Get("result").String()
+					if b64 == "" {
+						break
+					}
+					part := `{"inlineData":{"data":"","mimeType":""}}`
+					part, _ = sjson.Set(part, "inlineData.data", b64)
+					part, _ = sjson.Set(part, "inlineData.mimeType", mimeTypeFromCodexOutputFormat(value.Get("output_format").String()))
+					template, _ = sjson.SetRaw(template, "candidates.0.content.parts.-1", part)
+
 				case "function_call":
 					// Collect function call for potential merging with consecutive ones
 					hasToolCall = true
@@ -339,4 +415,25 @@ func buildReverseMapFromGeminiOriginal(original []byte) map[string]string {
 
 func GeminiTokenCount(ctx context.Context, count int64) string {
 	return fmt.Sprintf(`{"totalTokens":%d,"promptTokensDetails":[{"modality":"TEXT","tokenCount":%d}]}`, count, count)
+}
+
+func mimeTypeFromCodexOutputFormat(outputFormat string) string {
+	if outputFormat == "" {
+		return "image/png"
+	}
+	if strings.Contains(outputFormat, "/") {
+		return outputFormat
+	}
+	switch strings.ToLower(outputFormat) {
+	case "png":
+		return "image/png"
+	case "jpg", "jpeg":
+		return "image/jpeg"
+	case "webp":
+		return "image/webp"
+	case "gif":
+		return "image/gif"
+	default:
+		return "image/png"
+	}
 }

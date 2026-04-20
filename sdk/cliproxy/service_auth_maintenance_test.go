@@ -1334,6 +1334,135 @@ func TestHandleAuthMaintenanceResult_SharedPathDisablesAllAuthsAndQueuesSingleCa
 	}
 }
 
+func TestHandleAuthMaintenanceResult_CodexTerminalRefresh401Without429QueuesDeleteForRequestRecovery(t *testing.T) {
+	authDir := t.TempDir()
+	filePath := filepath.Join(authDir, "request-refresh-terminal.json")
+	if err := os.WriteFile(filePath, []byte(`{"type":"codex"}`), 0o600); err != nil {
+		t.Fatalf("failed to write auth file: %v", err)
+	}
+
+	service := &Service{
+		cfg: &config.Config{
+			AuthDir: authDir,
+			AuthMaintenance: config.AuthMaintenanceConfig{
+				Enable:                true,
+				DeleteStatusCodes:     []int{401},
+				Refresh401Requires429: true,
+			},
+		},
+		coreManager: coreauth.NewManager(nil, nil, nil),
+	}
+
+	auth := &coreauth.Auth{
+		ID:       "request-refresh-terminal",
+		FileName: filepath.Base(filePath),
+		Provider: "codex",
+		Status:   coreauth.StatusActive,
+		Attributes: map[string]string{
+			"path":      filePath,
+			"plan_type": "free",
+		},
+		Metadata: map[string]any{"email": "request@example.com"},
+	}
+	if _, err := service.coreManager.Register(context.Background(), auth); err != nil {
+		t.Fatalf("failed to register auth: %v", err)
+	}
+
+	service.handleAuthMaintenanceResult(context.Background(), coreauth.Result{
+		AuthID:  auth.ID,
+		Success: false,
+		Error: &coreauth.Error{
+			Code:       codexauth.RefreshTokenReusedErrorCode,
+			HTTPStatus: 401,
+			Message:    "token refresh failed with status 401: refresh_token_reused",
+		},
+	})
+
+	updated, ok := service.coreManager.GetByID(auth.ID)
+	if !ok || updated == nil {
+		t.Fatal("expected auth to remain in manager")
+	}
+	if !updated.Disabled || updated.Status != coreauth.StatusDisabled {
+		t.Fatalf("expected auth to be disabled immediately, got disabled=%v status=%q", updated.Disabled, updated.Status)
+	}
+	if !authMaintenancePendingDelete(updated) {
+		t.Fatal("expected auth to be marked pending delete")
+	}
+	reason, ok := authMaintenancePendingDeleteReason(updated)
+	if !ok || reason != "terminal_refresh_token_reused" {
+		t.Fatalf("expected pending delete reason terminal_refresh_token_reused, got %q ok=%v", reason, ok)
+	}
+
+	if got := service.authMaintenanceQueueLen(); got != 1 {
+		t.Fatalf("expected a single queued candidate, got %d", got)
+	}
+	candidate, _, ok := service.popAuthMaintenanceCandidate()
+	if !ok {
+		t.Fatal("expected queued candidate to be available")
+	}
+	if candidate.Path != filePath {
+		t.Fatalf("expected candidate path %s, got %s", filePath, candidate.Path)
+	}
+	if candidate.Reason != "terminal_refresh_token_reused" {
+		t.Fatalf("expected candidate reason terminal_refresh_token_reused, got %q", candidate.Reason)
+	}
+}
+
+func TestHandleAuthMaintenanceResult_CodexTerminalRefresh401Without401DeleteStatusSkipsQueue(t *testing.T) {
+	authDir := t.TempDir()
+	filePath := filepath.Join(authDir, "request-refresh-terminal-no-401.json")
+	if err := os.WriteFile(filePath, []byte(`{"type":"codex"}`), 0o600); err != nil {
+		t.Fatalf("failed to write auth file: %v", err)
+	}
+
+	service := &Service{
+		cfg: &config.Config{
+			AuthDir: authDir,
+			AuthMaintenance: config.AuthMaintenanceConfig{
+				Enable:                true,
+				DeleteStatusCodes:     []int{429},
+				Refresh401Requires429: true,
+			},
+		},
+		coreManager: coreauth.NewManager(nil, nil, nil),
+	}
+
+	auth := &coreauth.Auth{
+		ID:       "request-refresh-terminal-no-401",
+		FileName: filepath.Base(filePath),
+		Provider: "codex",
+		Status:   coreauth.StatusActive,
+		Attributes: map[string]string{
+			"path":      filePath,
+			"plan_type": "free",
+		},
+	}
+	if _, err := service.coreManager.Register(context.Background(), auth); err != nil {
+		t.Fatalf("failed to register auth: %v", err)
+	}
+
+	service.handleAuthMaintenanceResult(context.Background(), coreauth.Result{
+		AuthID:  auth.ID,
+		Success: false,
+		Error: &coreauth.Error{
+			Code:       codexauth.RefreshTokenReusedErrorCode,
+			HTTPStatus: 401,
+			Message:    "token refresh failed with status 401: refresh_token_reused",
+		},
+	})
+
+	updated, ok := service.coreManager.GetByID(auth.ID)
+	if !ok || updated == nil {
+		t.Fatal("expected auth to remain in manager")
+	}
+	if updated.Disabled || authMaintenancePendingDelete(updated) {
+		t.Fatalf("expected auth to stay active when 401 delete-status is absent, got disabled=%v pending=%v", updated.Disabled, authMaintenancePendingDelete(updated))
+	}
+	if got := service.authMaintenanceQueueLen(); got != 0 {
+		t.Fatalf("expected no queued candidate, got %d", got)
+	}
+}
+
 func TestScanAuthMaintenanceCandidates_LargeAuthPool9053(t *testing.T) {
 	authDir := t.TempDir()
 	service := &Service{

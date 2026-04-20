@@ -27,7 +27,7 @@
 - 检查调度：`sdk/cliproxy/auth/auto_refresh_loop.go::nextRefreshCheckAt`
 - 刷新判定：`sdk/cliproxy/auth/conductor.go::shouldRefresh` / `shouldRefreshCodexFromTokenJSON`
 
-当前服务启动后，会开启 core auth manager 的后台 auto-refresh。  
+当前服务启动后，会开启 core auth manager 的后台 auto-refresh。
 对于 Codex，默认不是“看到 refresh_token 就主动打上游”，而是走**保守门控**：
 
 1. **必须先有 `refresh_token`**
@@ -60,7 +60,12 @@
    - `codex_refresh_unauthorized`
 5. 如果 refresh 成功但重试后仍然 401，则返回 `codex_unauthorized_after_recovery`
 
-这条链和后台 auto-refresh 不是一回事：  
+这条链在 auth-maintenance 里的删除语义也单独收口：
+如果业务请求先命中 401，随后现场 refresh 又命中 terminal 401，那么它继续受
+`auth-maintenance.delete-status-codes` 控制；当其中包含 `401` 时，会直接进入删除通道。
+`refresh-401-requires-429` 只保护后台 auto-refresh / 初始 refresh / management 手动 refresh 这类主动 refresh 失败。
+
+这条链和后台 auto-refresh 不是一回事：
 **它是请求路径里的现场补救，而不是周期任务。**
 
 ---
@@ -71,7 +76,7 @@
 - 处理器：`internal/api/handlers/management/auth_files_codex_refresh.go::RefreshCodexAuthFile`
 - 核心执行：`sdk/cliproxy/auth/conductor.go::RefreshAuthNow`
 
-管理面手动刷新会同步等待 refresh 完成，并把最新 auth 状态直接返回给前端。  
+管理面手动刷新会同步等待 refresh 完成，并把最新 auth 状态直接返回给前端。
 它主要服务于“单卡片手动刷新”这种运维场景，不依赖后台周期任务。
 
 ## 2. 默认触发规则
@@ -148,7 +153,7 @@
 
 - `auth manager: rt 交换完成`
 
-那是 core auth manager / Codex 这条链。  
+那是 core auth manager / Codex 这条链。
 如果看到的是：
 
 - `antigravity rt 交换完成`

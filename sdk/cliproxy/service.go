@@ -1529,7 +1529,19 @@ func authEligibleForMaintenanceDelete(auth *coreauth.Auth, result *coreauth.Resu
 	if authMaintenanceShouldProtectCodexRefresh401(auth, result, cfg) {
 		return "", false
 	}
-	if reason, ok := authMaintenanceCodexTerminalDeleteReason(auth, result); ok {
+	// 业务请求链里的 terminal refresh 401 需要继续受 delete-status-codes 控制；
+	// 只有配置显式允许 401 删除时，才把这类“请求先 401、随后 refresh 也终态失败”的 auth 送进删除队列。
+	if reason, ok := authMaintenanceCodexResultTerminalDeleteReason(auth, result, cfg); ok {
+		return reason, true
+	}
+	// 主动 refresh / management 手动 refresh 不会带本轮 result；
+	// 这类终态 refresh 401 仍复用既有语义删除原因，并保持 429 保护逻辑在上面统一收口。
+	if result == nil {
+		if reason, ok := authMaintenanceCodexTerminalDeleteReason(auth, nil); ok {
+			return reason, true
+		}
+	}
+	if reason, ok := authMaintenanceCodexTerminalDeleteReason(auth, result); ok && !authMaintenanceResultTerminalRefresh401(result) {
 		return reason, true
 	}
 	if statusCode := authMaintenanceStatusCode(auth, result); containsStatusCode(cfg.DeleteStatusCodes, statusCode) {
@@ -1560,6 +1572,11 @@ func authMaintenanceShouldProtectCodexRefresh401(auth *coreauth.Auth, result *co
 		return false
 	}
 	if authMaintenanceHasQuota429(auth, result) {
+		return false
+	}
+	// 请求链里的 terminal refresh 401 已经意味着“业务请求先 401，现场 refresh 也失败”；
+	// 这类结果应直接交给 delete-status-codes 决定，不能继续套用后台/主动 refresh 的 429 保护。
+	if authMaintenanceResultTerminalRefresh401(result) {
 		return false
 	}
 	if authMaintenanceCodexTerminalRefresh401(auth, result) {
@@ -1600,6 +1617,43 @@ func authMaintenanceCodexTerminalRefresh401(auth *coreauth.Auth, result *coreaut
 	default:
 		return false
 	}
+}
+
+// authMaintenanceResultTerminalRefresh401 只识别“本轮业务请求结果”里带回来的 terminal refresh 401。
+// 主动 refresh / management 手动 refresh 不会经过 result hook，因此这里不回退读 auth.LastError。
+func authMaintenanceResultTerminalRefresh401(result *coreauth.Result) bool {
+	if result == nil || result.Error == nil {
+		return false
+	}
+	switch strings.TrimSpace(result.Error.Code) {
+	case codexauth.RefreshTokenExpiredErrorCode,
+		codexauth.RefreshTokenReusedErrorCode,
+		codexauth.RefreshTokenRevokedErrorCode,
+		codexauth.RefreshUnauthorizedErrorCode:
+		return true
+	default:
+		return false
+	}
+}
+
+// authMaintenanceCodexResultTerminalDeleteReason 只处理请求 hook 带来的 terminal 结果。
+// 其中 terminal refresh 401 必须继续经过 delete-status-codes 的 401 开关；
+// `codex_unauthorized_after_recovery` 维持既有“请求恢复链耗尽即可删除”的语义。
+func authMaintenanceCodexResultTerminalDeleteReason(auth *coreauth.Auth, result *coreauth.Result, cfg config.AuthMaintenanceConfig) (string, bool) {
+	if result == nil || result.Error == nil {
+		return "", false
+	}
+	code := strings.TrimSpace(result.Error.Code)
+	if code == codexauth.UnauthorizedAfterRecoveryErrorCode {
+		return "terminal_request_401_after_recovery", true
+	}
+	if !authMaintenanceResultTerminalRefresh401(result) {
+		return "", false
+	}
+	if !containsStatusCode(cfg.DeleteStatusCodes, http.StatusUnauthorized) {
+		return "", false
+	}
+	return authMaintenanceCodexTerminalDeleteReason(auth, result)
 }
 
 // authMaintenanceTerminalErrorCode 优先读取本轮结果里的错误码，回退到 auth 上持久化的 LastError.Code。

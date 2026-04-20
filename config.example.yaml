@@ -72,14 +72,16 @@ pprof:
 #   # 例如：如果包含 429，则一次 429 响应就足以立刻禁用该 auth，
 #   # 并将文件加入“移入垃圾站”的队列。quota-strike-threshold 不会延迟这条路径。
 #   delete-status-codes: [401, 429]
-#   # 对“refresh RT 失败导致的 401”做一层额外保护。
-#   # 默认 true：refresh 401（包括已归一成 Codex terminal refresh error code 的 RT 终态失败）
+#   # 对“主动 refresh RT 失败导致的 401”做一层额外保护。
+#   # 默认 true：后台 auto-refresh、初始 refresh、management 手动 refresh 这类主动 refresh 401
 #   # 不会直接按 401 删除，只有该 auth 已经具备 429 痕迹时才删除。
+#   # 业务请求链里若先返回 401，随后现场 refresh 也命中 terminal 401，
+#   # 这类结果会继续受 delete-status-codes 控制；若其中包含 401，则会直接进入删除通道。
 #   # 注意：这只是 refresh 401 的特殊分支，不等于开启了“普通 429 自动删除”。
 #   # 也就是说：如果 delete-status-codes 里没有 429，且 delete-quota-exceeded=false，
 #   # 那么普通 429 仍不会被自动删除；只有“refresh 401 + 已429”这类特殊情况会按 429 归因进入垃圾站。
 #   # 因此你可能会看到文件进入 logs/delete/429/，但这并不代表当前配置已经打开了常规 429 删除。
-#   # 显式设为 false 时，带 terminal refresh error code 的 Codex RT 401 会恢复进入删除流程；
+#   # 显式设为 false 时，主动 refresh 的 terminal RT 401 也会恢复进入删除流程；
 #   # 但普通原始 Codex 401 仍不会仅凭 delete-status-codes 被直接删除。
 #   refresh-401-requires-429: true
 #   # 为重复额度失败启用第二条删除路径。

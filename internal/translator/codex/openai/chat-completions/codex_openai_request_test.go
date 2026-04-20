@@ -268,6 +268,203 @@ func TestMultipleToolCalls(t *testing.T) {
 	}
 }
 
+// OpenClaw 风格的 user 文本 tool result 需要先归一化，再继续走标准
+// function_call_output 翻译链。
+func TestPseudoToolResultMessageBecomesFunctionCallOutput(t *testing.T) {
+	input := []byte(`{
+		"model": "gpt-4o",
+		"messages": [
+			{"role": "user", "content": "先读文件"},
+			{
+				"role": "assistant",
+				"content": null,
+				"tool_calls": [
+					{
+						"id": "call5u6VTmiKVl09FPPXrpMKxV8T",
+						"type": "function",
+						"function": {
+							"name": "read",
+							"arguments": "{\"path\":\"/tmp/demo.md\"}"
+						}
+					}
+				]
+			},
+			{
+				"role": "user",
+				"content": "[Tool result for call5u6VTmiKVl09FPPXrpMKxV8T]: # 标题\n\n正文"
+			}
+		],
+		"tools": [
+			{
+				"type": "function",
+				"function": {
+					"name": "read",
+					"description": "读取文件",
+					"parameters": {"type": "object", "properties": {"path": {"type": "string"}}}
+				}
+			}
+		]
+	}`)
+
+	out := ConvertOpenAIRequestToCodex("gpt-4o", input, true)
+	items := gjson.GetBytes(out, "input").Array()
+	if len(items) != 3 {
+		t.Fatalf("expected 3 input items, got %d: %s", len(items), gjson.GetBytes(out, "input").Raw)
+	}
+
+	if items[1].Get("type").String() != "function_call" {
+		t.Fatalf("item 1: expected function_call, got %s", items[1].Get("type").String())
+	}
+	if items[1].Get("call_id").String() != "call5u6VTmiKVl09FPPXrpMKxV8T" {
+		t.Fatalf("item 1: unexpected call_id %s", items[1].Get("call_id").String())
+	}
+
+	if items[2].Get("type").String() != "function_call_output" {
+		t.Fatalf("item 2: expected function_call_output, got %s", items[2].Get("type").String())
+	}
+	if items[2].Get("call_id").String() != "call5u6VTmiKVl09FPPXrpMKxV8T" {
+		t.Fatalf("item 2: unexpected call_id %s", items[2].Get("call_id").String())
+	}
+	if items[2].Get("output").String() != "# 标题\n\n正文" {
+		t.Fatalf("item 2: unexpected output %q", items[2].Get("output").String())
+	}
+}
+
+func TestPseudoToolResultMessageKeepsMixedTurnOrder(t *testing.T) {
+	input := []byte(`{
+		"model": "gpt-4o",
+		"messages": [
+			{"role": "user", "content": "先查一下"},
+			{
+				"role": "assistant",
+				"content": null,
+				"tool_calls": [
+					{
+						"id": "call_order",
+						"type": "function",
+						"function": {
+							"name": "lookup",
+							"arguments": "{}"
+						}
+					}
+				]
+			},
+			{"role": "user", "content": "[Tool result for call_order]: ok"},
+			{"role": "assistant", "content": "查询完成"}
+		],
+		"tools": [
+			{
+				"type": "function",
+				"function": {
+					"name": "lookup",
+					"description": "查询",
+					"parameters": {"type": "object", "properties": {}}
+				}
+			}
+		]
+	}`)
+
+	out := ConvertOpenAIRequestToCodex("gpt-4o", input, true)
+	items := gjson.GetBytes(out, "input").Array()
+	if len(items) != 4 {
+		t.Fatalf("expected 4 input items, got %d: %s", len(items), gjson.GetBytes(out, "input").Raw)
+	}
+
+	expected := []struct {
+		itemType string
+		role     string
+	}{
+		{itemType: "message", role: "user"},
+		{itemType: "function_call"},
+		{itemType: "function_call_output"},
+		{itemType: "message", role: "assistant"},
+	}
+	for i, want := range expected {
+		if got := items[i].Get("type").String(); got != want.itemType {
+			t.Fatalf("item %d: expected type %s, got %s", i, want.itemType, got)
+		}
+		if want.role != "" && items[i].Get("role").String() != want.role {
+			t.Fatalf("item %d: expected role %s, got %s", i, want.role, items[i].Get("role").String())
+		}
+	}
+}
+
+func TestPseudoToolResultMessageWithUnknownCallIDStaysUserMessage(t *testing.T) {
+	input := []byte(`{
+		"model": "gpt-4o",
+		"messages": [
+			{"role": "user", "content": "hello"},
+			{"role": "user", "content": "[Tool result for call_missing]: tool body"}
+		]
+	}`)
+
+	out := ConvertOpenAIRequestToCodex("gpt-4o", input, true)
+	items := gjson.GetBytes(out, "input").Array()
+	if len(items) != 2 {
+		t.Fatalf("expected 2 input items, got %d: %s", len(items), gjson.GetBytes(out, "input").Raw)
+	}
+	if items[1].Get("type").String() != "message" {
+		t.Fatalf("item 1: expected message, got %s", items[1].Get("type").String())
+	}
+	if items[1].Get("role").String() != "user" {
+		t.Fatalf("item 1: expected user role, got %s", items[1].Get("role").String())
+	}
+	if got := items[1].Get("content.0.text").String(); got != "[Tool result for call_missing]: tool body" {
+		t.Fatalf("item 1: unexpected content %q", got)
+	}
+}
+
+func TestPseudoToolResultMessageOutsidePendingWindowStaysUserMessage(t *testing.T) {
+	input := []byte(`{
+		"model": "gpt-4o",
+		"messages": [
+			{"role": "user", "content": "先查一下"},
+			{
+				"role": "assistant",
+				"content": null,
+				"tool_calls": [
+					{
+						"id": "call_order",
+						"type": "function",
+						"function": {
+							"name": "lookup",
+							"arguments": "{}"
+						}
+					}
+				]
+			},
+			{"role": "user", "content": "[Tool result for call_order]: ok"},
+			{"role": "assistant", "content": "查询完成"},
+			{"role": "user", "content": "[Tool result for call_order]: 这串前缀是日志格式，请帮我解释含义"}
+		],
+		"tools": [
+			{
+				"type": "function",
+				"function": {
+					"name": "lookup",
+					"description": "查询",
+					"parameters": {"type": "object", "properties": {}}
+				}
+			}
+		]
+	}`)
+
+	out := ConvertOpenAIRequestToCodex("gpt-4o", input, true)
+	items := gjson.GetBytes(out, "input").Array()
+	if len(items) != 5 {
+		t.Fatalf("expected 5 input items, got %d: %s", len(items), gjson.GetBytes(out, "input").Raw)
+	}
+	if items[4].Get("type").String() != "message" {
+		t.Fatalf("item 4: expected message, got %s", items[4].Get("type").String())
+	}
+	if items[4].Get("role").String() != "user" {
+		t.Fatalf("item 4: expected user role, got %s", items[4].Get("role").String())
+	}
+	if got := items[4].Get("content.0.text").String(); got != "[Tool result for call_order]: 这串前缀是日志格式，请帮我解释含义" {
+		t.Fatalf("item 4: unexpected content %q", got)
+	}
+}
+
 // Regression test for #2132: tool-call-only assistant messages (content:null)
 // must not produce an empty message item in the translated output.
 func TestNoSpuriousEmptyAssistantMessage(t *testing.T) {

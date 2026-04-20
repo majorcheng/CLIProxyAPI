@@ -12,6 +12,8 @@ import (
 	"strings"
 )
 
+const pseudoToolResultPrefix = "[Tool result for "
+
 // ---------------------------------------------------------------------------
 // Input structures (minimal – only fields actually used)
 // ---------------------------------------------------------------------------
@@ -120,6 +122,7 @@ func ConvertOpenAIRequestToCodex(modelName string, inputRawJSON []byte, stream b
 		_ = json.Unmarshal(inputRawJSON, &req)
 		PrimeOpenAIRequest(inputRawJSON)
 	}
+	req.Messages = normalizePseudoToolResultMessages(req.Messages)
 
 	// Build tool-name shortening map from all function tools in the request.
 	var funcNames []string
@@ -314,6 +317,99 @@ func ConvertOpenAIRequestToCodexLegacy(modelName string, inputRawJSON []byte, st
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+// normalizePseudoToolResultMessages 会把 OpenClaw 风格的伪装 tool result
+// user 消息，在“当前仍处于待提交 tool output 的窗口”内收口成标准
+// tool 消息，复用现有 function_call_output 翻译链。
+func normalizePseudoToolResultMessages(messages []chatMessage) []chatMessage {
+	if len(messages) == 0 {
+		return nil
+	}
+
+	normalized := append([]chatMessage(nil), messages...)
+	pendingCallIDs := make(map[string]struct{}, len(messages))
+	for i, message := range normalized {
+		if callID, output, ok := parsePseudoToolResultMessage(message, pendingCallIDs); ok {
+			normalized[i].Role = "tool"
+			normalized[i].ToolCallID = callID
+			normalized[i].Content = marshalStringRawMessage(output)
+			delete(pendingCallIDs, callID)
+			continue
+		}
+
+		switch message.Role {
+		case "assistant":
+			clearPendingToolCallIDs(pendingCallIDs)
+			for _, toolCall := range message.ToolCalls {
+				if toolCall.ID != "" {
+					pendingCallIDs[toolCall.ID] = struct{}{}
+				}
+			}
+		case "tool":
+			if message.ToolCallID != "" {
+				delete(pendingCallIDs, message.ToolCallID)
+			}
+		case "user":
+			clearPendingToolCallIDs(pendingCallIDs)
+		}
+	}
+	return normalized
+}
+
+// parsePseudoToolResultMessage 只识别纯字符串 user 内容，格式固定为
+// [Tool result for <call_id>]: <output>，且 call_id 必须仍处于最近一轮
+// assistant tool_calls 打开的 pending 窗口中，避免把后续引用日志的
+// 普通用户消息误判成 tool output。
+func parsePseudoToolResultMessage(message chatMessage, pendingCallIDs map[string]struct{}) (string, string, bool) {
+	if message.Role != "user" || firstNonSpaceByte(message.Content) != '"' {
+		return "", "", false
+	}
+
+	contentStr, ok := unmarshalStringMessage(message.Content)
+	if !ok || !strings.HasPrefix(contentStr, pseudoToolResultPrefix) {
+		return "", "", false
+	}
+
+	callIDEnd := strings.Index(contentStr[len(pseudoToolResultPrefix):], "]:")
+	if callIDEnd < 0 {
+		return "", "", false
+	}
+
+	callIDStart := len(pseudoToolResultPrefix)
+	callIDEnd += callIDStart
+	callID := contentStr[callIDStart:callIDEnd]
+	if callID == "" {
+		return "", "", false
+	}
+	if _, ok := pendingCallIDs[callID]; !ok {
+		return "", "", false
+	}
+
+	output := contentStr[callIDEnd+2:]
+	if strings.HasPrefix(output, " ") {
+		output = output[1:]
+	}
+	return callID, output, true
+}
+
+func clearPendingToolCallIDs(pendingCallIDs map[string]struct{}) {
+	for callID := range pendingCallIDs {
+		delete(pendingCallIDs, callID)
+	}
+}
+
+func unmarshalStringMessage(raw json.RawMessage) (string, bool) {
+	var s string
+	if err := json.Unmarshal(raw, &s); err != nil {
+		return "", false
+	}
+	return s, true
+}
+
+func marshalStringRawMessage(value string) json.RawMessage {
+	raw, _ := json.Marshal(value)
+	return raw
+}
 
 func rawToString(raw json.RawMessage) string {
 	if len(raw) == 0 {

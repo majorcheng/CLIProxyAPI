@@ -143,9 +143,13 @@ func TestManagerRefreshAuth_PersistsTerminalRefresh401ForMaintenance(t *testing.
 		ID:       "refresh-401",
 		Provider: "codex",
 		Status:   StatusActive,
+		Attributes: map[string]string{
+			"priority": "7",
+		},
 		Metadata: map[string]any{
 			"email":         "user@example.com",
 			"refresh_token": "refresh-token",
+			"priority":      7,
 		},
 	}
 	MarkCodexInitialRefreshPendingForNewFile(auth)
@@ -168,6 +172,12 @@ func TestManagerRefreshAuth_PersistsTerminalRefresh401ForMaintenance(t *testing.
 	}
 	if updated.LastError.Code != codexauth.RefreshUnauthorizedErrorCode {
 		t.Fatalf("expected LastError.Code = %q, got %q", codexauth.RefreshUnauthorizedErrorCode, updated.LastError.Code)
+	}
+	if got := strings.TrimSpace(updated.Attributes["priority"]); got != "5" {
+		t.Fatalf("expected runtime priority to become 5 after RT 401 failure, got %q", got)
+	}
+	if got, ok := updated.Metadata["priority"].(int); !ok || got != 5 {
+		t.Fatalf("expected metadata priority to become 5 after RT 401 failure, got %#v", updated.Metadata["priority"])
 	}
 	if !strings.Contains(updated.LastError.Message, "status 401") {
 		t.Fatalf("expected LastError.Message to preserve refresh failure details, got %q", updated.LastError.Message)
@@ -192,6 +202,12 @@ func TestManagerRefreshAuth_PersistsTerminalRefresh401ForMaintenance(t *testing.
 			last := saves[len(saves)-1]
 			if CodexInitialRefreshPending(last) {
 				t.Fatalf("expected persisted auth to clear pending flag after terminal failure")
+			}
+			if got := strings.TrimSpace(last.Attributes["priority"]); got != "5" {
+				t.Fatalf("expected persisted runtime priority 5 after RT 401 failure, got %q", got)
+			}
+			if got, ok := last.Metadata["priority"].(int); !ok || got != 5 {
+				t.Fatalf("expected persisted metadata priority 5 after RT 401 failure, got %#v", last.Metadata["priority"])
 			}
 			break
 		}
@@ -223,9 +239,13 @@ func TestManagerRefreshAuth_DoesNotMarkTransientRefreshStatusForMaintenance(t *t
 		ID:       "refresh-429",
 		Provider: "codex",
 		Status:   StatusActive,
+		Attributes: map[string]string{
+			"priority": "7",
+		},
 		Metadata: map[string]any{
 			"email":         "user@example.com",
 			"refresh_token": "refresh-token",
+			"priority":      7,
 		},
 	}
 	MarkCodexInitialRefreshPendingForNewFile(auth)
@@ -241,6 +261,12 @@ func TestManagerRefreshAuth_DoesNotMarkTransientRefreshStatusForMaintenance(t *t
 	}
 	if updated.LastError == nil {
 		t.Fatal("expected refresh failure to persist LastError")
+	}
+	if got := strings.TrimSpace(updated.Attributes["priority"]); got != "7" {
+		t.Fatalf("expected runtime priority to remain 7 after RT failure, got %q", got)
+	}
+	if got, ok := updated.Metadata["priority"].(int); !ok || got != 7 {
+		t.Fatalf("expected metadata priority to remain 7 after RT failure, got %#v", updated.Metadata["priority"])
 	}
 	if updated.LastError.HTTPStatus != 0 {
 		t.Fatalf("expected transient refresh error to avoid maintenance status code, got %d", updated.LastError.HTTPStatus)
@@ -314,8 +340,12 @@ func TestManagerRefreshAuthNow_LogsRTExchangeFailure(t *testing.T) {
 		ID:       "refresh-log-failure",
 		Provider: "codex",
 		Status:   StatusActive,
+		Attributes: map[string]string{
+			"priority": "7",
+		},
 		Metadata: map[string]any{
 			"refresh_token": "old-refresh-token",
+			"priority":      7,
 		},
 	}
 	if _, err := manager.Register(ctx, auth); err != nil {
@@ -329,6 +359,81 @@ func TestManagerRefreshAuthNow_LogsRTExchangeFailure(t *testing.T) {
 	logText := logBuf.String()
 	if !strings.Contains(logText, "auth manager: rt 交换失败: provider=codex auth=refresh-log-failure err=refresh boom") {
 		t.Fatalf("expected rt exchange failure log, got %q", logText)
+	}
+	updated, ok := manager.GetByID(auth.ID)
+	if !ok || updated == nil {
+		t.Fatalf("expected auth %q to remain registered", auth.ID)
+	}
+	if got := strings.TrimSpace(updated.Attributes["priority"]); got != "7" {
+		t.Fatalf("expected runtime priority to remain 7 after RT failure, got %q", got)
+	}
+	if got, ok := updated.Metadata["priority"].(int); !ok || got != 7 {
+		t.Fatalf("expected metadata priority to remain 7 after RT failure, got %#v", updated.Metadata["priority"])
+	}
+}
+
+func TestManagerRefreshAuthNow_PromotesPriorityOnRTUnauthorized401(t *testing.T) {
+	ctx := context.Background()
+	store := &codexRefreshRecordingStore{}
+
+	manager := NewManager(store, nil, nil)
+	manager.RegisterExecutor(refreshFailureTestExecutor{
+		provider: "codex",
+		err: terminalRefreshTestError{
+			status: http.StatusUnauthorized,
+			code:   codexauth.RefreshUnauthorizedErrorCode,
+			msg:    "token refresh failed with status 401: unauthorized",
+		},
+	})
+
+	auth := &Auth{
+		ID:       "refresh-log-401-priority",
+		Provider: "codex",
+		Status:   StatusActive,
+		Attributes: map[string]string{
+			"priority": "7",
+		},
+		Metadata: map[string]any{
+			"refresh_token": "old-refresh-token",
+			"priority":      7,
+		},
+	}
+	if _, err := manager.Register(ctx, auth); err != nil {
+		t.Fatalf("register auth: %v", err)
+	}
+
+	if _, err := manager.RefreshAuthNow(ctx, auth.ID); err == nil {
+		t.Fatal("expected RefreshAuthNow to return refresh failure")
+	}
+
+	updated, ok := manager.GetByID(auth.ID)
+	if !ok || updated == nil {
+		t.Fatalf("expected auth %q to remain registered", auth.ID)
+	}
+	if got := strings.TrimSpace(updated.Attributes["priority"]); got != "5" {
+		t.Fatalf("expected runtime priority to become 5 after RT 401 failure, got %q", got)
+	}
+	if got, ok := updated.Metadata["priority"].(int); !ok || got != 5 {
+		t.Fatalf("expected metadata priority to become 5 after RT 401 failure, got %#v", updated.Metadata["priority"])
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		saves := store.snapshot()
+		if len(saves) >= 2 {
+			last := saves[len(saves)-1]
+			if got := strings.TrimSpace(last.Attributes["priority"]); got != "5" {
+				t.Fatalf("expected persisted runtime priority 5 after RT 401 failure, got %q", got)
+			}
+			if got, ok := last.Metadata["priority"].(int); !ok || got != 5 {
+				t.Fatalf("expected persisted metadata priority 5 after RT 401 failure, got %#v", last.Metadata["priority"])
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("expected async persistence after RT 401 priority rewrite, got %d saves", len(saves))
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 

@@ -45,6 +45,77 @@
 
 ---
 
+# RT 交换失败后 priority 未收口到 5 排查记录（2026-04-20）
+
+## Observations
+
+- `sdk/cliproxy/auth/conductor.go::executeRefreshAuth` 当前在 `exec.Refresh(...)` 返回错误后，只更新 `LastError`、`NextRefreshAfter`、`UpdatedAt` 与 initial refresh pending 标记。
+- `sdk/cliproxy/auth/conductor.go::executeRefreshAuth` 当前错误分支里没有任何 `priority` 写回逻辑。
+- `sdk/cliproxy/auth/selector.go::authPriority` 与 `sdk/cliproxy/auth/scheduler.go::highestReadyPriorityLocked` 都读取 `Auth.Attributes["priority"]` 作为运行期调度优先级。
+- `sdk/auth/filestore.go::Save` 通过 `sdk/cliproxy/auth/runtime_state_persistence.go::MetadataWithPersistedRuntimeState` 把 `Auth.Metadata` 落盘，因此要让 auth JSON 顶层出现 `"priority": 5`，需要同步写入 `Auth.Metadata["priority"]`。
+- `internal/api/handlers/management/auth_files.go::PatchAuthFileFields` 已经给出 priority 双写语义：同时更新 `Auth.Attributes["priority"]` 与 `Auth.Metadata["priority"]`。
+
+## Hypotheses
+
+### H1: live 未生效的根因是 `executeRefreshAuth` 错误分支压根没有写回 priority（ROOT HYPOTHESIS）
+- Supports: 当前实现只有失败日志、退避与错误态更新；代码里搜不到 RT 失败后的 priority 写入。
+- Conflicts: 暂无。
+- Test: 在错误分支里给带 `refresh_token` 的 auth 同时写 `Attributes["priority"]="5"` 与 `Metadata["priority"]=5`，再补定向测试验证内存态与异步落盘都变成 5。
+
+### H2: priority 已写到运行态，只有落盘路径丢了
+- Supports: 调度读 `Attributes`，落盘读 `Metadata`，两套路径分离。
+- Conflicts: 当前错误分支连运行态 `Attributes["priority"]` 都没改。
+- Test: 回归测试同时断言运行态与持久化快照。
+
+### H3: management 展示链忽略了 priority
+- Supports: 用户看到的是文件/管理面结果。
+- Conflicts: `internal/api/handlers/management/auth_files.go::buildAuthFileEntry` 已优先读 `Attributes["priority"]`，其次读 `Metadata["priority"]`，展示链本身具备读取能力。
+- Test: 优先修正写路径，再用现有测试验证双写结果。
+
+## Experiments
+
+- 只读核对 `sdk/cliproxy/auth/conductor.go::executeRefreshAuth`，确认 RT 失败后当前实现缺少 priority 写回。
+- 只读核对 `sdk/cliproxy/auth/selector.go::authPriority`、`sdk/cliproxy/auth/scheduler.go::highestReadyPriorityLocked`、`internal/api/handlers/management/auth_files.go::PatchAuthFileFields` 与 `sdk/auth/filestore.go::Save`，确认本次修复应采用 `Attributes + Metadata` 双写。
+- 生产修复：在 `sdk/cliproxy/auth/conductor.go::executeRefreshAuth` 的失败分支新增 `setPreferredPriorityAfterRTExchangeFailure(...)` 收口逻辑，把 RT 失败后的 auth 统一写成 `priority=5`，并通过异步持久化把快照落盘。
+- 回归测试：扩展 `sdk/cliproxy/auth/conductor_refresh_failure_test.go`，覆盖 terminal 401、transient 429 与 `RefreshAuthNow(...)` 三条路径，确认 RT 失败后运行态与持久化快照都变成 5。
+
+## Root Cause
+
+- 根因是 `sdk/cliproxy/auth/conductor.go::executeRefreshAuth` 的 refresh 失败分支缺少 priority 写回逻辑，导致 RT 交换失败后只更新错误态与退避时间，既没有把运行态调度 priority 收口到 5，也没有把 `"priority": 5` 持久化回 auth 文件。
+
+## Fix
+
+- 新增 `sdk/cliproxy/auth/conductor.go::{setPreferredPriorityAfterRTExchangeFailure,authMetadataPriorityEquals}`，把 RT 失败后的优先级收口统一封装成双写 helper。
+- 在 `sdk/cliproxy/auth/conductor.go::executeRefreshAuth` 的错误分支中，只要当前 auth 携带 `refresh_token`，就把 `Auth.Attributes["priority"]` 写成 `"5"`、把 `Auth.Metadata["priority"]` 写成 `5`，并复用既有异步持久化队列落盘。
+- 扩展 `sdk/cliproxy/auth/conductor_refresh_failure_test.go::{TestManagerRefreshAuth_PersistsTerminalRefresh401ForMaintenance,TestManagerRefreshAuth_DoesNotMarkTransientRefreshStatusForMaintenance,TestManagerRefreshAuthNow_LogsRTExchangeFailure}`，锁定 401/429/即时刷新三条失败路径上的 priority 收口语义。
+
+## Reviewer Follow-up
+
+- reviewer 指出 `sdk/cliproxy/auth/types.go::Auth` 已把 `Attributes` 定义成 immutable configuration，`internal/api/handlers/management/auth_files.go::PatchAuthFileFields` 也把 priority 双写限定在显式管理入口。
+- `sdk/cliproxy/auth/conductor.go::executeRefreshAuth` 的职责边界适合维护 `LastError`、`NextRefreshAfter`、pending 标记等运行态信息；把一次 refresh 失败升级成 priority 持久化改写，会放大成 operator 路由配置变更。
+- 本仓 `tasks/lessons.md` 已同步沉淀：refresh/RT 交换失败场景保持运行态语义，priority 继续由显式管理路径负责。
+
+## Corrective Fix
+
+- 回退 `sdk/cliproxy/auth/conductor.go::executeRefreshAuth` 中 RT 失败后的 priority 双写与持久化改写逻辑，恢复到只更新 `LastError`、`NextRefreshAfter`、`UpdatedAt` 与 initial refresh pending 标记。
+- 调整 `sdk/cliproxy/auth/conductor_refresh_failure_test.go::{TestManagerRefreshAuth_PersistsTerminalRefresh401ForMaintenance,TestManagerRefreshAuth_DoesNotMarkTransientRefreshStatusForMaintenance,TestManagerRefreshAuthNow_LogsRTExchangeFailure}`，改为锁定“refresh 失败后 operator 预设的 priority 保持原值”。
+
+## User Decision Follow-up
+
+- 用户随后把行为边界重新明确为：只有“RT 交换失败的 401”需要把 priority 改成 5。
+- 这次约束比“所有 refresh 失败都改 priority”更窄，因此修复收口为 `rtExchangeLogged && terminalStatus == 401`。
+- `429` 和普通 refresh 错误继续保持原优先级，减少额外影响面。
+
+## Final Fix
+
+- 在 `sdk/cliproxy/auth/conductor.go::executeRefreshAuth` 中恢复 priority 双写逻辑，但触发条件只保留 `RT 交换失败 + HTTP 401`。
+- `sdk/cliproxy/auth/conductor_refresh_failure_test.go` 现已形成三层语义：
+  - `TestManagerRefreshAuth_PersistsTerminalRefresh401ForMaintenance`：401 时 priority 收口到 5；
+  - `TestManagerRefreshAuth_DoesNotMarkTransientRefreshStatusForMaintenance`：429 时 priority 保持原值；
+  - `TestManagerRefreshAuthNow_LogsRTExchangeFailure` 与 `TestManagerRefreshAuthNow_PromotesPriorityOnRTUnauthorized401`：分别锁定非 401 与 401 的 `RefreshAuthNow(...)` 行为边界。
+
+---
+
 # 手动编辑 config.yaml 新增 openai-compatibility provider 未热加载排查记录（2026-04-15）
 
 ## Observations

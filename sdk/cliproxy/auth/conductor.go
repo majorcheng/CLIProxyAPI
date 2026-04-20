@@ -76,6 +76,8 @@ const (
 	codexProactiveRefreshWindow = 12 * time.Hour
 	// 当 Codex access token 缺少可解析 exp 时，回退到官方约 8 天的 stale 判定窗口。
 	codexLastRefreshStaleWindow = 8 * 24 * time.Hour
+	// RT 交换返回 401 后，把凭证收口到 priority=5，便于按“优先使用”原则继续消费当前 token。
+	rtExchangeUnauthorizedPreferredPriority = 5
 )
 
 var quotaCooldownDisabled atomic.Bool
@@ -4039,6 +4041,46 @@ func authRefreshTokenRotated(before string, after string) bool {
 	return before != after
 }
 
+// setPreferredPriorityAfterRTUnauthorized 在 RT 交换返回 401 后把 auth 收口到 priority=5。
+// 这里同时写 Attributes 与 Metadata，保证当前调度与管理面读取到同一优先级。
+func setPreferredPriorityAfterRTUnauthorized(a *Auth) bool {
+	if a == nil {
+		return false
+	}
+	if a.Attributes == nil {
+		a.Attributes = make(map[string]string, 1)
+	}
+	if a.Metadata == nil {
+		a.Metadata = make(map[string]any, 1)
+	}
+	changed := false
+	priorityText := strconv.Itoa(rtExchangeUnauthorizedPreferredPriority)
+	if strings.TrimSpace(a.Attributes["priority"]) != priorityText {
+		a.Attributes["priority"] = priorityText
+		changed = true
+	}
+	if !authMetadataPriorityEquals(a.Metadata, rtExchangeUnauthorizedPreferredPriority) {
+		a.Metadata["priority"] = rtExchangeUnauthorizedPreferredPriority
+		changed = true
+	}
+	return changed
+}
+
+// authMetadataPriorityEquals 判断 metadata 中的 priority 是否已经等于目标值。
+func authMetadataPriorityEquals(metadata map[string]any, expected int) bool {
+	switch value := metadata["priority"].(type) {
+	case int:
+		return value == expected
+	case float64:
+		return int(value) == expected
+	case string:
+		parsed, err := strconv.Atoi(strings.TrimSpace(value))
+		return err == nil && parsed == expected
+	default:
+		return false
+	}
+}
+
 // authCodexAccessTokenExpiry 尝试直接从 Codex access token 的 JWT `exp` 读取真实过期时间。
 // 解析失败时返回 false，让上层回退到 metadata 中的 `expired` / `last_refresh` 判定。
 func authCodexAccessTokenExpiry(a *Auth) (time.Time, bool) {
@@ -4327,10 +4369,17 @@ func (m *Manager) executeRefreshAuth(ctx context.Context, id string) (*Auth, err
 		var currentSnapshot *Auth
 		m.mu.Lock()
 		if current := m.auths[id]; current != nil {
+			persistNeeded := false
+			if rtExchangeLogged && terminalStatus == http.StatusUnauthorized && setPreferredPriorityAfterRTUnauthorized(current) {
+				persistNeeded = true
+			}
 			current.NextRefreshAfter = now.Add(refreshFailureBackoff)
 			current.LastError = refreshErr
 			current.UpdatedAt = now
 			if initialRefreshPending && terminalStatus > 0 && ClearCodexInitialRefreshPending(current) {
+				persistNeeded = true
+			}
+			if persistNeeded {
 				persistSnapshot = current.Clone()
 			}
 			currentSnapshot = current.Clone()

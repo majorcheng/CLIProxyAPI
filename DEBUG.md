@@ -450,3 +450,28 @@
 
 ### Fix
 - OpenAI 流式图片改为 `buildImageDeltaChunk(...)` 逐字段写入；Gemini 图片返回改为统一走 `withPendingStorageOutput(...)`，先输出缓存 tool call 再输出图片 chunk。
+
+
+## 2026-04-20 PR2266 websocket compact replay 400 排查
+
+### Observations
+- 参考 PR `router-for-me/CLIProxyAPI#2266` 的说明，本次 400 `No tool output found for function call ...` 对应的是 websocket compact 之后客户端回放整段 transcript 时，旧的 `lastRequest` / `lastResponseOutput` 与新 transcript 继续合并，导致 `function_call` / `function_call_output` 配对被打乱。
+- 当前本地实现位于 `sdk/api/handlers/openai/openai_responses_websocket.go::normalizeResponseSubsequentRequest`，它会先调用 `shouldReplaceWebsocketTranscript(rawJSON, nextInput)`；只有命中“input 中含 `function_call` 或 `message(role=assistant)`”才走 transcript replacement，其余情况继续走 merge。
+- 当前本地 `sdk/api/handlers/openai/openai_responses_websocket.go::shouldReplaceWebsocketTranscript` 没有识别 `compaction` / `compaction_summary`，也没有识别 `custom_tool_call`，因此“compact 后只回放 `message + compaction`”会继续落入 merge 分支。
+- 现场实验：临时新增定向测试后调用 `normalizeResponsesWebsocketRequest(...)`，输入为 `lastRequest + lastResponseOutput + nextInput=[message,user,msg-2 ; compaction]`，当前结果仍返回 6 个 merged items，说明 stale merge 仍在发生；临时测试已删除。
+- `internal/translator/claude/openai/responses/claude_openai-responses_request.go` 与 `internal/translator/gemini/openai/responses/gemini_openai-responses_request.go` 的 request translator 只消费 `message` / `function_call` / `function_call_output` 主线，`compaction` / `compaction_summary` 不会直接下沉，因此 compact replay bypass 需要按 downstream 能力门控。
+- 当前仓库已经包含更早一批相关修复：`sdk/api/handlers/openai/openai_responses_websocket.go::shouldReplaceWebsocketTranscript`、`normalizeResponseTranscriptReplacement`、`repairResponsesWebsocketToolCalls` 以及 `sdk/api/handlers/openai/openai_responses_websocket_toolcall_repair.go`，说明本轮缺口集中在 compact replay 检测与 downstream 门控，而不是整套 websocket tool repair 缺失。
+
+### Hypotheses
+- H1 ROOT: `sdk/api/handlers/openai/openai_responses_websocket.go::shouldReplaceWebsocketTranscript` 缺少对 `compaction` / `compaction_summary` 的识别，导致 compact replay 继续 stale merge，最终打乱 tool call/output 配对。
+  - Supports: PR2266 描述与当前源码差异直接对上；本地实验已复现 merge 仍发生。
+  - Conflicts: 当前已有 assistant/function_call replacement 逻辑，部分 compact 形态已经被覆盖。
+  - Test: 为 `normalizeResponsesWebsocketRequestWithMode` 增加“compaction replay + codex 支持 bypass”与“unsupported downstream fallback merge”两组测试。
+- H2: compact replay bypass 需要限定在支持该语义的 downstream；若对 Claude/Gemini 一律 bypass，translator 会丢弃 compaction items，导致上下文丢失。
+  - Supports: 两个 translator 的 switch 未处理 `compaction` / `compaction_summary`。
+  - Conflicts: Codex 路径本身已支持 compact 语义，不能因为其他 downstream 而关闭整个 bypass。
+  - Test: 增加 `websocketUpstreamSupportsCompactionReplayForModel` 与 fallback strip-compaction 测试。
+- H3: 当前仓库对 `custom_tool_call` transcript replacement 覆盖不足，可能与同类 400 共因。
+  - Supports: upstream/dev 的 `shouldReplaceWebsocketTranscript` 已把 `custom_tool_call` 纳入 replacement 信号；当前本地只识别 `function_call`。
+  - Conflicts: 本次用户给的错误文案是 `No tool output found for function call ...`，主链更贴近标准 function_call compact replay。
+  - Test: 核对现有 `openai_responses_websocket_test.go` 是否已有 custom tool transcript reset 覆盖，必要时一并补齐。

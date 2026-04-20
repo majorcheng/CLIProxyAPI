@@ -313,6 +313,58 @@ func TestConvertOpenAIResponsesRequestToCodex_NormalizesTopLevelToolChoicePrevie
 	}
 }
 
+func TestConvertOpenAIResponsesRequestToCodex_NormalizesStringReasoningCompatibility(t *testing.T) {
+	inputJSON := []byte(`{
+		"model": "gpt-5.2",
+		"reasoning": " xhigh ",
+		"input": "hi"
+	}`)
+
+	output := ConvertOpenAIResponsesRequestToCodex("gpt-5.2", inputJSON, false)
+
+	if got := gjson.GetBytes(output, "reasoning.effort").String(); got != "xhigh" {
+		t.Fatalf("reasoning.effort = %q, want %q: %s", got, "xhigh", string(output))
+	}
+	if !gjson.GetBytes(output, "reasoning").IsObject() {
+		t.Fatalf("reasoning should be JSON object: %s", string(output))
+	}
+}
+
+func TestConvertOpenAIResponsesRequestToCodex_NormalizesReasoningEffortCompatibility(t *testing.T) {
+	inputJSON := []byte(`{
+		"model": "gpt-5.2",
+		"reasoning_effort": "high",
+		"input": "hi"
+	}`)
+
+	output := ConvertOpenAIResponsesRequestToCodex("gpt-5.2", inputJSON, false)
+
+	if got := gjson.GetBytes(output, "reasoning.effort").String(); got != "high" {
+		t.Fatalf("reasoning.effort = %q, want %q: %s", got, "high", string(output))
+	}
+	if gjson.GetBytes(output, "reasoning_effort").Exists() {
+		t.Fatalf("reasoning_effort should be removed after normalization: %s", string(output))
+	}
+}
+
+func TestConvertOpenAIResponsesRequestToCodex_PrefersNestedReasoningEffort(t *testing.T) {
+	inputJSON := []byte(`{
+		"model": "gpt-5.2",
+		"reasoning": {"effort": "medium"},
+		"reasoning_effort": "xhigh",
+		"input": "hi"
+	}`)
+
+	output := ConvertOpenAIResponsesRequestToCodex("gpt-5.2", inputJSON, false)
+
+	if got := gjson.GetBytes(output, "reasoning.effort").String(); got != "medium" {
+		t.Fatalf("reasoning.effort = %q, want %q: %s", got, "medium", string(output))
+	}
+	if gjson.GetBytes(output, "reasoning_effort").Exists() {
+		t.Fatalf("reasoning_effort should be removed after normalization: %s", string(output))
+	}
+}
+
 func TestUserFieldDeletion(t *testing.T) {
 	inputJSON := []byte(`{  
 		"model": "gpt-5.2",  

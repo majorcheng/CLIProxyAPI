@@ -20,6 +20,7 @@ const pseudoToolResultPrefix = "[Tool result for "
 
 type chatReqInput struct {
 	ReasoningEffort string          `json:"reasoning_effort"`
+	Reasoning       json.RawMessage `json:"reasoning"`
 	Messages        []chatMessage   `json:"messages"`
 	Tools           []chatTool      `json:"tools"`
 	ToolChoice      json.RawMessage `json:"tool_choice"`
@@ -146,7 +147,7 @@ func ConvertOpenAIRequestToCodex(modelName string, inputRawJSON []byte, stream b
 	}
 
 	// reasoning
-	effort := req.ReasoningEffort
+	effort := resolveCompatibleReasoningEffortForCodexChat(req)
 	if effort == "" {
 		effort = "medium"
 	}
@@ -301,6 +302,40 @@ func ConvertOpenAIRequestToCodex(modelName string, inputRawJSON []byte, stream b
 
 	b, _ := json.Marshal(out)
 	return b
+}
+
+// resolveCompatibleReasoningEffortForCodexChat 在 Codex Chat 入口兼容三种
+// 思考档位写法：标准 `reasoning_effort`、误传的 `reasoning.effort`，以及
+// 某些客户端会塞进 extra_body 的字符串 `reasoning="xhigh"`。
+// 优先级保持“当前 endpoint 的原生字段优先”，避免兼容分支反向覆盖显式配置。
+func resolveCompatibleReasoningEffortForCodexChat(req chatReqInput) string {
+	if effort := normalizeCompatibleReasoningEffort(req.ReasoningEffort); effort != "" {
+		return effort
+	}
+	return extractCompatibleReasoningEffortFromRaw(req.Reasoning)
+}
+
+// extractCompatibleReasoningEffortFromRaw 只做 Codex 兼容兜底：允许把
+// `reasoning` 既当字符串，也当 `{effort: ...}` 对象来读。
+// 其它异常结构保持旧行为，由后续链路继续处理。
+func extractCompatibleReasoningEffortFromRaw(raw json.RawMessage) string {
+	var text string
+	if err := json.Unmarshal(raw, &text); err == nil {
+		return normalizeCompatibleReasoningEffort(text)
+	}
+
+	var payload struct {
+		Effort string `json:"effort"`
+	}
+	if err := json.Unmarshal(raw, &payload); err == nil {
+		return normalizeCompatibleReasoningEffort(payload.Effort)
+	}
+
+	return ""
+}
+
+func normalizeCompatibleReasoningEffort(value string) string {
+	return strings.ToLower(strings.TrimSpace(value))
 }
 
 // ---------------------------------------------------------------------------

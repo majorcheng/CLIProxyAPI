@@ -268,6 +268,55 @@ func TestMultipleToolCalls(t *testing.T) {
 	}
 }
 
+func TestCodexChatReasoningCompatAcceptsStringReasoning(t *testing.T) {
+	input := []byte(`{
+		"model": "gpt-5.2",
+		"reasoning": " XHIGH ",
+		"messages": [
+			{"role": "user", "content": "hi"}
+		]
+	}`)
+
+	out := ConvertOpenAIRequestToCodex("gpt-5.2", input, true)
+
+	if got := gjson.GetBytes(out, "reasoning.effort").String(); got != "xhigh" {
+		t.Fatalf("reasoning.effort = %q, want %q: %s", got, "xhigh", string(out))
+	}
+}
+
+func TestCodexChatReasoningCompatAcceptsNestedReasoningEffort(t *testing.T) {
+	input := []byte(`{
+		"model": "gpt-5.2",
+		"reasoning": {"effort": " high "},
+		"messages": [
+			{"role": "user", "content": "hi"}
+		]
+	}`)
+
+	out := ConvertOpenAIRequestToCodex("gpt-5.2", input, true)
+
+	if got := gjson.GetBytes(out, "reasoning.effort").String(); got != "high" {
+		t.Fatalf("reasoning.effort = %q, want %q: %s", got, "high", string(out))
+	}
+}
+
+func TestCodexChatReasoningCompatPrefersReasoningEffort(t *testing.T) {
+	input := []byte(`{
+		"model": "gpt-5.2",
+		"reasoning_effort": "medium",
+		"reasoning": "xhigh",
+		"messages": [
+			{"role": "user", "content": "hi"}
+		]
+	}`)
+
+	out := ConvertOpenAIRequestToCodex("gpt-5.2", input, true)
+
+	if got := gjson.GetBytes(out, "reasoning.effort").String(); got != "medium" {
+		t.Fatalf("reasoning.effort = %q, want %q: %s", got, "medium", string(out))
+	}
+}
+
 // OpenClaw 风格的 user 文本 tool result 需要先归一化，再继续走标准
 // function_call_output 翻译链。
 func TestPseudoToolResultMessageBecomesFunctionCallOutput(t *testing.T) {

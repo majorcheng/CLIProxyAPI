@@ -688,3 +688,27 @@
 - reviewer 补充指出共享冷却还需要继续同步到 `internal/registry/model_registry.go` 暴露层与 `sdk/cliproxy/auth/session_affinity.go` 绑定层；否则会出现“兄弟模型在 `/v1/models` 里仍可见”以及“旧 session 绑定持续先命中冷却 auth 再 fallback”的双重分裂。
 - 已在 `sdk/cliproxy/auth/conductor.go::MarkResult` 增加 free Codex shared quota 的全模型联动：429 时批量 `SetModelQuotaExceeded` / `SuspendClientModel`，成功时批量 `ClearModelQuotaExceeded` / `ResumeClientModel`。
 - 已新增 `sdk/cliproxy/auth/session_affinity.go::invalidateSessionAffinityAuth`，并在 shared quota 生效时立刻清掉旧 auth 绑定。
+
+## 2026-04-20 Responses misroute reasoning 兼容回归
+
+### Observations
+- reviewer 指出的链路是 `sdk/api/handlers/openai/openai_handlers.go::ChatCompletions` → `internal/translator/openai/openai/responses/openai_openai-responses_request.go::ConvertOpenAIResponsesRequestToOpenAIChatCompletions` → `internal/translator/codex/openai/chat-completions/codex_openai_request.go::ConvertOpenAIRequestToCodex`。
+- 当前 Codex chat/responses translator 已分别兼容 `reasoning="xhigh"` 与 `reasoning_effort="xhigh"`，定向测试已覆盖直连 translator。
+- 中间层 `ConvertOpenAIResponsesRequestToOpenAIChatCompletions` 初始实现只搬 `reasoning.effort`；误投请求若只带字符串 `reasoning` 或顶层 `reasoning_effort`，到 Chat payload 这一跳就会丢档位，后续 Codex chat translator 回落成默认 `medium`。
+- 首版 handler 回归测试曾直接检查 executor 捕获到的 payload 上 `reasoning.effort`，实际拿到的是 Chat handler 传给 executor 的 OpenAI Chat 中间态，字段形态仍是 `reasoning_effort`，这条断言层级错误。
+
+### Hypotheses
+- H1（ROOT）：根因在 `ConvertOpenAIResponsesRequestToOpenAIChatCompletions` 漏搬 `reasoning_effort` 与字符串 `reasoning`，导致误投 Responses 请求在中间层丢失兼容字段。
+- H2：handler 回归测试失败来自断言层级错误；真实 handler 输出仍是 OpenAI Chat payload，需要再补一层 OpenAI Chat -> Codex 翻译后才能断言最终 `reasoning.effort`。
+
+### Experiments
+- E1：在 `internal/translator/openai/openai/responses/openai_openai-responses_request.go` 新增 `resolveCompatibleReasoningEffortForResponsesMisroute(...)`，按 `reasoning.effort` → `reasoning_effort` → 字符串 `reasoning` 的顺序保留档位。结果：`timeout 60s go test ./internal/translator/openai/openai/responses -run 'Reasoning|ConvertOpenAIResponsesRequestToOpenAIChatCompletions' -count=1` 通过。
+- E2：把 `sdk/api/handlers/openai/openai_handlers_reasoning_compat_test.go` 改成真实经过 `ChatCompletions` handler，再在 capture executor 里调用 `sdk/translator.TranslateRequest(openai -> codex)`，最后断言最终 Codex payload 的 `reasoning.effort`。结果：`timeout 60s go test ./sdk/api/handlers/openai -run 'ChatCompletionsResponsesMisroutePreservesCompatibleReasoning|Compact' -count=1` 通过。
+- E3：重跑 `timeout 60s go test ./internal/translator/codex/openai/chat-completions -run 'Reasoning|Tool|CallID|Pseudo|FunctionCallOutput' -count=1` 与 `git diff --check`。结果：均通过。
+
+### Root Cause
+- 根因是 Responses-format 误投到 `/v1/chat/completions` 时，中间转换层 `ConvertOpenAIResponsesRequestToOpenAIChatCompletions` 没有继续保留字符串 `reasoning` 与顶层 `reasoning_effort`，导致后续 Codex chat translator 看不到兼容字段并回落到默认档位。
+
+### Fix
+- `internal/translator/openai/openai/responses/openai_openai-responses_request.go::resolveCompatibleReasoningEffortForResponsesMisroute` 已补齐三种来源的保留逻辑，并通过 `normalizeResponsesMisrouteReasoningEffort(...)` 统一清洗大小写与空白。
+- `sdk/api/handlers/openai/openai_handlers_reasoning_compat_test.go::TestChatCompletionsResponsesMisroutePreservesCompatibleReasoning` 现在覆盖 reviewer 点名的完整 handler 分支，并通过真实 `openai -> codex` 翻译断言最终 `reasoning.effort` 仍为 `xhigh/high`。

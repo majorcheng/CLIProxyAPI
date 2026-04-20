@@ -131,7 +131,7 @@ func convertOpenAIResponsesRequestToCodexFastPath(inputRawJSON []byte) ([]byte, 
 	}
 
 	output = append(output, '}')
-	return output, true
+	return normalizeCodexResponsesReasoningCompatibility(output), true
 }
 
 func appendJSONObjectFieldName(dst []byte, field string, wroteField *bool) []byte {
@@ -423,7 +423,72 @@ func convertOpenAIResponsesRequestToCodexFallback(inputRawJSON []byte) []byte {
 		}
 	}
 
+	if output, err = normalizeCodexResponsesReasoningCompatibilityBytes(output); err != nil {
+		return inputRawJSON
+	}
+
 	return output
+}
+
+func normalizeCodexResponsesReasoningCompatibility(output []byte) []byte {
+	normalized, err := normalizeCodexResponsesReasoningCompatibilityBytes(output)
+	if err != nil {
+		return output
+	}
+	return normalized
+}
+
+// normalizeCodexResponsesReasoningCompatibilityBytes 只在 Codex `/v1/responses`
+// 链路里做兼容收口：允许客户端误把 chat-completions 的
+// `reasoning_effort` 或字符串 `reasoning="xhigh"` 发进来，并统一规范成
+// Codex 真实接受的 `reasoning.effort`。
+// 优先级保持 `reasoning.effort` > `reasoning_effort` > 字符串 `reasoning`。
+func normalizeCodexResponsesReasoningCompatibilityBytes(output []byte) ([]byte, error) {
+	effort := extractCompatibleReasoningEffortForCodexResponses(output)
+	if effort == "" {
+		return output, nil
+	}
+
+	reasoning := gjson.GetBytes(output, "reasoning")
+	if reasoning.Exists() && !reasoning.IsObject() {
+		var err error
+		output, err = sjson.DeleteBytes(output, "reasoning")
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	var err error
+	output, err = sjson.SetBytes(output, "reasoning.effort", effort)
+	if err != nil {
+		return nil, err
+	}
+	if gjson.GetBytes(output, "reasoning_effort").Exists() {
+		output, err = sjson.DeleteBytes(output, "reasoning_effort")
+		if err != nil {
+			return nil, err
+		}
+	}
+	return output, nil
+}
+
+func extractCompatibleReasoningEffortForCodexResponses(output []byte) string {
+	if effort := normalizeCodexResponsesReasoningEffort(gjson.GetBytes(output, "reasoning.effort").String()); effort != "" {
+		return effort
+	}
+	if effort := normalizeCodexResponsesReasoningEffort(gjson.GetBytes(output, "reasoning_effort").String()); effort != "" {
+		return effort
+	}
+
+	reasoning := gjson.GetBytes(output, "reasoning")
+	if reasoning.Type == gjson.String {
+		return normalizeCodexResponsesReasoningEffort(reasoning.String())
+	}
+	return ""
+}
+
+func normalizeCodexResponsesReasoningEffort(value string) string {
+	return strings.ToLower(strings.TrimSpace(value))
 }
 
 func normalizeOpenAIResponsesInputForCodexFallback(inputRawJSON []byte) ([]byte, error) {

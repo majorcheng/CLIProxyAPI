@@ -198,11 +198,8 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 		}
 	}
 
-	if reasoningEffort := root.Get("reasoning.effort"); reasoningEffort.Exists() {
-		effort := strings.ToLower(strings.TrimSpace(reasoningEffort.String()))
-		if effort != "" {
-			out, _ = sjson.Set(out, "reasoning_effort", effort)
-		}
+	if effort := resolveCompatibleReasoningEffortForResponsesMisroute(root); effort != "" {
+		out, _ = sjson.Set(out, "reasoning_effort", effort)
 	}
 
 	// Convert tool_choice if present
@@ -211,4 +208,30 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 	}
 
 	return []byte(out)
+}
+
+// resolveCompatibleReasoningEffortForResponsesMisroute 为“Responses payload
+// 误投到 /v1/chat/completions”补兼容：优先保留 Responses 原生
+// `reasoning.effort`，其次兼容误传的 `reasoning_effort`，最后兜底字符串
+// `reasoning="xhigh"`。这样后续 Chat translator 才不会把本应传给 Codex 的
+// 档位丢成默认 medium。
+func resolveCompatibleReasoningEffortForResponsesMisroute(root gjson.Result) string {
+	if effort := normalizeResponsesMisrouteReasoningEffort(root.Get("reasoning.effort").String()); effort != "" {
+		return effort
+	}
+	if effort := normalizeResponsesMisrouteReasoningEffort(root.Get("reasoning_effort").String()); effort != "" {
+		return effort
+	}
+
+	reasoning := root.Get("reasoning")
+	if reasoning.Type == gjson.String {
+		return normalizeResponsesMisrouteReasoningEffort(reasoning.String())
+	}
+	return ""
+}
+
+// normalizeResponsesMisrouteReasoningEffort 统一清洗误投链路里可能出现的
+// reasoning 档位字符串，避免大小写和空白差异把兼容字段再次丢掉。
+func normalizeResponsesMisrouteReasoningEffort(value string) string {
+	return strings.ToLower(strings.TrimSpace(value))
 }

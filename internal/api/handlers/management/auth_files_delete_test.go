@@ -24,6 +24,7 @@ func TestDeleteAuthFile_UsesAuthPathFromManager(t *testing.T) {
 	tempDir := t.TempDir()
 	authDir := filepath.Join(tempDir, "auth")
 	externalDir := filepath.Join(tempDir, "external")
+	logDir := filepath.Join(tempDir, "logs")
 	if errMkdirAuth := os.MkdirAll(authDir, 0o700); errMkdirAuth != nil {
 		t.Fatalf("failed to create auth dir: %v", errMkdirAuth)
 	}
@@ -61,7 +62,9 @@ func TestDeleteAuthFile_UsesAuthPathFromManager(t *testing.T) {
 	}
 
 	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, manager)
-	h.tokenStore = &memoryAuthStore{}
+	store := &memoryAuthStore{}
+	h.tokenStore = store
+	h.logDir = logDir
 
 	deleteRec := httptest.NewRecorder()
 	deleteCtx, _ := gin.CreateTestContext(deleteRec)
@@ -77,6 +80,19 @@ func TestDeleteAuthFile_UsesAuthPathFromManager(t *testing.T) {
 	}
 	if _, errStatShadow := os.Stat(shadowPath); errStatShadow != nil {
 		t.Fatalf("expected shadow auth file to remain, stat err: %v", errStatShadow)
+	}
+	archivedPath := filepath.Join(logDir, "delete", managementDeleteTrashBucket, fileName)
+	if _, errStatArchived := os.Stat(archivedPath); errStatArchived != nil {
+		t.Fatalf("expected managed auth file to be archived, stat err: %v", errStatArchived)
+	}
+	if len(store.persistCalls) != 1 {
+		t.Fatalf("expected one persist call, got %d", len(store.persistCalls))
+	}
+	if got := store.persistCalls[0].Paths; len(got) != 1 || got[0] != realPath {
+		t.Fatalf("persist paths = %#v, want [%q]", got, realPath)
+	}
+	if len(store.deletedIDs) != 0 {
+		t.Fatalf("expected delete fallback to stay unused, got %#v", store.deletedIDs)
 	}
 
 	listRec := httptest.NewRecorder()
@@ -105,7 +121,12 @@ func TestDeleteAuthFile_FallbackToAuthDirPath(t *testing.T) {
 	t.Setenv("MANAGEMENT_PASSWORD", "")
 	gin.SetMode(gin.TestMode)
 
-	authDir := t.TempDir()
+	tempDir := t.TempDir()
+	authDir := filepath.Join(tempDir, "auth")
+	logDir := filepath.Join(tempDir, "logs")
+	if errMkdir := os.MkdirAll(authDir, 0o700); errMkdir != nil {
+		t.Fatalf("failed to create auth dir: %v", errMkdir)
+	}
 	fileName := "fallback-user.json"
 	filePath := filepath.Join(authDir, fileName)
 	if errWrite := os.WriteFile(filePath, []byte(`{"type":"codex"}`), 0o600); errWrite != nil {
@@ -114,7 +135,9 @@ func TestDeleteAuthFile_FallbackToAuthDirPath(t *testing.T) {
 
 	manager := coreauth.NewManager(nil, nil, nil)
 	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, manager)
-	h.tokenStore = &memoryAuthStore{}
+	store := &memoryAuthStore{}
+	h.tokenStore = store
+	h.logDir = logDir
 
 	deleteRec := httptest.NewRecorder()
 	deleteCtx, _ := gin.CreateTestContext(deleteRec)
@@ -127,6 +150,19 @@ func TestDeleteAuthFile_FallbackToAuthDirPath(t *testing.T) {
 	}
 	if _, errStat := os.Stat(filePath); !os.IsNotExist(errStat) {
 		t.Fatalf("expected auth file to be removed from auth dir, stat err: %v", errStat)
+	}
+	archivedPath := filepath.Join(logDir, "delete", managementDeleteTrashBucket, fileName)
+	if _, errStatArchived := os.Stat(archivedPath); errStatArchived != nil {
+		t.Fatalf("expected auth file to be archived, stat err: %v", errStatArchived)
+	}
+	if len(store.persistCalls) != 1 {
+		t.Fatalf("expected one persist call, got %d", len(store.persistCalls))
+	}
+	if got := store.persistCalls[0].Paths; len(got) != 1 || got[0] != filePath {
+		t.Fatalf("persist paths = %#v, want [%q]", got, filePath)
+	}
+	if len(store.deletedIDs) != 0 {
+		t.Fatalf("expected delete fallback to stay unused, got %#v", store.deletedIDs)
 	}
 }
 
@@ -162,7 +198,8 @@ func TestDeleteAuthFile_AlreadyMissingStillDisablesAuth(t *testing.T) {
 	}
 
 	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, manager)
-	h.tokenStore = &memoryAuthStore{}
+	store := &memoryAuthStore{}
+	h.tokenStore = store
 
 	deleteRec := httptest.NewRecorder()
 	deleteCtx, _ := gin.CreateTestContext(deleteRec)
@@ -212,6 +249,15 @@ func TestDeleteAuthFile_AlreadyMissingStillDisablesAuth(t *testing.T) {
 	if len(filesRaw) != 0 {
 		t.Fatalf("expected missing auth to be hidden from list after delete, got %d entries", len(filesRaw))
 	}
+	if len(store.persistCalls) != 1 {
+		t.Fatalf("expected one persist call, got %d", len(store.persistCalls))
+	}
+	if got := store.persistCalls[0].Paths; len(got) != 1 || got[0] != filePath {
+		t.Fatalf("persist paths = %#v, want [%q]", got, filePath)
+	}
+	if len(store.deletedIDs) != 0 {
+		t.Fatalf("expected delete fallback to stay unused, got %#v", store.deletedIDs)
+	}
 }
 
 func TestDeleteAuthFile_AlreadyMissingWithoutAuthStill404(t *testing.T) {
@@ -230,6 +276,54 @@ func TestDeleteAuthFile_AlreadyMissingWithoutAuthStill404(t *testing.T) {
 
 	if deleteRec.Code != http.StatusNotFound {
 		t.Fatalf("expected delete status %d, got %d with body %s", http.StatusNotFound, deleteRec.Code, deleteRec.Body.String())
+	}
+}
+
+func TestDeleteAuthFile_AllArchivesFiles(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	gin.SetMode(gin.TestMode)
+
+	tempDir := t.TempDir()
+	authDir := filepath.Join(tempDir, "auth")
+	logDir := filepath.Join(tempDir, "logs")
+	if errMkdir := os.MkdirAll(authDir, 0o700); errMkdir != nil {
+		t.Fatalf("failed to create auth dir: %v", errMkdir)
+	}
+	files := []string{"alpha.json", "beta.json"}
+	for _, name := range files {
+		if errWrite := os.WriteFile(filepath.Join(authDir, name), []byte(`{"type":"codex"}`), 0o600); errWrite != nil {
+			t.Fatalf("failed to write auth file %s: %v", name, errWrite)
+		}
+	}
+
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, coreauth.NewManager(nil, nil, nil))
+	store := &memoryAuthStore{}
+	h.tokenStore = store
+	h.logDir = logDir
+
+	deleteRec := httptest.NewRecorder()
+	deleteCtx, _ := gin.CreateTestContext(deleteRec)
+	deleteReq := httptest.NewRequest(http.MethodDelete, "/v0/management/auth-files?all=true", nil)
+	deleteCtx.Request = deleteReq
+	h.DeleteAuthFile(deleteCtx)
+
+	if deleteRec.Code != http.StatusOK {
+		t.Fatalf("expected delete status %d, got %d with body %s", http.StatusOK, deleteRec.Code, deleteRec.Body.String())
+	}
+	for _, name := range files {
+		if _, errStat := os.Stat(filepath.Join(authDir, name)); !os.IsNotExist(errStat) {
+			t.Fatalf("expected auth file %s to leave auth dir, stat err: %v", name, errStat)
+		}
+		archivedPath := filepath.Join(logDir, "delete", managementDeleteTrashBucket, name)
+		if _, errStatArchived := os.Stat(archivedPath); errStatArchived != nil {
+			t.Fatalf("expected auth file %s to be archived, stat err: %v", name, errStatArchived)
+		}
+	}
+	if len(store.persistCalls) != len(files) {
+		t.Fatalf("expected %d persist calls, got %d", len(files), len(store.persistCalls))
+	}
+	if len(store.deletedIDs) != 0 {
+		t.Fatalf("expected delete fallback to stay unused, got %#v", store.deletedIDs)
 	}
 }
 

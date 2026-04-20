@@ -1,6 +1,7 @@
 package store
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -311,6 +312,49 @@ func TestEnsureRepositoryKeepsCurrentBranchWhenRemoteDefaultCannotBeResolved(t *
 	assertRepositoryHeadBranch(t, filepath.Join(root, "workspace"), "develop")
 }
 
+func TestGitTokenStorePersistAuthFilesCommitsDeletionWhenSourceAlreadyMissing(t *testing.T) {
+	root := t.TempDir()
+	remoteDir := setupGitRemoteRepository(t, root, "master",
+		testBranchSpec{name: "master", contents: "remote master branch\n"},
+	)
+
+	baseDir := filepath.Join(root, "workspace", "auths")
+	store := NewGitTokenStore(remoteDir, "", "", "")
+	store.SetBaseDir(baseDir)
+
+	if err := store.EnsureRepository(); err != nil {
+		t.Fatalf("EnsureRepository: %v", err)
+	}
+
+	authPath := filepath.Join(baseDir, "removed.json")
+	if err := os.MkdirAll(filepath.Dir(authPath), 0o700); err != nil {
+		t.Fatalf("mkdir auth dir: %v", err)
+	}
+	if err := os.WriteFile(authPath, []byte(`{"type":"codex","email":"user@example.com"}`), 0o600); err != nil {
+		t.Fatalf("write auth file: %v", err)
+	}
+	authRel, err := store.relativeToRepo(authPath)
+	if err != nil {
+		t.Fatalf("relativeToRepo auth path: %v", err)
+	}
+	store.mu.Lock()
+	if err := store.commitAndPushLocked("seed auth file", authRel); err != nil {
+		store.mu.Unlock()
+		t.Fatalf("commitAndPushLocked seed auth: %v", err)
+	}
+	store.mu.Unlock()
+	assertRemoteBranchHasFile(t, remoteDir, "master", authRel)
+
+	if err := os.Remove(authPath); err != nil {
+		t.Fatalf("remove local auth file: %v", err)
+	}
+	if err := store.PersistAuthFiles(context.Background(), "management 归档移除 removed.json", authPath); err != nil {
+		t.Fatalf("PersistAuthFiles: %v", err)
+	}
+
+	assertRemoteBranchLacksFile(t, remoteDir, "master", authRel)
+}
+
 func setupGitRemoteRepository(t *testing.T, root, defaultBranch string, branches ...testBranchSpec) string {
 	t.Helper()
 
@@ -581,5 +625,53 @@ func assertRemoteBranchContents(t *testing.T, remoteDir, branch, wantContents st
 	}
 	if contents != wantContents {
 		t.Fatalf("remote branch %s contents = %q, want %q", branch, contents, wantContents)
+	}
+}
+
+func assertRemoteBranchHasFile(t *testing.T, remoteDir, branch, path string) {
+	t.Helper()
+
+	remoteRepo, err := git.PlainOpen(remoteDir)
+	if err != nil {
+		t.Fatalf("open remote repo: %v", err)
+	}
+	ref, err := remoteRepo.Reference(plumbing.NewBranchReferenceName(branch), false)
+	if err != nil {
+		t.Fatalf("read remote branch %s: %v", branch, err)
+	}
+	commit, err := remoteRepo.CommitObject(ref.Hash())
+	if err != nil {
+		t.Fatalf("read remote branch %s commit: %v", branch, err)
+	}
+	tree, err := commit.Tree()
+	if err != nil {
+		t.Fatalf("read remote branch %s tree: %v", branch, err)
+	}
+	if _, err := tree.File(path); err != nil {
+		t.Fatalf("expected remote branch %s to contain %s: %v", branch, path, err)
+	}
+}
+
+func assertRemoteBranchLacksFile(t *testing.T, remoteDir, branch, path string) {
+	t.Helper()
+
+	remoteRepo, err := git.PlainOpen(remoteDir)
+	if err != nil {
+		t.Fatalf("open remote repo: %v", err)
+	}
+	ref, err := remoteRepo.Reference(plumbing.NewBranchReferenceName(branch), false)
+	if err != nil {
+		t.Fatalf("read remote branch %s: %v", branch, err)
+	}
+	commit, err := remoteRepo.CommitObject(ref.Hash())
+	if err != nil {
+		t.Fatalf("read remote branch %s commit: %v", branch, err)
+	}
+	tree, err := commit.Tree()
+	if err != nil {
+		t.Fatalf("read remote branch %s tree: %v", branch, err)
+	}
+	if _, err := tree.File(path); err == nil {
+		t.Fatalf("expected remote branch %s to remove %s", branch, path)
 	}
 }

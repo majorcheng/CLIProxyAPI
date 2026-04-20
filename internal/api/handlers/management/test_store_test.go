@@ -8,8 +8,17 @@ import (
 )
 
 type memoryAuthStore struct {
-	mu    sync.Mutex
-	items map[string]*coreauth.Auth
+	mu             sync.Mutex
+	items          map[string]*coreauth.Auth
+	deletedIDs     []string
+	persistCalls   []memoryPersistCall
+	baseDir        string
+	globalProxyURL string
+}
+
+type memoryPersistCall struct {
+	Message string
+	Paths   []string
 }
 
 func (s *memoryAuthStore) List(_ context.Context) ([]*coreauth.Auth, error) {
@@ -42,8 +51,34 @@ func (s *memoryAuthStore) Delete(_ context.Context, id string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	s.deletedIDs = append(s.deletedIDs, id)
 	delete(s.items, id)
 	return nil
 }
 
-func (s *memoryAuthStore) SetBaseDir(string) {}
+func (s *memoryAuthStore) PersistAuthFiles(_ context.Context, message string, paths ...string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	clonedPaths := append([]string(nil), paths...)
+	s.persistCalls = append(s.persistCalls, memoryPersistCall{
+		Message: message,
+		Paths:   clonedPaths,
+	})
+	for _, id := range clonedPaths {
+		delete(s.items, id)
+	}
+	return nil
+}
+
+func (s *memoryAuthStore) SetBaseDir(dir string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.baseDir = dir
+}
+
+func (s *memoryAuthStore) SetGlobalProxyURL(proxyURL string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.globalProxyURL = proxyURL
+}

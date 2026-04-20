@@ -40,6 +40,10 @@ import (
 	"golang.org/x/oauth2/google"
 )
 
+type authFileStorePersister interface {
+	PersistAuthFiles(ctx context.Context, message string, paths ...string) error
+}
+
 var lastRefreshKeys = []string{"last_refresh", "lastRefresh", "last_refreshed_at", "lastRefreshedAt"}
 
 const (
@@ -952,14 +956,20 @@ func (h *Handler) DeleteAuthFile(c *gin.Context) {
 					full = abs
 				}
 			}
-			if err = os.Remove(full); err == nil {
-				if errDel := h.deleteTokenRecord(ctx, full); errDel != nil {
-					c.JSON(500, gin.H{"error": errDel.Error()})
-					return
-				}
-				deleted++
-				h.disableAuth(ctx, full)
+			_, alreadyMissing, errArchive := h.archiveDeletedAuthFile(full)
+			if errArchive != nil {
+				c.JSON(500, gin.H{"error": errArchive.Error()})
+				return
 			}
+			if alreadyMissing {
+				continue
+			}
+			if errDel := h.deleteTokenRecord(ctx, full); errDel != nil {
+				c.JSON(500, gin.H{"error": errDel.Error()})
+				return
+			}
+			deleted++
+			h.disableAuth(ctx, full)
 		}
 		c.JSON(200, gin.H{"status": "ok", "deleted": deleted})
 		return
@@ -1177,16 +1187,13 @@ func (h *Handler) deleteAuthFileByName(ctx context.Context, name string) (string
 			targetPath = abs
 		}
 	}
-	alreadyMissing := false
-	if errRemove := os.Remove(targetPath); errRemove != nil {
-		if os.IsNotExist(errRemove) {
-			if !targetAuthFound {
-				return filepath.Base(name), false, http.StatusNotFound, errAuthFileNotFound
-			}
-			alreadyMissing = true
-		} else {
-			return filepath.Base(name), false, http.StatusInternalServerError, fmt.Errorf("failed to remove file: %w", errRemove)
-		}
+	// management 主动删除统一走归档路径，方便后续按 logs/delete/management 回溯操作来源。
+	_, alreadyMissing, errArchive := h.archiveDeletedAuthFile(targetPath)
+	if errArchive != nil {
+		return filepath.Base(name), false, http.StatusInternalServerError, errArchive
+	}
+	if alreadyMissing && !targetAuthFound {
+		return filepath.Base(name), false, http.StatusNotFound, errAuthFileNotFound
 	}
 	if errDeleteRecord := h.deleteTokenRecord(ctx, targetPath); errDeleteRecord != nil {
 		return filepath.Base(name), alreadyMissing, http.StatusInternalServerError, errDeleteRecord
@@ -1542,14 +1549,28 @@ func (h *Handler) disableAuth(ctx context.Context, id string) {
 }
 
 func (h *Handler) deleteTokenRecord(ctx context.Context, path string) error {
-	if strings.TrimSpace(path) == "" {
+	path = strings.TrimSpace(path)
+	if path == "" {
 		return fmt.Errorf("auth path is empty")
 	}
 	store := h.tokenStoreWithBaseDir()
 	if store == nil {
 		return fmt.Errorf("token store unavailable")
 	}
+	// management 删除会先把本地文件归档到 logs/delete/management。
+	// 持久化后端需要继续按“源路径已不存在”的语义同步删除，Git/Object/Postgres 都通过 PersistAuthFiles 兜底。
+	if persister, ok := store.(authFileStorePersister); ok {
+		return persister.PersistAuthFiles(ctx, authDeleteMessage(path), path)
+	}
 	return store.Delete(ctx, path)
+}
+
+func authDeleteMessage(path string) string {
+	name := filepath.Base(strings.TrimSpace(path))
+	if name == "" {
+		name = "unknown"
+	}
+	return fmt.Sprintf("management 归档移除 %s", name)
 }
 
 func (h *Handler) tokenStoreWithBaseDir() coreauth.Store {

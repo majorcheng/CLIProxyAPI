@@ -475,3 +475,120 @@
   - Supports: upstream/dev 的 `shouldReplaceWebsocketTranscript` 已把 `custom_tool_call` 纳入 replacement 信号；当前本地只识别 `function_call`。
   - Conflicts: 本次用户给的错误文案是 `No tool output found for function call ...`，主链更贴近标准 function_call compact replay。
   - Test: 核对现有 `openai_responses_websocket_test.go` 是否已有 custom tool transcript reset 覆盖，必要时一并补齐。
+
+## 2026-04-20 RT 交换失败后 priority=5 收口
+
+### Observations
+- `sdk/cliproxy/auth/conductor.go::executeRefreshAuth` 当前在 `err != nil` 分支只会写 `LastError`、`NextRefreshAfter` 与初始 refresh pending 清理，未改动 `Auth.Attributes["priority"]` 或 `Auth.Metadata["priority"]`。
+- `sdk/cliproxy/auth/selector.go::authPriority` 与 `sdk/cliproxy/auth/scheduler.go::highestReadyPriorityLocked` 都按更高 priority bucket 优先选路，因此运行期把凭证写到 `priority=5` 会直接影响“优先使用”顺序。
+- `internal/api/handlers/management/auth_files.go::PatchAuthFileFields` 当前更新优先级时会同时写 `Metadata["priority"]` 与 `Attributes["priority"]`，这给了本次运行期写回的最小对齐语义。
+
+### Hypotheses
+- H1: RT 交换失败后没有把 auth 收口到 `priority=5`，因此后续调度仍沿用旧优先级，缺少“优先使用”效果。
+  - Supports: `executeRefreshAuth` 失败分支当前没有任何 priority 写回逻辑。
+  - Conflicts: 无。
+  - Test: 在 `executeRefreshAuth` 失败分支最小加入 priority 写回，补测试验证内存态与持久化快照都变成 5。
+- H2: 只写 `Metadata["priority"]` 就足够，因为 management 展示层已有 metadata fallback。
+  - Supports: `buildAuthFileEntry` 对 `priority` 已支持 metadata fallback。
+  - Conflicts: 运行期调度读取的是 `Attributes["priority"]`。
+  - Test: 同时检查调度读路径与 management 写路径，确认需要双写。
+- H3: 只写 `Attributes["priority"]` 就足够，因为调度只认 Attributes。
+  - Supports: `authPriority` 当前只看 `Attributes`。
+  - Conflicts: 持久化 token 文件走 metadata 合并，单写 Attributes 会丢失重启后磁盘语义。
+  - Test: 参考 management 既有写法，双写 Attributes 与 Metadata。
+
+### Experiments
+- E1: 只读检查 `executeRefreshAuth` 失败分支。结果：确认当前只写错误状态与退避时间，支持 H1。
+- E2: 只读检查 management 的 `PatchAuthFileFields`。结果：确认 priority 更新现有约定是同时写 `Metadata` 与 `Attributes`，支持 H2/H3 的双写方案。
+
+### Root Cause
+- RT 交换失败分支缺少 priority 收口逻辑，导致 auth 无法在失败后立刻进入 `priority=5` 的优先使用桶。
+
+### Fix
+- 在 `sdk/cliproxy/auth/conductor.go::executeRefreshAuth` 的失败分支加入 `priority=5` 双写收口，并补 `sdk/cliproxy/auth/conductor_refresh_failure_test.go` 回归测试，锁定内存态与持久化快照都会写入该优先级。
+
+
+## 2026-04-20 Chat Completions 伪装 tool result 400 排查
+
+### Observations
+- `/tmp/error-v1-chat-completions-2026-04-20T120904-c6f60ac3.log` 的 `=== REQUEST BODY ===` 里，`messages[29]` 是 assistant tool call，包含 `tool_calls[0].id = call5u6VTmiKVl09FPPXrpMKxV8T`。
+- 同一请求里的 `messages[30]` 已经带了这次调用的结果内容，但消息形态是 `role="user"`，`content` 为字符串前缀 `[Tool result for call5u6VTmiKVl09FPPXrpMKxV8T]: ...`。
+- `sdk/api/handlers/openai/openai_handlers.go::ChatCompletions` 当前会在 `shouldTreatAsResponsesFormat(rawJSON)` 为真时才切到 Responses-format 处理；这次请求携带的是 `messages`，所以仍走 Chat Completions translator 链。
+- `internal/translator/codex/openai/chat-completions/codex_openai_request.go::ConvertOpenAIRequestToCodex` 当前只会把 `role="tool"` 且带 `tool_call_id` 的消息翻译成 `function_call_output`。上述 `messages[30]` 会继续作为普通 user message 写入 `input`。
+- 现有标准路径已经有回归覆盖：`internal/translator/codex/openai/chat-completions/codex_openai_request_test.go::TestToolCallSimple` 会验证 `role="tool" + tool_call_id` 能翻译成 `function_call_output`。
+
+### Hypotheses
+- H1 ROOT: Chat Completions translator 缺少对 `[Tool result for <call_id>]: ...` 这类兼容消息的归一化，导致上游只收到 `function_call(call_id)`，收不到匹配的 `function_call_output(call_id)`。
+  - Supports: 日志里的 tool result 内容已经存在；`ConvertOpenAIRequestToCodex` 的 role 分支只识别显式 `tool`。
+  - Conflicts: 无。
+  - Test: 在 translator 进入主循环前做一次顺序扫描，把命中的 user 文本改写成 `role="tool" + tool_call_id=<call_id>`，再补定向回归测试。
+- H2: 应当把修复收口在 Codex Chat Completions translator，避免扩大到 handler 或其它 provider translator。
+  - Supports: 当前 400 来自 `/v1/chat/completions` 到 Codex 的请求翻译链；最小改动点就是 `ConvertOpenAIRequestToCodex`。
+  - Conflicts: 无。
+  - Test: 只修改 `internal/translator/codex/openai/chat-completions/*` 并运行包级测试。
+- H3: 归一化需要限定为“更早 assistant.tool_calls 已声明过的 call_id”，这样可以避免把普通用户文本误判成 tool result。
+  - Supports: 本次日志里存在真实上游 assistant tool call；顺序扫描可以天然限定“更早声明”的边界。
+  - Conflicts: 无。
+  - Test: 增加“前缀存在但 call_id 未声明”用例，确保消息继续保留为 user 文本。
+
+### Experiments
+- E1: 只读核对日志与 translator 分支。结果：确认 `messages[30]` 当前不会生成 `function_call_output`，支持 H1。
+- E2: 只读核对现有测试。结果：确认标准 `role="tool"` 路径已被 `TestToolCallSimple` 覆盖，本轮只需要补兼容归一化回归。
+
+### Root Cause
+- Codex Chat Completions translator 缺少对伪装 tool result user 消息的归一化，导致 `function_call_output` 丢失。
+
+### Fix
+- 在 `internal/translator/codex/openai/chat-completions/codex_openai_request.go::ConvertOpenAIRequestToCodex` 进入主输入构造前，顺序扫描消息并把 `[Tool result for <call_id>]: ...` 归一化为标准 tool 消息；同时补多行正文、未知 call_id 与顺序保持的回归测试。
+
+
+## 2026-04-20 reviewer fix：Chat Completions 伪装 tool result 命中窗口收口
+
+### Observations
+- `internal/translator/codex/openai/chat-completions/codex_openai_request.go::parsePseudoToolResultMessage` 初版只要求三项条件：`role="user"`、内容前缀匹配 `[Tool result for `、`call_id` 曾在更早 `assistant.tool_calls[].id` 中出现。
+- 现场最小复现：先经历一轮 `assistant.tool_calls -> user 伪装 tool result -> assistant 正常回复`，随后用户再次发送 `"[Tool result for call_order]: 这串前缀是日志格式，请帮我解释含义"`。初版实现会把最后这条普通用户消息继续改写成 `function_call_output(call_order)`。
+- 这条误命中发生在 `ConvertOpenAIRequestToCodex` 的归一化阶段，因此会直接污染 Codex 输入 turn 顺序。
+
+### Hypotheses
+- H1 ROOT: 命中条件需要从“历史上见过 call_id”收口到“当前仍处于待提交 tool output 的 pending window”；只有最近一轮 assistant tool_calls 刚打开、且对应 call_id 尚未消费时，前缀消息才应视为 tool output。
+  - Supports: 误命中样例里的 `call_order` 确实历史上出现过，但该轮 tool call 已在更早 turn 消费完成。
+  - Conflicts: 无。
+  - Test: 引入 pending call set；assistant 发起新 tool_calls 时重建窗口，tool/兼容 tool result 消费后移除对应 call_id，assistant 新文本回复与普通 user 新提问都会关闭窗口。
+- H2: “未知 call_id 保留 user 文本”与“窗口外旧 call_id 保留 user 文本”需要分别覆盖，避免只修一半边界。
+  - Supports: 两类误判边界来源不同；一类是未声明 id，一类是旧 id 已过期。
+  - Conflicts: 无。
+  - Test: 分别保留 `call_missing` 与 `call_order` 旧前缀回归测试。
+
+### Experiments
+- E1: 只读检查初版 `normalizePseudoToolResultMessages`。结果：确认它只维护 `seenCallIDs`，没有“待消费窗口”概念，支持 H1。
+- E2: 新增“窗口外旧前缀”回归测试。结果：初版失败，收口到 pending window 后通过。
+
+### Root Cause
+- 初版兼容逻辑把“历史见过 call_id”当成充分条件，导致窗口外的普通用户引用文本被误改写成 tool output。
+
+### Fix
+- `internal/translator/codex/openai/chat-completions/codex_openai_request.go::normalizePseudoToolResultMessages` 现改为维护 pending call window：assistant 新 tool_calls 会重建窗口，tool 或兼容 tool result 会消费对应 call_id，assistant 正常回复与普通 user 新提问会关闭窗口；只有窗口内前缀消息才会归一化。
+
+
+## 2026-04-20 reviewer fix：撤回 RT 失败 priority=5 写回方案
+
+### Observations
+- `sdk/cliproxy/auth/types.go::Auth` 明确把 `Attributes` 标注为 provider immutable configuration。
+- `internal/api/handlers/management/auth_files.go::PatchAuthFileFields` 中的 priority 更新属于显式管理操作，会同时写 `Metadata["priority"]` 与 `Attributes["priority"]` 并最终落盘。
+- 初版方案在 `sdk/cliproxy/auth/conductor.go::executeRefreshAuth` 的任意 refresh 错误路径里写回 `priority=5` 并触发异步持久化，这会把一次运行期失败扩散成持久化配置变更。
+
+### Hypotheses
+- H1 ROOT: refresh 失败路径只应维护运行态错误、退避与 pending 标记，不应覆盖 operator 配置的 priority。
+  - Supports: `executeRefreshAuth` 当前本来只管理 `LastError`、`NextRefreshAfter` 与 pending 清理；priority 属于调度拓扑配置。
+  - Conflicts: 无。
+  - Test: 撤回 priority 写回 helper 与对应断言，恢复“transient failure 不额外落盘 priority 变更”的测试期望。
+
+### Experiments
+- E1: 复核 `sdk/cliproxy/auth/types.go::Auth` 与 `internal/api/handlers/management/auth_files.go::PatchAuthFileFields`。结果：确认 priority 属于显式配置面，支持 H1。
+- E2: 撤回 `executeRefreshAuth` 中的 priority 写回与测试断言。结果：定向 refresh failure 测试恢复通过。
+
+### Root Cause
+- 初版方案把 refresh 失败的运行态处理与 operator priority 配置混在了一起。
+
+### Fix
+- 已从 `sdk/cliproxy/auth/conductor.go::executeRefreshAuth` 删除 priority=5 写回逻辑，并把 `sdk/cliproxy/auth/conductor_refresh_failure_test.go` 恢复为“运行态 refresh 失败不追加 priority 落盘变更”的断言。

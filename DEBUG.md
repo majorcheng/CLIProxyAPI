@@ -663,3 +663,28 @@
 
 ### Fix
 - 已从 `sdk/cliproxy/auth/conductor.go::executeRefreshAuth` 删除 priority=5 写回逻辑，并把 `sdk/cliproxy/auth/conductor_refresh_failure_test.go` 恢复为“运行态 refresh 失败不追加 priority 落盘变更”的断言。
+
+
+## 2026-04-20 Codex free 429 跨模型共享
+
+### Observations
+- `sdk/cliproxy/auth/conductor.go::MarkResult` 在 429 时把冷却写进 `auth.ModelStates[result.Model]`，并通过 `updateAggregatedAvailability(...)` 聚合到 auth 级 `Quota`。
+- `sdk/cliproxy/auth/selector.go::isAuthBlockedForModel` 在带模型请求时优先只看当前模型对应的 `ModelStates[model]`，因此 `gpt-5.4` 的 429 不会拦住同一 free token 的 `gpt-5.3-codex`。
+- 用户目标语义是“Codex free 账号的 429 属于 token 级共享状态”，当前实现与目标存在偏差。
+
+### Hypotheses
+- H1（ROOT）：问题根因在 `isAuthBlockedForModel(...)` 只按模型态判定可用性，没有把 free Codex 的 auth 级 quota 冷却共享到兄弟模型。
+- H2：`updateAggregatedAvailability(...)` 只在所有模型都 unavailable 时才把 auth 标成 unavailable，因此 free 账号的 auth 聚合态也没有体现跨模型共享冷却。
+- H3：`sdk/cliproxy/auth/scheduler.go::projectAggregatedAuthState` 与运行态聚合逻辑保持同样的“全模型都不可用才阻断”规则，因此 scheduler 快路径也会延续这个偏差。
+
+### Experiments
+- E1：只读核对 `selector.go`、`conductor.go`、`scheduler.go` 三处代码路径。结果：确认 H1、H2、H3 同时成立。
+- E2：设计最小修复为“新增 free Codex shared-quota helper，并在 selector + 两处聚合逻辑复用”。结果：可以把共享语义收口到单一判据。
+
+### Root Cause
+- 根因是 free Codex 的 429 语义属于 token 级共享额度，而当前调度与聚合代码沿用了通用的按模型冷却规则。
+
+### Follow-up
+- reviewer 补充指出共享冷却还需要继续同步到 `internal/registry/model_registry.go` 暴露层与 `sdk/cliproxy/auth/session_affinity.go` 绑定层；否则会出现“兄弟模型在 `/v1/models` 里仍可见”以及“旧 session 绑定持续先命中冷却 auth 再 fallback”的双重分裂。
+- 已在 `sdk/cliproxy/auth/conductor.go::MarkResult` 增加 free Codex shared quota 的全模型联动：429 时批量 `SetModelQuotaExceeded` / `SuspendClientModel`，成功时批量 `ClearModelQuotaExceeded` / `ResumeClientModel`。
+- 已新增 `sdk/cliproxy/auth/session_affinity.go::invalidateSessionAffinityAuth`，并在 shared quota 生效时立刻清掉旧 auth 绑定。

@@ -1042,12 +1042,6 @@ func projectAggregatedAuthState(auth *Auth, modelKey string, override *ModelStat
 		return projected
 	}
 
-	projected.unavailable = allUnavailable
-	if allUnavailable {
-		projected.nextRetryAfter = earliestRetry
-	} else {
-		projected.nextRetryAfter = time.Time{}
-	}
 	if quotaExceeded {
 		projected.quota = QuotaState{
 			Exceeded:      true,
@@ -1058,6 +1052,16 @@ func projectAggregatedAuthState(auth *Auth, modelKey string, override *ModelStat
 		}
 	} else {
 		projected.quota = QuotaState{}
+	}
+	if next, ok := codexFreeSharedQuotaRetryAfter(auth, projected.quota, now); ok {
+		projected.unavailable = true
+		projected.nextRetryAfter = next
+	} else if allUnavailable {
+		projected.unavailable = true
+		projected.nextRetryAfter = earliestRetry
+	} else {
+		projected.unavailable = false
+		projected.nextRetryAfter = time.Time{}
 	}
 	if hasError {
 		projected.status = StatusError

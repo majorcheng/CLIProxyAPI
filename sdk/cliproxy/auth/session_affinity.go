@@ -185,6 +185,16 @@ func bindSessionAffinityFromMetadata(selector Selector, metadata map[string]any,
 	affinity.BindSelectedAuth(metadata, provider, model, authID)
 }
 
+// invalidateSessionAffinityAuth 在共享冷却命中后主动清理旧 auth 绑定，
+// 避免长会话持续先命中已不可用的 token，再回退到 fallback selector。
+func invalidateSessionAffinityAuth(selector Selector, authID string) {
+	affinity := sessionAffinitySelectorOf(selector)
+	if affinity == nil {
+		return
+	}
+	affinity.InvalidateAuth(authID)
+}
+
 func sessionAffinityIDsFromOptions(opts cliproxyexecutor.Options) (string, string) {
 	if primaryID, fallbackID := sessionAffinityIDsFromMetadata(opts.Metadata); primaryID != "" {
 		return primaryID, fallbackID

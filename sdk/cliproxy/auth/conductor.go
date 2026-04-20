@@ -2421,6 +2421,11 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	suspendReason := ""
 	clearModelQuota := false
 	setModelQuota := false
+	sharedQuotaCooldown := false
+	clearModelQuotaIDs := []string(nil)
+	setModelQuotaIDs := []string(nil)
+	resumeModelIDs := []string(nil)
+	suspendModelIDs := []string(nil)
 	var authSnapshot *Auth
 	var modelStateSnapshot *ModelState
 	var persistSnapshot *Auth
@@ -2446,6 +2451,10 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 				auth.UpdatedAt = now
 				shouldResumeModel = true
 				clearModelQuota = true
+				if codexFree429BlocksAllModels(auth) {
+					clearModelQuotaIDs = codexFreeSharedQuotaModelIDs(result.AuthID, result.Model)
+					resumeModelIDs = append([]string(nil), clearModelQuotaIDs...)
+				}
 			} else {
 				clearAuthStateOnSuccess(auth, now)
 			}
@@ -2528,6 +2537,12 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 								suspendReason = "quota"
 								shouldSuspendModel = true
 								setModelQuota = true
+								if codexFree429BlocksAllModels(auth) {
+									sharedQuotaCooldown = true
+									suspendReason = "shared_quota"
+									setModelQuotaIDs = codexFreeSharedQuotaModelIDs(result.AuthID, result.Model)
+									suspendModelIDs = append([]string(nil), setModelQuotaIDs...)
+								}
 							}
 						case 408, 500, 502, 503, 504:
 							if disableCooling {
@@ -2583,15 +2598,42 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	}
 
 	if clearModelQuota && result.Model != "" {
-		registry.GetGlobalRegistry().ClearModelQuotaExceeded(result.AuthID, result.Model)
+		clearIDs := clearModelQuotaIDs
+		if len(clearIDs) == 0 {
+			clearIDs = []string{result.Model}
+		}
+		for _, modelID := range clearIDs {
+			registry.GetGlobalRegistry().ClearModelQuotaExceeded(result.AuthID, modelID)
+		}
 	}
 	if setModelQuota && result.Model != "" {
-		registry.GetGlobalRegistry().SetModelQuotaExceeded(result.AuthID, result.Model)
+		setIDs := setModelQuotaIDs
+		if len(setIDs) == 0 {
+			setIDs = []string{result.Model}
+		}
+		for _, modelID := range setIDs {
+			registry.GetGlobalRegistry().SetModelQuotaExceeded(result.AuthID, modelID)
+		}
 	}
 	if shouldResumeModel {
-		registry.GetGlobalRegistry().ResumeClientModel(result.AuthID, result.Model)
+		resumeIDs := resumeModelIDs
+		if len(resumeIDs) == 0 {
+			resumeIDs = []string{result.Model}
+		}
+		for _, modelID := range resumeIDs {
+			registry.GetGlobalRegistry().ResumeClientModel(result.AuthID, modelID)
+		}
 	} else if shouldSuspendModel {
-		registry.GetGlobalRegistry().SuspendClientModel(result.AuthID, result.Model, suspendReason)
+		suspendIDs := suspendModelIDs
+		if len(suspendIDs) == 0 {
+			suspendIDs = []string{result.Model}
+		}
+		for _, modelID := range suspendIDs {
+			registry.GetGlobalRegistry().SuspendClientModel(result.AuthID, modelID, suspendReason)
+		}
+		if sharedQuotaCooldown {
+			invalidateSessionAffinityAuth(m.selector, result.AuthID)
+		}
 	}
 
 	// 反馈型 selector 只在进程内维护评分，不参与持久化，因此在结果落库后再喂回运行态统计。
@@ -2678,12 +2720,6 @@ func updateAggregatedAvailability(auth *Auth, now time.Time) {
 			}
 		}
 	}
-	auth.Unavailable = allUnavailable
-	if allUnavailable {
-		auth.NextRetryAfter = earliestRetry
-	} else {
-		auth.NextRetryAfter = time.Time{}
-	}
 	if quotaExceeded {
 		auth.Quota.Exceeded = true
 		auth.Quota.Reason = "quota"
@@ -2697,6 +2733,17 @@ func updateAggregatedAvailability(auth *Auth, now time.Time) {
 		auth.Quota.BackoffLevel = 0
 		auth.Quota.StrikeCount = 0
 	}
+	if next, ok := codexFreeSharedQuotaRetryAfter(auth, auth.Quota, now); ok {
+		auth.Unavailable = true
+		auth.NextRetryAfter = next
+		return
+	}
+	auth.Unavailable = allUnavailable
+	if allUnavailable {
+		auth.NextRetryAfter = earliestRetry
+		return
+	}
+	auth.NextRetryAfter = time.Time{}
 }
 
 func hasModelError(auth *Auth, now time.Time) bool {

@@ -712,3 +712,113 @@
 ### Fix
 - `internal/translator/openai/openai/responses/openai_openai-responses_request.go::resolveCompatibleReasoningEffortForResponsesMisroute` 已补齐三种来源的保留逻辑，并通过 `normalizeResponsesMisrouteReasoningEffort(...)` 统一清洗大小写与空白。
 - `sdk/api/handlers/openai/openai_handlers_reasoning_compat_test.go::TestChatCompletionsResponsesMisroutePreservesCompatibleReasoning` 现在覆盖 reviewer 点名的完整 handler 分支，并通过真实 `openai -> codex` 翻译断言最终 `reasoning.effort` 仍为 `xhigh/high`。
+
+
+## 2026-04-21 复用现有 Codex 配额刷新自动解除 stale 429 冷却
+
+### Observations
+- 管理中心当前“仅刷新这个凭证的额度”入口是前端 `Cli-Proxy-API-Management-Center/src/components/quota/quotaConfigs.ts::fetchCodexQuota`，它经由 CPA 后端 `internal/api/handlers/management/api_tools.go::APICall` 代理 `GET /backend-api/wham/usage`；仓内没有独立的 quota refresh management 接口。
+- `sdk/cliproxy/auth/selector.go::isAuthBlockedForModel` 会同时读取 auth 聚合态与 model state 的 `NextRetryAfter`、`Quota`、`FailureHTTPStatus` 和 `StatusMessage`；只清 auth 级 `next_retry_after` 仍可能被 model state 里的 429 冷却继续挡住。
+- `sdk/cliproxy/auth/conductor.go::MarkResult` 对模型级 429 会同时写入 `ModelState.Quota`、`ModelState.NextRetryAfter`、`Auth.Quota`、`Auth.NextRetryAfter`，并联动 registry 的 `SetModelQuotaExceeded` / `SuspendClientModel`；这说明恢复动作也需要同时回收 manager 与 registry 两层状态。
+- 管理中心前端 `quotaConfigs.ts::buildCodexQuotaWindows` 当前按 `limit_window_seconds == 604800` 识别主 code 周窗口；缺失时长字段时回退到 `secondary_window -> primary_window` 顺序，展示层剩余额度口径是 `100 - used_percent`。
+- 当前仓内没有可直接复用的“只清 quota 429 冷却” manager helper；现有 `resetModelState` / `clearAuthStateOnSuccess` / `syncAggregatedAuthStateFromModelStates` 是分散的内部工具。
+
+### Hypotheses
+- H1 ROOT：最小修复点是直接增强 `internal/api/handlers/management/api_tools.go::APICall`，在成功的 Codex `wham/usage` 响应后按 fresh 周额度判定并调用新的 manager helper 清理 429 冷却。
+  - Supports: 用户明确要求复用现有“刷新这个凭证的额度”动作；当前这条动作正是 `APICall -> wham/usage` 闭环。
+  - Conflicts: 需要补一层 usage payload 解析 helper，并保证只命中 Codex usage 请求。
+  - Test: 在 `APICall` 定向测试里伪造 `wham/usage` 成功响应，断言周剩余 > 30% 时 auth/model 429 状态被清掉，<= 30% 时保持原样。
+- H2：只在 management handler 内手动改 auth 聚合态字段就够了。
+  - Supports: `selector.go::isAuthBlockedForModel` 在 model 为空时确实会看 auth 聚合态。
+  - Conflicts: 真实 pick 路径通常携带模型名，会优先落到 model state；registry 里的 quota/suspend 标记也会继续影响 `/v1/models` 可见性。
+  - Test: 只改 auth 聚合态后跑 selector/model-state 场景，验证仍会被 model state 挡住。
+- H3：可以直接复用 `Manager.Update(...)` 外加若干手动字段赋值，无需单独 helper。
+  - Supports: `Update(...)` 已负责 scheduler upsert、persist 与 hook。
+  - Conflicts: quota 清理涉及“哪些字段算 quota 痕迹”“如何保留 401/403”“free shared quota 需要恢复哪些兄弟模型”三层语义，散落在 handler 里容易漏边界。
+  - Test: 抽一个 manager helper，并补 auth 层定向测试，验证保留非 quota 错误与 free shared quota 恢复。
+
+### Experiments
+- E1：只读核对 `sdk/cliproxy/auth/conductor.go::MarkResult`、`sdk/cliproxy/auth/conductor.go::applyAuthFailureState`、`sdk/cliproxy/auth/selector.go::isAuthBlockedForModel`、`internal/registry/model_registry.go::{SetModelQuotaExceeded,ClearModelQuotaExceeded,SuspendClientModel,ResumeClientModel}`。结果：确认 429 冷却涉及 auth/model 双层 manager 状态与 registry 状态。
+- E2：只读核对管理中心 `Cli-Proxy-API-Management-Center/src/components/quota/quotaConfigs.ts::buildCodexQuotaWindows`。结果：确认后端应按 `limit_window_seconds == 604800` 识别主 code 周窗口，缺失时长时回退 secondary/primary 顺序。
+- E3：生产修复分两层落地：
+  - `sdk/cliproxy/auth/quota_recovery.go::ClearAuthQuotaCooldown`：新增单 auth quota/429 runtime state 清理 helper，清理 auth 聚合态与带 429 痕迹的 model state，并同步 registry 的 quota/suspend 标记。
+  - `internal/api/handlers/management/api_tools_codex_quota.go::maybeRecoverCodexQuotaCooldown`：在成功的 Codex `wham/usage` 响应后读取周窗口 `used_percent`，当剩余额度 `> 30%` 时调用 manager helper。
+- E4：定向测试已补两层：
+  - auth 层 `sdk/cliproxy/auth/quota_recovery_test.go`
+  - management 层 `internal/api/handlers/management/api_tools_codex_quota_test.go`
+
+### Root Cause
+- 根因是当前“刷新这个凭证的额度”链路只负责向上游查询 fresh `wham/usage`，而 CPA 继续选不到这把 Codex 凭证的真实阻断点仍留在本地 runtime state：`sdk/cliproxy/auth/selector.go::isAuthBlockedForModel` 会持续读取 auth/model 上残留的 429 cooldown 与 registry quota/suspend 标记。
+
+### Fix
+- 在 `sdk/cliproxy/auth/quota_recovery.go` 新增 `Manager.ClearAuthQuotaCooldown(...)`，把“清理单 auth 的 quota/429 runtime state”收口成可复用 helper：
+  - 清空 auth 聚合态上的 `StatusMessage="quota exhausted"`、`FailureHTTPStatus=429`、`Quota`、`NextRetryAfter`、429 `LastError`
+  - 仅重置带 quota/429 痕迹的 model state
+  - 重新计算聚合态，并在仍有非 quota 模型错误时把代表性错误重新投影回 auth 聚合态
+  - 清理 registry 中对应模型的 `QuotaExceededClients` 与 `SuspendedClients`
+- 在 `internal/api/handlers/management/api_tools.go::APICall` 成功读取响应体后接入 `maybeRecoverCodexQuotaCooldown(...)`，让现有 Codex 单凭证 quota refresh 闭环直接承担“恢复可用性”的职责。
+- 在 `internal/api/handlers/management/api_tools_codex_quota.go` 按管理中心现有口径解析 `wham/usage`：
+  - 优先用 `limit_window_seconds == 604800` 识别周窗口
+  - 缺失时长时按 `secondary_window -> primary_window` 回退
+  - 使用 `100 - used_percent` 计算剩余额度，严格命中 `> 30%`
+
+---
+
+# reviewer follow-up：Codex quota recovery mixed-state、host 作用域与测试串扰修复（2026-04-21）
+
+## Observations
+
+- `sdk/cliproxy/auth/quota_recovery.go::clearQuotaCooldownModelStates` 与 `clearAuthQuotaRuntimeState` 之前只要看到 quota/429 残留字段就会直接重置状态，没有核对“当前活跃失败类型”是否仍然属于 quota。
+- `sdk/cliproxy/auth/conductor.go::applyAuthFailureState` 与 `MarkResult` 在 401/402/403/404 分支会更新 `FailureHTTPStatus`、`StatusMessage`、`NextRetryAfter`，同时旧 `Quota` 结构体可能继续保留；这会形成 mixed-state：当前失败是 unauthorized/payment_required，quota 痕迹仍在。
+- `sdk/cliproxy/auth/selector.go::isAuthBlockedForModel` 对 401/403 这类状态会以 `blockReasonOther` 继续阻断，所以如果 quota recovery 把这些 mixed-state 也清掉，就会把本应继续阻断的 auth/model 重新放行。
+- `internal/api/handlers/management/api_tools_codex_quota.go::isCodexUsageRefreshRequest` 之前只校验 `provider=codex + GET + path=/backend-api/wham/usage`，没有校验 host 与 `Chatgpt-Account-Id`，因此任意 host 的仿真 usage JSON 都可能触发本地 cooldown 恢复。
+- `sdk/cliproxy/auth/quota_recovery_test.go` 新增用例之前带 `t.Parallel()`，同时读写 `internal/registry.GetGlobalRegistry()`；包级 `go test ./sdk/cliproxy/auth -count=5` 已稳定复现 `TestManagerExecute_SessionAffinityRebindsToSuccessfulFallbackAuth` 抖动，说明 reviewer 第 3 条成立。
+
+## Hypotheses
+
+### H1: mixed-state 误恢复的根因是 quota recovery 依据“残留字段存在”判断，而不是依据“当前活跃失败仍是 quota”判断（ROOT HYPOTHESIS）
+- Supports: `clearAuthQuotaRuntimeState` 只检查 `authHasQuotaCooldown(auth)`；`clearQuotaCooldownModelStates` 只检查 `modelStateHasQuotaCooldown(state)`。
+- Conflicts: 若当前活跃失败直接来自 `LastError.HTTPStatus=429`，新旧判据都会清理，需通过 mixed unauthorized 场景证明差异。
+- Test: 构造 `FailureHTTPStatus/LastError=401 + Quota residue` 的 auth/model，断言 `ClearAuthQuotaCooldown` 返回 unchanged，`isAuthBlockedForModel` 仍保持 `blockReasonOther`。
+
+### H2: APICall 作用域过宽的根因是 recovery helper 只识别 path，没有把官方 host 与凭证身份一起纳入匹配（ROOT HYPOTHESIS）
+- Supports: 现有 helper 既不看 `parsedURL.Hostname()`，也不校验 `Chatgpt-Account-Id` 与 auth metadata 的一致性。
+- Conflicts: 若 management 前端未来改 header key，当前新判据会需要同步更新。
+- Test: 加入 host=`mock.local` 与错误 account_id 的测试，请求成功返回 usage JSON 时也不应清理 cooldown。
+
+### H3: 包级并发抖动的根因是新增测试在 `t.Parallel()` 下修改全局 registry 单例（ROOT HYPOTHESIS）
+- Supports: reviewer 已复现 flake；新增测试直接注册/冻结/恢复全局模型目录。
+- Conflicts: 包内原有并行测试很多，若新测试改成串行仍需用 `go test -count=5` 再确认。
+- Test: 去掉新增 registry 测试的 `t.Parallel()`，重复跑 `go test ./sdk/cliproxy/auth -count=5`。
+
+## Experiments
+
+- 运行 `timeout 60s go test ./sdk/cliproxy/auth -count=5`，稳定复现 `TestManagerExecute_SessionAffinityRebindsToSuccessfulFallbackAuth` 抖动，证实新增并行 registry 测试会污染包级共享状态。
+- 只读核对 `sdk/cliproxy/auth/conductor.go::{MarkResult,applyAuthFailureState}` 与 `sdk/cliproxy/auth/quota_recovery.go`，确认 401/403 覆盖时会保留旧 quota 结构，旧 helper 会把 mixed-state 误判成可清理 quota。
+- 只读核对 `internal/api/handlers/management/api_tools.go::APICall` 与 `api_tools_codex_quota.go::isCodexUsageRefreshRequest`，确认当前恢复副作用仅靠 path 命中，没有 host/account_id 收口。
+- 生产修复：
+  - 新增 `sdk/cliproxy/auth/quota_recovery_state.go`，把 quota recovery 判据改成“当前活跃失败类型分类”；只有当前 failure kind 仍是 quota 时才清理 auth/model 冷却。
+  - 收紧 `internal/api/handlers/management/api_tools_codex_quota.go`，要求同时命中 `GET + host=chatgpt.com + path=/backend-api/wham/usage + Chatgpt-Account-Id 与 auth.Metadata.account_id 一致` 才触发恢复。
+  - 去掉新增 quota recovery 测试中的并行执行，并补 mixed-state / host-scope 定向测试。
+
+## Root Cause
+
+- mixed-state 误恢复的根因是 quota recovery 之前按“残留 quota 字段存在”做清理判据，而 401/403 等新失败覆盖后旧 quota 结构仍可能残留，导致当前 unauthorized/payment_required 状态被误清空。
+- APICall 作用域过宽的根因是 Codex usage recovery helper 只按 path 命中 `/backend-api/wham/usage`，缺少官方 host 与目标账号身份校验。
+- 包级测试抖动的根因是新增测试在 `t.Parallel()` 下读写全局 model registry 单例，和现有 session-affinity / scheduler 并行用例共享同一份运行态。
+
+## Fix
+
+- `sdk/cliproxy/auth/quota_recovery.go` 现已只负责清理流程编排；具体“当前活跃失败是否属于 quota”判据拆到 `sdk/cliproxy/auth/quota_recovery_state.go`：
+  - `authCurrentFailureKind(...)`
+  - `modelStateCurrentFailureKind(...)`
+  - `errorCurrentFailureKind(...)`
+  - `failureKindFromStateSignals(...)`
+- `clearAuthQuotaRuntimeState(...)` 与 `clearQuotaCooldownModelStates(...)` 现在只有在当前 failure kind 仍是 quota 时才执行清理；401/403/not_found mixed-state 会保持原阻断状态。
+- `internal/api/handlers/management/api_tools_codex_quota.go::isCodexUsageRefreshRequest` 现已要求同时满足：
+  - `provider=codex`
+  - `method=GET`
+  - `hostname=chatgpt.com`
+  - `path=/backend-api/wham/usage`
+  - `Chatgpt-Account-Id` 与 `auth.Metadata.account_id` 一致
+- `sdk/cliproxy/auth/quota_recovery_test.go` 与 `internal/api/handlers/management/api_tools_codex_quota_test.go` 已补 mixed unauthorized、非官方 host、缺失/错误 account_id 等回归场景，并移除会写全局 registry 的新测试并行执行。

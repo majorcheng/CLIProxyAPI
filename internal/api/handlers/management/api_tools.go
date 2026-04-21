@@ -208,6 +208,8 @@ func (h *Handler) APICall(c *gin.Context) {
 		return
 	}
 
+	h.maybeRecoverCodexQuotaCooldown(c.Request.Context(), auth, body, parsedURL, resp.StatusCode, respBody)
+
 	c.JSON(http.StatusOK, apiCallResponse{
 		StatusCode: resp.StatusCode,
 		Header:     resp.Header,

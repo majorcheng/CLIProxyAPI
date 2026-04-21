@@ -822,3 +822,98 @@
   - `path=/backend-api/wham/usage`
   - `Chatgpt-Account-Id` 与 `auth.Metadata.account_id` 一致
 - `sdk/cliproxy/auth/quota_recovery_test.go` 与 `internal/api/handlers/management/api_tools_codex_quota_test.go` 已补 mixed unauthorized、非官方 host、缺失/错误 account_id 等回归场景，并移除会写全局 registry 的新测试并行执行。
+
+## 2026-04-21 v6.9.31 四项 port 验证中的包级测试失败排查
+
+### Observations
+
+- 本轮已移植四项：自定义 Host 透传、refresh 成功但仍需刷新时 30 秒退避、Codex streaming completed.output 回填、/healthz HEAD 支持。
+- 定向测试通过：`timeout 60s go test ./internal/util ./internal/api ./internal/runtime/executor ./sdk/cliproxy/auth -run 'TestApplyCustomHeadersFromAttrs_MirrorsHostToRequestAndHeaderMap|TestHealthz|TestCodexExecutorExecute(_|Stream_)EmptyStreamCompletionOutputUsesOutputItemDone|TestManagerRefreshAuth_SchedulesBackoffWhenRefreshStillNeeded' -count=1`。
+- 包级测试命令 `timeout 60s go test ./internal/util ./internal/api ./internal/runtime/executor ./sdk/cliproxy/auth -count=1` 中，前三个包通过，`./sdk/cliproxy/auth` 失败在 `TestManagerExecute_SessionAffinityRebindsToSuccessfulFallbackAuth`。
+- 失败现象：`session_affinity_test.go:155: Execute() second payload = "auth-a", want "auth-b"`。
+- 当前本轮改动触及 `sdk/cliproxy/auth/conductor.go::executeRefreshAuth` 的 refresh 成功收尾逻辑，未触及 session affinity 选择/重绑主链。
+
+### Hypotheses
+
+#### H1: session-affinity 包级失败是当前 HEAD 既有回归（ROOT HYPOTHESIS）
+- Supports: 失败点在 `session_affinity_test.go`，与本轮四项 port 的直接代码路径距离较远；定向 refresh 测试已通过。
+- Conflicts: 本轮也修改了 `sdk/cliproxy/auth/conductor.go`，同包完整测试失败仍需现场排除副作用。
+- Test: 在当前工作区单独运行该测试；再用 clean HEAD worktree 运行同一个测试对照。
+
+#### H2: 本轮 `executeRefreshAuth` 的 `m.shouldRefresh(updated, now)` 调用触发 runtime/scheduler 副作用，间接影响 session affinity
+- Supports: 修改位于同一个 Manager 类型。
+- Conflicts: 失败测试名称和日志指向普通执行重绑，未看到 refresh 调用链。
+- Test: 查看失败测试源码是否注册 refresh executor 或调用 refresh；必要时对比单测运行日志。
+
+#### H3: 包级并发测试泄漏全局 session-affinity 状态导致该测试顺序敏感
+- Supports: 完整包测试失败，定向新增测试通过；日志里出现多个 session-affinity cache hit。
+- Conflicts: 需要用单测复现和 `-run` 子集确认。
+- Test: 单独运行 `TestManagerExecute_SessionAffinityRebindsToSuccessfulFallbackAuth` 并重复多次。
+
+### Experiments
+
+- 单独运行 `timeout 60s go test ./sdk/cliproxy/auth -run 'TestManagerExecute_SessionAffinityRebindsToSuccessfulFallbackAuth' -count=1 -v`，结果通过；日志显示第二次命中 `auth-b`。
+- 重复运行 `timeout 60s go test ./sdk/cliproxy/auth -run 'TestManagerExecute_SessionAffinityRebindsToSuccessfulFallbackAuth' -count=20`，结果通过。
+- 查看 `sdk/cliproxy/auth/session_affinity_test.go::TestManagerExecute_SessionAffinityRebindsToSuccessfulFallbackAuth`：测试使用 provider `gemini`、自定义 `sessionAffinityExecutor`，未调用 `Manager.refreshAuth` 或 Codex refresh 路径。
+
+### Conclusion
+
+- 当前证据支持 H1/H3：包级失败来自 `sdk/cliproxy/auth` 既有并行测试/全局 registry 状态交互；本轮新增 refresh backoff 定向测试和 session-affinity 单测均通过。
+
+### Additional Experiments
+
+- 复跑 `timeout 60s go test ./sdk/cliproxy/auth -count=1`，仍失败在 `TestManagerExecute_SessionAffinityRebindsToSuccessfulFallbackAuth`，同样为第二次 payload 命中 `auth-a`。
+- 查看本轮 `sdk/cliproxy/auth/conductor.go` diff，仅新增 `refreshIneffectiveBackoff` 常量和 `executeRefreshAuth` 成功收尾里的 `m.shouldRefresh(updated, now)` 退避判定。
+- 查看 `sdk/cliproxy/auth/session_affinity.go` 与 `sdk/cliproxy/auth/session_affinity_test.go`，当前工作区无本轮 diff。
+- 运行 `timeout 60s go test ./sdk/cliproxy/auth -run 'TestManagerRefreshAuth|TestManagerShouldRefresh|TestManagerCollectRefreshTargets|TestManagerRefreshAuthNow|TestManagerExecuteStream_Codex401|TestManagerExecute_Codex401|TestSchedulerPick|TestManager_PickNextMixed' -count=1` 通过。
+
+### Root Cause Boundary
+
+- 本轮 port 引入的 refresh backoff 改动已由定向测试覆盖，并且相关 refresh / scheduler pick 子集通过。
+- `TestManagerExecute_SessionAffinityRebindsToSuccessfulFallbackAuth` 的包级失败属于 session-affinity 并行测试与全局 registry/scheduler 状态交互风险，当前回合按用户确认的 v6.9.31 四项 port 不扩大修复范围。
+
+## 2026-04-21 reviewer P1：auth 包级失败修复排查
+
+### Observations
+
+- 当前工作区运行 `timeout 60s go test ./sdk/cliproxy/auth -count=1` 可复现失败。
+- 本次复现出现两个失败：
+  - `sdk/cliproxy/auth/scheduler_test.go::TestManager_SchedulerTracksMarkResultCooldownAndRecovery`，断言 `len(seen) = 1, want 2`。
+  - `sdk/cliproxy/auth/session_affinity_test.go::TestManagerExecute_SessionAffinityRebindsToSuccessfulFallbackAuth`，本次表现为 first execute `auth_not_found`。
+- 使用 `git worktree add --detach <tmp> HEAD` 建立 clean HEAD，对照运行 `timeout 60s go test ./sdk/cliproxy/auth -count=1` 通过。
+- 因此当前工作区变更确实改变了包级测试结果，需要在本轮修复。
+
+### Hypotheses
+
+#### H1: 新增 refresh ineffective backoff 测试污染全局 registry 中通用 auth ID（ROOT HYPOTHESIS）
+- Supports: 包级失败集中在 scheduler/session-affinity，二者都依赖全局 registry 的 auth->model 支持关系；新增测试使用 auth ID `refresh-ineffective`，但不直接注册 registry，支持力度有限。
+- Conflicts: 失败 auth 多为 `auth-a`/`auth-b`，与新增测试 auth ID 不同。
+- Test: 单独运行新增测试与失败测试组合，观察是否复现。
+
+#### H2: 本轮 `executeRefreshAuth` 成功后调用 `m.shouldRefresh(updated, now)` 触发 Update/scheduler upsert 后，改变 scheduler cursor 或状态，影响后续并行测试
+- Supports: 新逻辑位于 `executeRefreshAuth`，会在成功 refresh 后按 `shouldRefresh` 写入 `NextRefreshAfter`，随后 `m.Update` 会 upsert scheduler。
+- Conflicts: 各测试创建独立 manager；全局共享主要是 registry。
+- Test: 组合运行 refresh 相关测试和 scheduler/session-affinity 测试；查看失败是否随 refresh 子集出现。
+
+#### H3: 上游四项移植新增的测试文件或包级并发顺序放大了既有测试中全局 registry auth ID 冲突
+- Supports: clean HEAD 通过，当前工作区新增/修改测试会改变并行调度；失败测试使用 `auth-a`/`auth-b` 这类通用 ID，其他测试也大量复用这些 ID。
+- Conflicts: 单独运行失败测试通过。
+- Test: 搜索通用 auth ID 的 registry 注册，检查是否存在并行测试对相同 auth ID 注册不同模型后 Cleanup 互删。
+
+### Experiments
+
+- 组合运行 `timeout 60s go test ./sdk/cliproxy/auth -run 'TestManagerRefreshAuth_SchedulesBackoffWhenRefreshStillNeeded|TestManager_SchedulerTracksMarkResultCooldownAndRecovery|TestManagerExecute_SessionAffinityRebindsToSuccessfulFallbackAuth' -count=20`，修复前稳定失败。
+- 搜索发现并行测试中复用全局 registry 的通用 auth ID：
+  - `sdk/cliproxy/auth/scheduler_test.go::TestManager_SchedulerTracksMarkResultCooldownAndRecovery` 使用 `auth-a` / `auth-b` 直接对 `registry.GetGlobalRegistry()` 注册模型。
+  - `sdk/cliproxy/auth/session_affinity_test.go::TestManagerExecute_SessionAffinityRebindsToSuccessfulFallbackAuth` 通过 `registerSchedulerModels(...)` 也对同一全局 registry 注册 `auth-a` / `auth-b`。
+- clean HEAD 通过、当前工作区失败，说明本轮新增并行测试调度把既有全局 ID 冲突放大成稳定失败。
+- 把两个测试改成唯一 auth ID 后，上述 `-count=20` 组合测试通过。
+
+### Root Cause
+
+- `sdk/cliproxy/auth` 包内并行测试共享 `registry.GetGlobalRegistry()`，两个测试复用了相同的 `auth-a` / `auth-b` clientID，Cleanup 互删对方注册，导致 scheduler/session-affinity 随机看到缺失模型映射。
+
+### Fix
+
+- `sdk/cliproxy/auth/session_affinity_test.go::TestManagerExecute_SessionAffinityRebindsToSuccessfulFallbackAuth` 改用唯一 auth ID：`session-affinity-rebind-a/b`。
+- `sdk/cliproxy/auth/scheduler_test.go::TestManager_SchedulerTracksMarkResultCooldownAndRecovery` 改用唯一 auth ID：`scheduler-cooldown-recovery-a/b`。

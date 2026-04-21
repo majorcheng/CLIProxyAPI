@@ -65,8 +65,10 @@ const (
 	refreshMaxConcurrency = 16
 	refreshPendingBackoff = time.Minute
 	refreshFailureBackoff = 5 * time.Minute
-	quotaBackoffBase      = time.Second
-	quotaBackoffMax       = 30 * time.Minute
+	// refresh 成功后仍满足刷新条件时短暂退避，避免无效 token 更新触发空转刷新。
+	refreshIneffectiveBackoff = 30 * time.Second
+	quotaBackoffBase          = time.Second
+	quotaBackoffMax           = 30 * time.Minute
 	// 单个 auth 满载时给客户端一个很短的 Retry-After，表达“这是本地拥塞保护，不是上游长冷却”。
 	authCapacityRetryAfter = time.Second
 	// unlimitedRetrySafetyCap bounds legacy "retry all credentials" mode so a
@@ -4476,6 +4478,9 @@ func (m *Manager) executeRefreshAuth(ctx context.Context, id string) (*Auth, err
 	updated.NextRefreshAfter = time.Time{}
 	updated.LastError = nil
 	updated.UpdatedAt = now
+	if m.shouldRefresh(updated, now) {
+		updated.NextRefreshAfter = now.Add(refreshIneffectiveBackoff)
+	}
 	persisted, _ := m.Update(ctx, updated)
 	if persisted != nil {
 		return persisted, nil

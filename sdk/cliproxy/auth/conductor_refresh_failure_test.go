@@ -899,3 +899,54 @@ func TestManagerExecuteStream_Codex401RefreshesBeforeFirstByte(t *testing.T) {
 		t.Fatalf("streamCalls = %d, want 2", executor.streamCalls)
 	}
 }
+
+func TestManagerRefreshAuth_SchedulesBackoffWhenRefreshStillNeeded(t *testing.T) {
+	ctx := context.Background()
+	manager := NewManager(nil, nil, nil)
+	manager.RegisterExecutor(refreshFailureTestExecutor{
+		provider: "codex",
+		after: func(auth *Auth) {
+			if auth == nil {
+				return
+			}
+			if auth.Metadata == nil {
+				auth.Metadata = make(map[string]any)
+			}
+			// 上游返回成功但没有有效延长 token 时，当前 auth 仍会满足 shouldRefresh。
+			auth.Metadata["refresh_token"] = "same-refresh-token"
+			auth.Metadata["access_token"] = testJWTWithExp(time.Now().Add(time.Minute))
+		},
+	})
+
+	auth := &Auth{
+		ID:       "refresh-ineffective",
+		Provider: "codex",
+		Status:   StatusActive,
+		Metadata: map[string]any{
+			"refresh_token": "same-refresh-token",
+			"access_token":  testJWTWithExp(time.Now().Add(-time.Minute)),
+		},
+	}
+	if _, err := manager.Register(ctx, auth); err != nil {
+		t.Fatalf("register auth: %v", err)
+	}
+
+	started := time.Now()
+	manager.refreshAuth(ctx, auth.ID)
+
+	updated, ok := manager.GetByID(auth.ID)
+	if !ok || updated == nil {
+		t.Fatalf("expected auth %q to remain registered", auth.ID)
+	}
+	if updated.NextRefreshAfter.IsZero() {
+		t.Fatal("NextRefreshAfter 应写入无效刷新退避")
+	}
+	minBackoff := started.Add(refreshIneffectiveBackoff - time.Second)
+	maxBackoff := started.Add(refreshIneffectiveBackoff + time.Second)
+	if updated.NextRefreshAfter.Before(minBackoff) || updated.NextRefreshAfter.After(maxBackoff) {
+		t.Fatalf("NextRefreshAfter = %v，期望落在 %v 到 %v", updated.NextRefreshAfter, minBackoff, maxBackoff)
+	}
+	if updated.LastError != nil {
+		t.Fatalf("successful ineffective refresh should clear LastError, got %#v", updated.LastError)
+	}
+}

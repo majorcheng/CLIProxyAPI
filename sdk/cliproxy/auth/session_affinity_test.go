@@ -131,28 +131,32 @@ func TestEnsureRequestSimHashMetadata_WrappedSimHashSelector(t *testing.T) {
 func TestManagerExecute_SessionAffinityRebindsToSuccessfulFallbackAuth(t *testing.T) {
 	t.Parallel()
 
-	registerSchedulerModels(t, "gemini", "gemini-2.5-pro", "auth-a", "auth-b")
+	const (
+		authA = "session-affinity-rebind-a"
+		authB = "session-affinity-rebind-b"
+	)
+	registerSchedulerModels(t, "gemini", "gemini-2.5-pro", authA, authB)
 	selector := NewSessionAffinitySelector(&RoundRobinSelector{})
 	manager := NewManager(nil, selector, nil)
-	manager.executors["gemini"] = &sessionAffinityExecutor{failures: map[string]int{"auth-a": 1}}
-	manager.auths["auth-a"] = &Auth{ID: "auth-a", Provider: "gemini", Metadata: map[string]any{"disable_cooling": true}}
-	manager.auths["auth-b"] = &Auth{ID: "auth-b", Provider: "gemini"}
+	manager.executors["gemini"] = &sessionAffinityExecutor{failures: map[string]int{authA: 1}}
+	manager.auths[authA] = &Auth{ID: authA, Provider: "gemini", Metadata: map[string]any{"disable_cooling": true}}
+	manager.auths[authB] = &Auth{ID: authB, Provider: "gemini"}
 
 	opts := cliproxyexecutor.Options{Headers: http.Header{"X-Session-ID": []string{"session-sticky"}}}
 	resp, errExec := manager.Execute(context.Background(), []string{"gemini"}, cliproxyexecutor.Request{Model: "gemini-2.5-pro"}, opts)
 	if errExec != nil {
 		t.Fatalf("Execute() first error = %v", errExec)
 	}
-	if got := string(resp.Payload); got != "auth-b" {
-		t.Fatalf("Execute() first payload = %q, want %q", got, "auth-b")
+	if got := string(resp.Payload); got != authB {
+		t.Fatalf("Execute() first payload = %q, want %q", got, authB)
 	}
 
 	resp, errExec = manager.Execute(context.Background(), []string{"gemini"}, cliproxyexecutor.Request{Model: "gemini-2.5-pro"}, opts)
 	if errExec != nil {
 		t.Fatalf("Execute() second error = %v", errExec)
 	}
-	if got := string(resp.Payload); got != "auth-b" {
-		t.Fatalf("Execute() second payload = %q, want %q", got, "auth-b")
+	if got := string(resp.Payload); got != authB {
+		t.Fatalf("Execute() second payload = %q, want %q", got, authB)
 	}
 }
 

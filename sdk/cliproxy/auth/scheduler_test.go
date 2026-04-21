@@ -1156,23 +1156,27 @@ func TestManager_PickNextMixed_SkipsProvidersWithoutExecutors(t *testing.T) {
 func TestManager_SchedulerTracksMarkResultCooldownAndRecovery(t *testing.T) {
 	t.Parallel()
 
+	const (
+		authA = "scheduler-cooldown-recovery-a"
+		authB = "scheduler-cooldown-recovery-b"
+	)
 	manager := NewManager(nil, &RoundRobinSelector{}, nil)
 	reg := registry.GetGlobalRegistry()
-	reg.RegisterClient("auth-a", "gemini", []*registry.ModelInfo{{ID: "test-model"}})
-	reg.RegisterClient("auth-b", "gemini", []*registry.ModelInfo{{ID: "test-model"}})
+	reg.RegisterClient(authA, "gemini", []*registry.ModelInfo{{ID: "test-model"}})
+	reg.RegisterClient(authB, "gemini", []*registry.ModelInfo{{ID: "test-model"}})
 	t.Cleanup(func() {
-		reg.UnregisterClient("auth-a")
-		reg.UnregisterClient("auth-b")
+		reg.UnregisterClient(authA)
+		reg.UnregisterClient(authB)
 	})
-	if _, errRegister := manager.Register(context.Background(), &Auth{ID: "auth-a", Provider: "gemini"}); errRegister != nil {
-		t.Fatalf("Register(auth-a) error = %v", errRegister)
+	if _, errRegister := manager.Register(context.Background(), &Auth{ID: authA, Provider: "gemini"}); errRegister != nil {
+		t.Fatalf("Register(%s) error = %v", authA, errRegister)
 	}
-	if _, errRegister := manager.Register(context.Background(), &Auth{ID: "auth-b", Provider: "gemini"}); errRegister != nil {
-		t.Fatalf("Register(auth-b) error = %v", errRegister)
+	if _, errRegister := manager.Register(context.Background(), &Auth{ID: authB, Provider: "gemini"}); errRegister != nil {
+		t.Fatalf("Register(%s) error = %v", authB, errRegister)
 	}
 
 	manager.MarkResult(context.Background(), Result{
-		AuthID:   "auth-a",
+		AuthID:   authA,
 		Provider: "gemini",
 		Model:    "test-model",
 		Success:  false,
@@ -1183,12 +1187,12 @@ func TestManager_SchedulerTracksMarkResultCooldownAndRecovery(t *testing.T) {
 	if errPick != nil {
 		t.Fatalf("scheduler.pickSingle() after cooldown error = %v", errPick)
 	}
-	if got == nil || got.ID != "auth-b" {
-		t.Fatalf("scheduler.pickSingle() after cooldown auth = %v, want auth-b", got)
+	if got == nil || got.ID != authB {
+		t.Fatalf("scheduler.pickSingle() after cooldown auth = %v, want %s", got, authB)
 	}
 
 	manager.MarkResult(context.Background(), Result{
-		AuthID:   "auth-a",
+		AuthID:   authA,
 		Provider: "gemini",
 		Model:    "test-model",
 		Success:  true,

@@ -47,6 +47,10 @@ func applyCustomHeaders(r *http.Request, headers map[string]string) {
 		if k == "" || v == "" {
 			continue
 		}
+		// Go 发真实请求时从 Request.Host 取 wire Host，synthetic 请求仍会消费 Header map。
+		if http.CanonicalHeaderKey(k) == "Host" {
+			r.Host = v
+		}
 		r.Header.Set(k, v)
 	}
 }

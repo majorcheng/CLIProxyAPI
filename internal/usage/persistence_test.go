@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -15,31 +16,46 @@ import (
 
 func TestPersistAndRestoreRequestStatisticsRoundTrip(t *testing.T) {
 	stats := NewRequestStatistics()
-	recordUsageWithRemoteAddrForTest(t, stats, "203.0.113.10:54321", coreusage.Record{
-		APIKey:      "test-key",
-		Model:       "gpt-5.4",
-		RequestedAt: time.Date(2026, 3, 26, 10, 0, 0, 0, time.UTC),
-		Latency:     1500 * time.Millisecond,
-		Source:      "user@example.com",
-		AuthIndex:   "0",
-		Detail: coreusage.Detail{
-			InputTokens:  10,
-			OutputTokens: 20,
-			TotalTokens:  30,
+	firstRequestedAt := time.Date(2026, 3, 26, 10, 0, 0, 0, time.UTC)
+	recordUsageWithOptionsForTest(t, stats, usageRecordTestOptions{
+		RemoteAddr:      "203.0.113.10:54321",
+		RequestType:     RequestTypeStream,
+		UserAgent:       "  test-client/1.0 \n " + strings.Repeat("x", 200),
+		FirstResponseAt: firstRequestedAt.Add(275 * time.Millisecond),
+		ReasoningEffort: "xhigh",
+		Record: coreusage.Record{
+			APIKey:      "test-key",
+			Model:       "gpt-5.4",
+			RequestedAt: firstRequestedAt,
+			Latency:     1500 * time.Millisecond,
+			Source:      "user@example.com",
+			AuthIndex:   "0",
+			Detail: coreusage.Detail{
+				InputTokens:  10,
+				OutputTokens: 20,
+				TotalTokens:  30,
+			},
 		},
-	}, "xhigh")
-	recordUsageWithRemoteAddrForTest(t, stats, "[2001:db8::1]:443", coreusage.Record{
-		APIKey:      "test-key",
-		Model:       "gpt-5.4",
-		RequestedAt: time.Date(2026, 3, 26, 11, 0, 0, 0, time.UTC),
-		Latency:     900 * time.Millisecond,
-		Source:      "user@example.com",
-		AuthIndex:   "0",
-		Failed:      true,
-		Detail: coreusage.Detail{
-			InputTokens:  5,
-			OutputTokens: 7,
-			TotalTokens:  12,
+	})
+	secondRequestedAt := time.Date(2026, 3, 26, 11, 0, 0, 0, time.UTC)
+	recordUsageWithOptionsForTest(t, stats, usageRecordTestOptions{
+		RemoteAddr:      "[2001:db8::1]:443",
+		RequestType:     RequestTypeWebsocket,
+		UserAgent:       "codex-cli/0.118.0",
+		FirstResponseAt: secondRequestedAt.Add(110 * time.Millisecond),
+		Record: coreusage.Record{
+			APIKey:      "test-key",
+			Model:       "gpt-5.4",
+			RequestedAt: secondRequestedAt,
+			Latency:     900 * time.Millisecond,
+			Source:      "user@example.com",
+			AuthIndex:   "0",
+			Failed:      true,
+			Detail: coreusage.Detail{
+				InputTokens:  5,
+				OutputTokens: 7,
+				TotalTokens:  12,
+			},
 		},
 	})
 
@@ -93,8 +109,26 @@ func TestPersistAndRestoreRequestStatisticsRoundTrip(t *testing.T) {
 	if details[0].ReasoningEffort != "xhigh" {
 		t.Fatalf("details[0].reasoning_effort = %q, want %q", details[0].ReasoningEffort, "xhigh")
 	}
+	if details[0].RequestType != RequestTypeStream {
+		t.Fatalf("details[0].request_type = %q, want %q", details[0].RequestType, RequestTypeStream)
+	}
+	if details[0].FirstTokenMs != 275 {
+		t.Fatalf("details[0].first_token_ms = %d, want 275", details[0].FirstTokenMs)
+	}
+	if strings.Contains(details[0].UserAgent, "\n") {
+		t.Fatalf("details[0].user_agent should be single-line, got %q", details[0].UserAgent)
+	}
 	if details[1].ClientIP != "2001:db8::1" {
 		t.Fatalf("details[1].client_ip = %q, want %q", details[1].ClientIP, "2001:db8::1")
+	}
+	if details[1].RequestType != RequestTypeWebsocket {
+		t.Fatalf("details[1].request_type = %q, want %q", details[1].RequestType, RequestTypeWebsocket)
+	}
+	if details[1].FirstTokenMs != 110 {
+		t.Fatalf("details[1].first_token_ms = %d, want 110", details[1].FirstTokenMs)
+	}
+	if details[1].UserAgent != "codex-cli/0.118.0" {
+		t.Fatalf("details[1].user_agent = %q, want %q", details[1].UserAgent, "codex-cli/0.118.0")
 	}
 	if restored.HasPendingPersistence() {
 		t.Fatalf("restored stats should be clean immediately after restore")
@@ -305,19 +339,50 @@ func recordUsageForTest(stats *RequestStatistics, record coreusage.Record) {
 	stats.Record(context.Background(), record)
 }
 
+type usageRecordTestOptions struct {
+	RemoteAddr      string
+	RequestType     string
+	UserAgent       string
+	FirstResponseAt time.Time
+	ReasoningEffort string
+	Record          coreusage.Record
+}
+
 func recordUsageWithRemoteAddrForTest(t *testing.T, stats *RequestStatistics, remoteAddr string, record coreusage.Record, reasoningEffort ...string) {
+	t.Helper()
+
+	options := usageRecordTestOptions{
+		RemoteAddr: remoteAddr,
+		Record:     record,
+	}
+	if len(reasoningEffort) > 0 {
+		options.ReasoningEffort = reasoningEffort[0]
+	}
+	recordUsageWithOptionsForTest(t, stats, options)
+}
+
+func recordUsageWithOptionsForTest(t *testing.T, stats *RequestStatistics, options usageRecordTestOptions) {
 	t.Helper()
 	gin.SetMode(gin.TestMode)
 
 	recorder := httptest.NewRecorder()
 	ginCtx, _ := gin.CreateTestContext(recorder)
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
-	req.RemoteAddr = remoteAddr
+	req.RemoteAddr = options.RemoteAddr
+	if strings.TrimSpace(options.UserAgent) != "" {
+		req.Header.Set("User-Agent", options.UserAgent)
+	}
 	ginCtx.Request = req
-	if len(reasoningEffort) > 0 {
-		ginCtx.Set(RequestReasoningEffortContextKey, reasoningEffort[0])
+	if strings.TrimSpace(options.ReasoningEffort) != "" {
+		ginCtx.Set(RequestReasoningEffortContextKey, options.ReasoningEffort)
+	}
+	if strings.TrimSpace(options.RequestType) != "" {
+		ginCtx.Set(RequestTypeContextKey, options.RequestType)
+	}
+	if !options.FirstResponseAt.IsZero() {
+		ginCtx.Set("API_RESPONSE_TIMESTAMP", options.FirstResponseAt)
 	}
 
 	ctx := context.WithValue(context.Background(), "gin", ginCtx)
-	stats.Record(ctx, record)
+	stats.Record(ctx, options.Record)
 }

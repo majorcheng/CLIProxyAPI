@@ -4,8 +4,10 @@
 package usage
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"net/http"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -115,6 +117,9 @@ type modelStats struct {
 type RequestDetail struct {
 	Timestamp       time.Time  `json:"timestamp"`
 	LatencyMs       int64      `json:"latency_ms"`
+	RequestType     string     `json:"request_type,omitempty"`
+	FirstTokenMs    int64      `json:"first_token_ms,omitempty"`
+	UserAgent       string     `json:"user_agent,omitempty"`
 	Source          string     `json:"source"`
 	ClientIP        string     `json:"client_ip"`
 	AuthIndex       string     `json:"auth_index"`
@@ -167,6 +172,15 @@ var defaultRequestStatistics = NewRequestStatistics()
 // derived from the final upstream request body in Gin context.
 const RequestReasoningEffortContextKey = "API_REASONING_EFFORT"
 
+// RequestTypeContextKey stores the normalized downstream request mode in Gin context.
+const RequestTypeContextKey = "API_REQUEST_TYPE"
+
+const (
+	RequestTypeSync      = "sync"
+	RequestTypeStream    = "stream"
+	RequestTypeWebsocket = "websocket"
+)
+
 // GetRequestStatistics returns the shared statistics store.
 func GetRequestStatistics() *RequestStatistics { return defaultRequestStatistics }
 
@@ -208,6 +222,7 @@ func (s *RequestStatistics) Record(ctx context.Context, record coreusage.Record)
 	if modelName == "" {
 		modelName = "unknown"
 	}
+	requestType := resolveRequestType(ctx)
 	dayKey := timestamp.Format("2006-01-02")
 	hourKey := timestamp.Hour()
 	now := time.Now()
@@ -233,6 +248,9 @@ func (s *RequestStatistics) Record(ctx context.Context, record coreusage.Record)
 	s.updateAPIStats(stats, modelName, RequestDetail{
 		Timestamp:       timestamp,
 		LatencyMs:       normaliseLatency(record.Latency),
+		RequestType:     requestType,
+		FirstTokenMs:    resolveFirstTokenMs(ctx, record.RequestedAt, requestType),
+		UserAgent:       resolveUserAgent(ctx),
 		Source:          record.Source,
 		ClientIP:        resolveClientIP(ctx),
 		AuthIndex:       record.AuthIndex,
@@ -352,6 +370,18 @@ type MergeResult struct {
 	Skipped int64 `json:"skipped"`
 }
 
+type requestDetailRef struct {
+	stats *modelStats
+	index int
+}
+
+func (r requestDetailRef) get() *RequestDetail {
+	if r.stats == nil || r.index < 0 || r.index >= len(r.stats.Details) {
+		return nil
+	}
+	return &r.stats.Details[r.index]
+}
+
 // MergeSnapshot merges an exported statistics snapshot into the current store.
 // Existing data is preserved and duplicate request details are skipped.
 func (s *RequestStatistics) MergeSnapshot(snapshot StatisticsSnapshot) MergeResult {
@@ -363,7 +393,31 @@ func (s *RequestStatistics) MergeSnapshot(snapshot StatisticsSnapshot) MergeResu
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	seen := make(map[string]struct{})
+	seen := s.buildDetailIndexLocked()
+	for apiName, apiSnapshot := range snapshot.APIs {
+		apiName = strings.TrimSpace(apiName)
+		if apiName == "" {
+			continue
+		}
+		stats := s.ensureAPIStatsLocked(apiName)
+		for modelName, modelSnapshot := range apiSnapshot.Models {
+			modelName = normalizeModelName(modelName)
+			s.mergeModelSnapshotLocked(mergeModelSnapshotInput{
+				seen:     seen,
+				apiName:  apiName,
+				model:    modelName,
+				stats:    stats,
+				snapshot: modelSnapshot,
+				result:   &result,
+			})
+		}
+	}
+
+	return result
+}
+
+func (s *RequestStatistics) buildDetailIndexLocked() map[string]requestDetailRef {
+	seen := make(map[string]requestDetailRef)
 	for apiName, stats := range s.apis {
 		if stats == nil {
 			continue
@@ -372,51 +426,99 @@ func (s *RequestStatistics) MergeSnapshot(snapshot StatisticsSnapshot) MergeResu
 			if modelStatsValue == nil {
 				continue
 			}
-			for _, detail := range modelStatsValue.Details {
-				seen[dedupKey(apiName, modelName, detail)] = struct{}{}
+			for i := range modelStatsValue.Details {
+				detail := modelStatsValue.Details[i]
+				seen[dedupKey(apiName, modelName, detail)] = requestDetailRef{stats: modelStatsValue, index: i}
 			}
 		}
 	}
+	return seen
+}
 
-	for apiName, apiSnapshot := range snapshot.APIs {
-		apiName = strings.TrimSpace(apiName)
-		if apiName == "" {
+func (s *RequestStatistics) ensureAPIStatsLocked(apiName string) *apiStats {
+	stats, ok := s.apis[apiName]
+	if !ok || stats == nil {
+		stats = &apiStats{Models: make(map[string]*modelStats)}
+		s.apis[apiName] = stats
+		return stats
+	}
+	if stats.Models == nil {
+		stats.Models = make(map[string]*modelStats)
+	}
+	return stats
+}
+
+func normalizeModelName(modelName string) string {
+	modelName = strings.TrimSpace(modelName)
+	if modelName == "" {
+		return "unknown"
+	}
+	return modelName
+}
+
+type mergeModelSnapshotInput struct {
+	seen     map[string]requestDetailRef
+	apiName  string
+	model    string
+	stats    *apiStats
+	snapshot ModelSnapshot
+	result   *MergeResult
+}
+
+func (s *RequestStatistics) mergeModelSnapshotLocked(input mergeModelSnapshotInput) {
+	for _, detail := range input.snapshot.Details {
+		detail = normalizeImportedDetail(detail)
+		key := dedupKey(input.apiName, input.model, detail)
+		if ref, exists := input.seen[key]; exists {
+			if mergeRequestDetailMetadata(ref.get(), detail) {
+				s.markChangedLocked()
+			}
+			input.result.Skipped++
 			continue
 		}
-		stats, ok := s.apis[apiName]
-		if !ok || stats == nil {
-			stats = &apiStats{Models: make(map[string]*modelStats)}
-			s.apis[apiName] = stats
-		} else if stats.Models == nil {
-			stats.Models = make(map[string]*modelStats)
+		s.recordImported(input.apiName, input.model, input.stats, detail)
+		if modelStatsValue := input.stats.Models[input.model]; modelStatsValue != nil {
+			input.seen[key] = requestDetailRef{stats: modelStatsValue, index: len(modelStatsValue.Details) - 1}
 		}
-		for modelName, modelSnapshot := range apiSnapshot.Models {
-			modelName = strings.TrimSpace(modelName)
-			if modelName == "" {
-				modelName = "unknown"
-			}
-			for _, detail := range modelSnapshot.Details {
-				detail.Tokens = normaliseTokenStats(detail.Tokens)
-				if detail.LatencyMs < 0 {
-					detail.LatencyMs = 0
-				}
-				detail.ReasoningEffort = strings.TrimSpace(strings.ToLower(detail.ReasoningEffort))
-				if detail.Timestamp.IsZero() {
-					detail.Timestamp = time.Now()
-				}
-				key := dedupKey(apiName, modelName, detail)
-				if _, exists := seen[key]; exists {
-					result.Skipped++
-					continue
-				}
-				seen[key] = struct{}{}
-				s.recordImported(apiName, modelName, stats, detail)
-				result.Added++
-			}
-		}
+		input.result.Added++
 	}
+}
 
-	return result
+func normalizeImportedDetail(detail RequestDetail) RequestDetail {
+	detail.Tokens = normaliseTokenStats(detail.Tokens)
+	if detail.LatencyMs < 0 {
+		detail.LatencyMs = 0
+	}
+	detail.RequestType = normalizeRequestType(detail.RequestType)
+	if detail.FirstTokenMs < 0 {
+		detail.FirstTokenMs = 0
+	}
+	detail.UserAgent = logging.NormalizeUserAgent(detail.UserAgent)
+	detail.ReasoningEffort = strings.TrimSpace(strings.ToLower(detail.ReasoningEffort))
+	if detail.Timestamp.IsZero() {
+		detail.Timestamp = time.Now()
+	}
+	return detail
+}
+
+func mergeRequestDetailMetadata(existing *RequestDetail, incoming RequestDetail) bool {
+	if existing == nil {
+		return false
+	}
+	changed := false
+	if normalizeRequestType(existing.RequestType) == "" && incoming.RequestType != "" {
+		existing.RequestType = incoming.RequestType
+		changed = true
+	}
+	if existing.FirstTokenMs <= 0 && incoming.FirstTokenMs > 0 {
+		existing.FirstTokenMs = incoming.FirstTokenMs
+		changed = true
+	}
+	if strings.TrimSpace(existing.UserAgent) == "" && incoming.UserAgent != "" {
+		existing.UserAgent = incoming.UserAgent
+		changed = true
+	}
+	return changed
 }
 
 func (s *RequestStatistics) recordImported(apiName, modelName string, stats *apiStats, detail RequestDetail) {
@@ -732,6 +834,116 @@ func resolveReasoningEffort(ctx context.Context) string {
 		return ""
 	}
 	return strings.TrimSpace(text)
+}
+
+// ClassifyRequestType 根据下游请求/响应信号归类 usage 明细的交互模式。
+// 这里优先识别 websocket，其次识别流式响应，最后回落到同步请求。
+func ClassifyRequestType(req *http.Request, requestBody []byte, responseHeaders http.Header) string {
+	if isWebsocketRequest(req) {
+		return RequestTypeWebsocket
+	}
+	if isStreamingResponse(responseHeaders) {
+		return RequestTypeStream
+	}
+	if bytes.Contains(requestBody, []byte(`"stream": true`)) ||
+		bytes.Contains(requestBody, []byte(`"stream":true`)) {
+		return RequestTypeStream
+	}
+	if req == nil && len(responseHeaders) == 0 && len(requestBody) == 0 {
+		return ""
+	}
+	return RequestTypeSync
+}
+
+func resolveRequestType(ctx context.Context) string {
+	if ctx == nil {
+		return ""
+	}
+	ginCtx, ok := ctx.Value("gin").(*gin.Context)
+	if !ok || ginCtx == nil {
+		return ""
+	}
+	if value, exists := ginCtx.Get(RequestTypeContextKey); exists {
+		if text, ok := value.(string); ok {
+			if normalized := normalizeRequestType(text); normalized != "" {
+				return normalized
+			}
+		}
+	}
+	return ClassifyRequestType(ginCtx.Request, nil, writerHeaders(ginCtx))
+}
+
+// resolveFirstTokenMs 统一复用首次 API 响应进入 Gin 上下文的时间戳，
+// 让 management usage 可以稳定展示 stream/websocket 的首 token 时间。
+func resolveFirstTokenMs(ctx context.Context, requestedAt time.Time, requestType string) int64 {
+	if requestType != RequestTypeStream && requestType != RequestTypeWebsocket {
+		return 0
+	}
+	if ctx == nil || requestedAt.IsZero() {
+		return 0
+	}
+	ginCtx, ok := ctx.Value("gin").(*gin.Context)
+	if !ok || ginCtx == nil {
+		return 0
+	}
+	value, exists := ginCtx.Get("API_RESPONSE_TIMESTAMP")
+	if !exists {
+		return 0
+	}
+	timestamp, ok := value.(time.Time)
+	if !ok || timestamp.IsZero() {
+		return 0
+	}
+	latency := timestamp.Sub(requestedAt)
+	if latency <= 0 {
+		return 0
+	}
+	return latency.Milliseconds()
+}
+
+func resolveUserAgent(ctx context.Context) string {
+	if ctx == nil {
+		return ""
+	}
+	ginCtx, ok := ctx.Value("gin").(*gin.Context)
+	if !ok || ginCtx == nil || ginCtx.Request == nil {
+		return ""
+	}
+	return logging.NormalizeUserAgent(ginCtx.Request.UserAgent())
+}
+
+func normalizeRequestType(requestType string) string {
+	switch strings.ToLower(strings.TrimSpace(requestType)) {
+	case RequestTypeSync:
+		return RequestTypeSync
+	case RequestTypeStream:
+		return RequestTypeStream
+	case RequestTypeWebsocket:
+		return RequestTypeWebsocket
+	default:
+		return ""
+	}
+}
+
+func isStreamingResponse(headers http.Header) bool {
+	if len(headers) == 0 {
+		return false
+	}
+	return strings.Contains(strings.ToLower(strings.TrimSpace(headers.Get("Content-Type"))), "text/event-stream")
+}
+
+func isWebsocketRequest(req *http.Request) bool {
+	if req == nil {
+		return false
+	}
+	return strings.EqualFold(strings.TrimSpace(req.Header.Get("Upgrade")), "websocket")
+}
+
+func writerHeaders(ginCtx *gin.Context) http.Header {
+	if ginCtx == nil || ginCtx.Writer == nil {
+		return nil
+	}
+	return ginCtx.Writer.Header()
 }
 
 func normaliseDetail(detail coreusage.Detail) TokenStats {

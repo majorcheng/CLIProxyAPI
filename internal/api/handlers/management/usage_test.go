@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -20,16 +21,24 @@ func TestGetUsageStatistics_IncludesClientIP(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
 	stats := internalusage.NewRequestStatistics()
-	recordManagementUsageWithRemoteAddr(t, stats, "198.51.100.7:1234", coreusage.Record{
-		APIKey:      "test-key",
-		Model:       "gpt-5.4",
-		RequestedAt: time.Date(2026, 3, 27, 8, 0, 0, 0, time.UTC),
-		Detail: coreusage.Detail{
-			InputTokens:  11,
-			OutputTokens: 22,
-			TotalTokens:  33,
+	requestedAt := time.Date(2026, 3, 27, 8, 0, 0, 0, time.UTC)
+	recordManagementUsageWithOptions(t, stats, managementUsageRecordOptions{
+		RemoteAddr:      "198.51.100.7:1234",
+		RequestType:     internalusage.RequestTypeStream,
+		UserAgent:       "  test-client/1.0 \n " + strings.Repeat("x", 200),
+		FirstResponseAt: requestedAt.Add(420 * time.Millisecond),
+		ReasoningEffort: "xhigh",
+		Record: coreusage.Record{
+			APIKey:      "test-key",
+			Model:       "gpt-5.4",
+			RequestedAt: requestedAt,
+			Detail: coreusage.Detail{
+				InputTokens:  11,
+				OutputTokens: 22,
+				TotalTokens:  33,
+			},
 		},
-	}, "xhigh")
+	})
 
 	h := NewHandlerWithoutConfigFilePath(&config.Config{}, nil)
 	h.SetUsageStatistics(stats)
@@ -62,6 +71,18 @@ func TestGetUsageStatistics_IncludesClientIP(t *testing.T) {
 	if details[0].ReasoningEffort != "xhigh" {
 		t.Fatalf("reasoning_effort = %q, want %q", details[0].ReasoningEffort, "xhigh")
 	}
+	if details[0].RequestType != internalusage.RequestTypeStream {
+		t.Fatalf("request_type = %q, want %q", details[0].RequestType, internalusage.RequestTypeStream)
+	}
+	if details[0].FirstTokenMs != 420 {
+		t.Fatalf("first_token_ms = %d, want 420", details[0].FirstTokenMs)
+	}
+	if strings.Contains(details[0].UserAgent, "\n") {
+		t.Fatalf("user_agent should be single-line, got %q", details[0].UserAgent)
+	}
+	if len([]rune(details[0].UserAgent)) != 160 {
+		t.Fatalf("user_agent rune length = %d, want 160", len([]rune(details[0].UserAgent)))
+	}
 	if payload.FailedRequests != 0 {
 		t.Fatalf("failed_requests = %d, want 0", payload.FailedRequests)
 	}
@@ -72,16 +93,24 @@ func TestExportImportUsageStatistics_PreservesClientIP(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
 	sourceStats := internalusage.NewRequestStatistics()
-	recordManagementUsageWithRemoteAddr(t, sourceStats, "[2001:db8::1]:443", coreusage.Record{
-		APIKey:      "test-key",
-		Model:       "gpt-5.4",
-		RequestedAt: time.Date(2026, 3, 27, 9, 0, 0, 0, time.UTC),
-		Detail: coreusage.Detail{
-			InputTokens:  5,
-			OutputTokens: 8,
-			TotalTokens:  13,
+	requestedAt := time.Date(2026, 3, 27, 9, 0, 0, 0, time.UTC)
+	recordManagementUsageWithOptions(t, sourceStats, managementUsageRecordOptions{
+		RemoteAddr:      "[2001:db8::1]:443",
+		RequestType:     internalusage.RequestTypeWebsocket,
+		UserAgent:       "codex-cli/0.118.0",
+		FirstResponseAt: requestedAt.Add(125 * time.Millisecond),
+		ReasoningEffort: "high",
+		Record: coreusage.Record{
+			APIKey:      "test-key",
+			Model:       "gpt-5.4",
+			RequestedAt: requestedAt,
+			Detail: coreusage.Detail{
+				InputTokens:  5,
+				OutputTokens: 8,
+				TotalTokens:  13,
+			},
 		},
-	}, "high")
+	})
 
 	exportHandler := NewHandlerWithoutConfigFilePath(&config.Config{}, nil)
 	exportHandler.SetUsageStatistics(sourceStats)
@@ -120,6 +149,15 @@ func TestExportImportUsageStatistics_PreservesClientIP(t *testing.T) {
 	}
 	if details[0].ReasoningEffort != "high" {
 		t.Fatalf("reasoning_effort = %q, want %q", details[0].ReasoningEffort, "high")
+	}
+	if details[0].RequestType != internalusage.RequestTypeWebsocket {
+		t.Fatalf("request_type = %q, want %q", details[0].RequestType, internalusage.RequestTypeWebsocket)
+	}
+	if details[0].FirstTokenMs != 125 {
+		t.Fatalf("first_token_ms = %d, want 125", details[0].FirstTokenMs)
+	}
+	if details[0].UserAgent != "codex-cli/0.118.0" {
+		t.Fatalf("user_agent = %q, want %q", details[0].UserAgent, "codex-cli/0.118.0")
 	}
 }
 
@@ -184,18 +222,36 @@ func TestImportUsageStatistics_AppliesRetentionDays(t *testing.T) {
 	}
 }
 
-func recordManagementUsageWithRemoteAddr(t *testing.T, stats *internalusage.RequestStatistics, remoteAddr string, record coreusage.Record, reasoningEffort ...string) {
+type managementUsageRecordOptions struct {
+	RemoteAddr      string
+	RequestType     string
+	UserAgent       string
+	FirstResponseAt time.Time
+	ReasoningEffort string
+	Record          coreusage.Record
+}
+
+func recordManagementUsageWithOptions(t *testing.T, stats *internalusage.RequestStatistics, options managementUsageRecordOptions) {
 	t.Helper()
 
 	recorder := httptest.NewRecorder()
 	ginCtx, _ := gin.CreateTestContext(recorder)
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
-	req.RemoteAddr = remoteAddr
+	req.RemoteAddr = options.RemoteAddr
+	if strings.TrimSpace(options.UserAgent) != "" {
+		req.Header.Set("User-Agent", options.UserAgent)
+	}
 	ginCtx.Request = req
-	if len(reasoningEffort) > 0 {
-		ginCtx.Set(internalusage.RequestReasoningEffortContextKey, reasoningEffort[0])
+	if strings.TrimSpace(options.ReasoningEffort) != "" {
+		ginCtx.Set(internalusage.RequestReasoningEffortContextKey, options.ReasoningEffort)
+	}
+	if strings.TrimSpace(options.RequestType) != "" {
+		ginCtx.Set(internalusage.RequestTypeContextKey, options.RequestType)
+	}
+	if !options.FirstResponseAt.IsZero() {
+		ginCtx.Set("API_RESPONSE_TIMESTAMP", options.FirstResponseAt)
 	}
 
 	ctx := context.WithValue(context.Background(), "gin", ginCtx)
-	stats.Record(ctx, record)
+	stats.Record(ctx, options.Record)
 }

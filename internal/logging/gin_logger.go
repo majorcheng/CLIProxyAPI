@@ -30,6 +30,22 @@ const skipGinLogKey = "__gin_skip_request_logging__"
 
 const maxLoggedUserAgentRunes = 160
 
+// NormalizeUserAgent 将客户端 UA 收口为单行、限长的稳定摘要。
+// 该函数同时服务 main log 与 usage 快照，保证两处看到的 UA 口径一致。
+func NormalizeUserAgent(userAgent string) string {
+	normalized := strings.Join(strings.Fields(strings.TrimSpace(userAgent)), " ")
+	if normalized == "" {
+		return ""
+	}
+
+	runes := []rune(normalized)
+	if len(runes) <= maxLoggedUserAgentRunes {
+		return normalized
+	}
+
+	return string(runes[:maxLoggedUserAgentRunes-3]) + "..."
+}
+
 // GinLogrusLogger returns a Gin middleware handler that logs HTTP requests and responses
 // using logrus. It captures request details including method, path, status code, latency,
 // client IP, and any error messages. Request ID is only added for AI API requests.
@@ -105,17 +121,11 @@ func summarizeUserAgentForMainLog(req *http.Request) string {
 		return "-"
 	}
 
-	userAgent := strings.Join(strings.Fields(strings.TrimSpace(req.UserAgent())), " ")
+	userAgent := NormalizeUserAgent(req.UserAgent())
 	if userAgent == "" {
 		return "-"
 	}
-
-	runes := []rune(userAgent)
-	if len(runes) <= maxLoggedUserAgentRunes {
-		return userAgent
-	}
-
-	return string(runes[:maxLoggedUserAgentRunes-3]) + "..."
+	return userAgent
 }
 
 // isAIAPIPath checks if the given path is an AI API endpoint that should have request ID tracking.

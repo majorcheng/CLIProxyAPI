@@ -12,6 +12,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/logging"
+	internalusage "github.com/router-for-me/CLIProxyAPI/v6/internal/usage"
 )
 
 const requestBodyOverrideContextKey = "REQUEST_BODY_OVERRIDE"
@@ -37,6 +38,7 @@ type ResponseWriterWrapper struct {
 	streamDone          chan struct{}              // streamDone signals when the streaming goroutine completes.
 	logger              logging.RequestLogger      // logger is the instance of the request logger service.
 	requestInfo         *RequestInfo               // requestInfo holds the details of the original request.
+	ginCtx              *gin.Context               // ginCtx carries per-request metadata shared with usage tracking.
 	statusCode          int                        // statusCode stores the HTTP status code of the response.
 	headers             map[string][]string        // headers stores the response headers.
 	logOnErrorOnly      bool                       // logOnErrorOnly enables logging only when an error response is detected.
@@ -53,12 +55,13 @@ type ResponseWriterWrapper struct {
 //
 // Returns:
 //   - A pointer to a new ResponseWriterWrapper.
-func NewResponseWriterWrapper(w gin.ResponseWriter, logger logging.RequestLogger, requestInfo *RequestInfo) *ResponseWriterWrapper {
+func NewResponseWriterWrapper(w gin.ResponseWriter, logger logging.RequestLogger, requestInfo *RequestInfo, ginCtx *gin.Context) *ResponseWriterWrapper {
 	return &ResponseWriterWrapper{
 		ResponseWriter: w,
 		body:           &bytes.Buffer{},
 		logger:         logger,
 		requestInfo:    requestInfo,
+		ginCtx:         ginCtx,
 		headers:        make(map[string][]string),
 	}
 }
@@ -155,6 +158,9 @@ func (w *ResponseWriterWrapper) WriteHeader(statusCode int) {
 	// Detect streaming based on Content-Type
 	contentType := w.ResponseWriter.Header().Get("Content-Type")
 	w.isStreaming = w.detectStreaming(contentType)
+	if w.isStreaming {
+		w.markStreamRequestType()
+	}
 
 	// If streaming, initialize streaming log writer
 	if w.isStreaming && w.logger.IsEnabled() {
@@ -181,6 +187,20 @@ func (w *ResponseWriterWrapper) WriteHeader(statusCode int) {
 
 	// Call original WriteHeader
 	w.ResponseWriter.WriteHeader(statusCode)
+}
+
+// markStreamRequestType 在真正进入 SSE 响应时回写 request_type，
+// 这样即使请求体没有被预读，也能让 usage 看到稳定的 stream 分类。
+func (w *ResponseWriterWrapper) markStreamRequestType() {
+	if w == nil || w.ginCtx == nil {
+		return
+	}
+	if raw, exists := w.ginCtx.Get(internalusage.RequestTypeContextKey); exists {
+		if requestType, ok := raw.(string); ok && requestType == internalusage.RequestTypeWebsocket {
+			return
+		}
+	}
+	w.ginCtx.Set(internalusage.RequestTypeContextKey, internalusage.RequestTypeStream)
 }
 
 // ensureHeadersCaptured is a helper function to make sure response headers are captured.

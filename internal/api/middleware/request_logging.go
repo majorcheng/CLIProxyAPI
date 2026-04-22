@@ -12,6 +12,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/logging"
+	internalusage "github.com/router-for-me/CLIProxyAPI/v6/internal/usage"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 )
 
@@ -49,9 +50,10 @@ func RequestLoggingMiddleware(logger logging.RequestLogger) gin.HandlerFunc {
 			c.Next()
 			return
 		}
+		c.Set(internalusage.RequestTypeContextKey, internalusage.ClassifyRequestType(c.Request, requestInfo.Body, nil))
 
 		// Create response writer wrapper
-		wrapper := NewResponseWriterWrapper(c.Writer, logger, requestInfo)
+		wrapper := NewResponseWriterWrapper(c.Writer, logger, requestInfo, c)
 		if !loggerEnabled {
 			wrapper.logOnErrorOnly = true
 		}

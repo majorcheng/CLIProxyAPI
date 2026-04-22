@@ -917,3 +917,61 @@
 
 - `sdk/cliproxy/auth/session_affinity_test.go::TestManagerExecute_SessionAffinityRebindsToSuccessfulFallbackAuth` 改用唯一 auth ID：`session-affinity-rebind-a/b`。
 - `sdk/cliproxy/auth/scheduler_test.go::TestManager_SchedulerTracksMarkResultCooldownAndRecovery` 改用唯一 auth ID：`scheduler-cooldown-recovery-a/b`。
+
+## 2026-04-22 reviewer：management usage 新字段回归修复
+
+### Observations
+
+- reviewer 指出 `first_token_ms` 只依赖 Gin context 的 `API_RESPONSE_TIMESTAMP`。
+- 现场代码确认：`sdk/api/handlers/stream_forwarder.go::BaseAPIHandler.ForwardStream` 在 `writeChunk(chunk)` 前后都没有设置 `API_RESPONSE_TIMESTAMP`。
+- 现场代码确认：`sdk/api/handlers/handlers.go::GetContextWithCancel` 里的 `appendAPIResponse(c, payload)` 受 `h.Cfg.RequestLog` 条件影响；默认 `request-log=false` 时，主流 SSE 不会通过这条路径写入时间戳。
+- 现场代码确认：`internal/usage/logger_plugin.go::MergeSnapshot` 对重复明细直接 `Skipped++`，当前不会把新快照里的 `request_type`、`first_token_ms`、`user_agent` 回填到旧明细。
+
+### Hypotheses
+
+#### H1: 主流 SSE 首包时间缺失来自 `ForwardStream` 没有在首个数据 chunk 写入 `API_RESPONSE_TIMESTAMP`（ROOT HYPOTHESIS）
+- Supports: OpenAI / Responses / Claude / Gemini 的 SSE handler 都调用 `BaseAPIHandler.ForwardStream`；该函数当前只写 chunk、flush、keepalive、terminal error，没有写时间戳。
+- Conflicts: websocket 路径已有 `markAPIResponseTimestamp`，因此该问题集中在 SSE 转发主链。
+- Test: 给 `stream_forwarder_test.go` 增加真实 `ForwardStream` 用例，断言第一条数据 chunk 后 Gin context 出现 `API_RESPONSE_TIMESTAMP`。
+
+#### H2: `first_token_ms=0` 来自 usage 记录发生在首包之前
+- Supports: usage 发布点位于 executor 流结束或 usage 事件解析处，存在先后顺序风险。
+- Conflicts: reviewer 指向的主因是上下文时间戳缺失；只要 `ForwardStream` 首 chunk 写入时间戳，流结束后的 usage 发布可读取到该值。
+- Test: 补 `ForwardStream` 时间戳测试后，再跑 usage 层 `RequestStatistics` 用例确认读取逻辑保持有效。
+
+#### H3: 历史快照补齐失败来自 `dedupKey` 排除了新增观测字段且重复命中没有 merge 元数据
+- Supports: `dedupKey` 只包含时间戳、source、client_ip、auth_index、failed 与 token；`MergeSnapshot` 看到重复 key 后直接跳过。
+- Conflicts: 排除观测字段是保留导入去重稳定性的设计，修复点应落在重复命中后的元数据补齐，而不是扩大 dedup key。
+- Test: 增加先导入旧明细、再导入同 key 新明细的测试，断言现有 detail 补齐三项元数据且总请求数保持不变。
+
+### Experiments
+
+- 代码阅读确认 H1：`ForwardStream` 数据分支当前只有 `writeChunk(chunk)`、`pendingBytes += len(chunk)`、`flushPending(false)`，没有 `API_RESPONSE_TIMESTAMP` 写入点。
+- 代码阅读确认 H3：`MergeSnapshot` 的 `seen` 只有 `map[string]struct{}`，重复时没有拿到现有 detail 引用，因此无法回填新增观测字段。
+
+### Root Cause
+
+- SSE 主链没有在 `ForwardStream` 首个真实数据 chunk 处写入 `API_RESPONSE_TIMESTAMP`，导致默认 `request-log=false` 时 `resolveFirstTokenMs` 读取不到首包时间。
+- `MergeSnapshot` 的重复明细处理只做跳过计数，没有对旧快照空元数据执行补齐。
+
+### Fix Plan
+
+- 在 `sdk/api/handlers` 增加共享 `markAPIResponseTimestamp` helper，`appendAPIResponse` 与 `ForwardStream` 都复用它；`ForwardStream` 在首个非空数据 chunk 写入时间戳。
+- 把 `MergeSnapshot` 的 seen map 改为指向现有 detail 的引用，重复命中时仅补齐空的 `request_type`、`first_token_ms`、`user_agent`。
+- 增加 `ForwardStream` 首包时间测试与 `MergeSnapshot` 元数据回填测试。
+
+### Fix Results
+
+- 在 `sdk/api/handlers/handlers.go::markAPIResponseTimestamp` 抽出共享时间戳 helper，并让 `appendAPIResponse` 复用它。
+- 在 `sdk/api/handlers/stream_forwarder.go::BaseAPIHandler.ForwardStream` 的首个非空数据 chunk 写入前调用 `markAPIResponseTimestamp(c)`。
+- 在 `internal/usage/logger_plugin.go::MergeSnapshot` 中把 `seen` 改为现有 detail 引用；重复命中时通过 `mergeRequestDetailMetadata` 仅补齐空的 `request_type`、`first_token_ms`、`user_agent`。
+- 新增 `sdk/api/handlers/stream_forwarder_test.go::TestForwardStreamMarksAPIResponseTimestampOnFirstChunk` 覆盖默认 SSE 转发首包时间戳。
+- 新增 `internal/usage/logger_plugin_test.go::TestRequestStatisticsMergeSnapshotBackfillsDuplicateUsageMetadata` 覆盖历史快照元数据回填。
+
+### Verification
+
+- `timeout 60s go test ./sdk/api/handlers -run 'ForwardStream|APIResponse' -count=1` 通过。
+- `timeout 60s go test ./internal/usage -run 'MergeSnapshot|RequestStatisticsRecordIncludesStreamMetadata|ClassifyRequestType' -count=1` 通过。
+- `timeout 60s go test ./internal/usage ./internal/api/handlers/management ./internal/logging ./internal/api/middleware ./sdk/api/handlers -timeout 60s` 通过。
+- `timeout 60s go test ./... -run '^$'` 通过。
+- `git diff --check` 通过。

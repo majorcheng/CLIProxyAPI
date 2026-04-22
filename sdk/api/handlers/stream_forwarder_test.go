@@ -62,6 +62,41 @@ func TestForwardStreamFlushesDoneAndBatchesChunks(t *testing.T) {
 	}
 }
 
+func TestForwardStreamMarksAPIResponseTimestampOnFirstChunk(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest("GET", "/stream", nil)
+
+	data := make(chan []byte, 1)
+	data <- []byte("one")
+	close(data)
+
+	errs := make(chan *interfaces.ErrorMessage)
+	close(errs)
+
+	before := time.Now()
+	handler := &BaseAPIHandler{}
+	handler.ForwardStream(c, &countingFlusher{}, func(error) {}, data, errs, StreamForwardOptions{
+		WriteChunk: func(chunk []byte) {
+			_, _ = c.Writer.Write(chunk)
+		},
+	})
+
+	rawTimestamp, exists := c.Get(apiResponseTimestampKey)
+	if !exists {
+		t.Fatalf("%s missing after first stream chunk", apiResponseTimestampKey)
+	}
+	timestamp, ok := rawTimestamp.(time.Time)
+	if !ok {
+		t.Fatalf("%s type = %T, want time.Time", apiResponseTimestampKey, rawTimestamp)
+	}
+	if timestamp.Before(before) {
+		t.Fatalf("%s = %s, want >= %s", apiResponseTimestampKey, timestamp, before)
+	}
+}
+
 func TestForwardStreamFlushesKeepAliveAndTerminalError(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 

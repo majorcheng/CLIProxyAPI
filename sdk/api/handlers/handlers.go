@@ -53,6 +53,7 @@ const idempotencyKeyMetadataKey = "idempotency_key"
 const (
 	defaultStreamingKeepAliveSeconds = 0
 	defaultStreamingBootstrapRetries = 0
+	apiResponseTimestampKey          = "API_RESPONSE_TIMESTAMP"
 )
 
 type pinnedAuthContextKey struct{}
@@ -586,10 +587,7 @@ func appendAPIResponse(c *gin.Context, data []byte) {
 		return
 	}
 
-	// Capture timestamp on first API response
-	if _, exists := c.Get("API_RESPONSE_TIMESTAMP"); !exists {
-		c.Set("API_RESPONSE_TIMESTAMP", time.Now())
-	}
+	markAPIResponseTimestamp(c)
 
 	if existing, exists := c.Get("API_RESPONSE"); exists {
 		if existingBytes, ok := existing.([]byte); ok && len(existingBytes) > 0 {
@@ -605,6 +603,18 @@ func appendAPIResponse(c *gin.Context, data []byte) {
 	}
 
 	c.Set("API_RESPONSE", bytes.Clone(data))
+}
+
+// markAPIResponseTimestamp 记录首次 API 响应进入 Gin 上下文的时间，
+// usage 的首 token 耗时和 request log 的响应时间都复用这个稳定锚点。
+func markAPIResponseTimestamp(c *gin.Context) {
+	if c == nil {
+		return
+	}
+	if _, exists := c.Get(apiResponseTimestampKey); exists {
+		return
+	}
+	c.Set(apiResponseTimestampKey, time.Now())
 }
 
 // ExecuteWithAuthManager executes a non-streaming request via the core auth manager.

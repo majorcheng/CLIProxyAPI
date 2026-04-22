@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -148,6 +149,133 @@ func TestRequestStatisticsRecordIncludesReasoningEffort(t *testing.T) {
 	}
 }
 
+func TestRequestStatisticsRecordIncludesStreamMetadata(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	stats := NewRequestStatistics()
+	recorder := httptest.NewRecorder()
+	ginCtx, _ := gin.CreateTestContext(recorder)
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	req.Header.Set("User-Agent", "  test-client/1.0 \n "+strings.Repeat("x", 200))
+	ginCtx.Request = req
+	ginCtx.Set(RequestTypeContextKey, RequestTypeStream)
+	requestedAt := time.Date(2026, 3, 20, 12, 0, 0, 0, time.UTC)
+	ginCtx.Set("API_RESPONSE_TIMESTAMP", requestedAt.Add(350*time.Millisecond))
+
+	ctx := context.WithValue(context.Background(), "gin", ginCtx)
+	stats.Record(ctx, coreusage.Record{
+		APIKey:      "test-key",
+		Model:       "gpt-5.4",
+		RequestedAt: requestedAt,
+		Detail: coreusage.Detail{
+			InputTokens:  10,
+			OutputTokens: 20,
+			TotalTokens:  30,
+		},
+	})
+
+	details := stats.Snapshot().APIs["test-key"].Models["gpt-5.4"].Details
+	if len(details) != 1 {
+		t.Fatalf("details len = %d, want 1", len(details))
+	}
+	if details[0].RequestType != RequestTypeStream {
+		t.Fatalf("request_type = %q, want %q", details[0].RequestType, RequestTypeStream)
+	}
+	if details[0].FirstTokenMs != 350 {
+		t.Fatalf("first_token_ms = %d, want 350", details[0].FirstTokenMs)
+	}
+	if strings.Contains(details[0].UserAgent, "\n") {
+		t.Fatalf("user_agent should be single-line, got %q", details[0].UserAgent)
+	}
+	if len([]rune(details[0].UserAgent)) != 160 {
+		t.Fatalf("user_agent rune length = %d, want 160", len([]rune(details[0].UserAgent)))
+	}
+}
+
+func TestRequestStatisticsRecordDerivesWebsocketTypeFromRequest(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	stats := NewRequestStatistics()
+	recorder := httptest.NewRecorder()
+	ginCtx, _ := gin.CreateTestContext(recorder)
+	req := httptest.NewRequest(http.MethodGet, "/v1/responses", nil)
+	req.Header.Set("Upgrade", "websocket")
+	req.Header.Set("User-Agent", "codex-cli/0.1")
+	ginCtx.Request = req
+	requestedAt := time.Date(2026, 3, 20, 12, 0, 0, 0, time.UTC)
+	ginCtx.Set("API_RESPONSE_TIMESTAMP", requestedAt.Add(120*time.Millisecond))
+
+	ctx := context.WithValue(context.Background(), "gin", ginCtx)
+	stats.Record(ctx, coreusage.Record{
+		APIKey:      "test-key",
+		Model:       "gpt-5.4",
+		RequestedAt: requestedAt,
+		Detail: coreusage.Detail{
+			InputTokens:  10,
+			OutputTokens: 20,
+			TotalTokens:  30,
+		},
+	})
+
+	details := stats.Snapshot().APIs["test-key"].Models["gpt-5.4"].Details
+	if len(details) != 1 {
+		t.Fatalf("details len = %d, want 1", len(details))
+	}
+	if details[0].RequestType != RequestTypeWebsocket {
+		t.Fatalf("request_type = %q, want %q", details[0].RequestType, RequestTypeWebsocket)
+	}
+	if details[0].FirstTokenMs != 120 {
+		t.Fatalf("first_token_ms = %d, want 120", details[0].FirstTokenMs)
+	}
+	if details[0].UserAgent != "codex-cli/0.1" {
+		t.Fatalf("user_agent = %q, want %q", details[0].UserAgent, "codex-cli/0.1")
+	}
+}
+
+func TestClassifyRequestType(t *testing.T) {
+	tests := []struct {
+		name            string
+		req             *http.Request
+		requestBody     []byte
+		responseHeaders http.Header
+		want            string
+	}{
+		{
+			name: "websocket upgrade",
+			req: &http.Request{
+				Header: http.Header{"Upgrade": []string{"websocket"}},
+			},
+			want: RequestTypeWebsocket,
+		},
+		{
+			name:            "sse response",
+			responseHeaders: http.Header{"Content-Type": []string{"text/event-stream; charset=utf-8"}},
+			want:            RequestTypeStream,
+		},
+		{
+			name:        "stream request body",
+			requestBody: []byte(`{"stream":true}`),
+			want:        RequestTypeStream,
+		},
+		{
+			name: "sync default",
+			req: &http.Request{
+				Method: http.MethodPost,
+				Header: http.Header{},
+			},
+			want: RequestTypeSync,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := ClassifyRequestType(tt.req, tt.requestBody, tt.responseHeaders); got != tt.want {
+				t.Fatalf("ClassifyRequestType() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestRequestStatisticsMergeSnapshotDedupIgnoresLatency(t *testing.T) {
 	stats := NewRequestStatistics()
 	timestamp := time.Date(2026, 3, 20, 12, 0, 0, 0, time.UTC)
@@ -265,6 +393,119 @@ func TestRequestStatisticsMergeSnapshotKeepsDistinctClientIPs(t *testing.T) {
 	}
 	if !seenIPs["198.51.100.1"] || !seenIPs["198.51.100.2"] {
 		t.Fatalf("details client_ip set = %#v, want both client IPs preserved", seenIPs)
+	}
+}
+
+func TestRequestStatisticsMergeSnapshotNormalizesUsageMetadata(t *testing.T) {
+	stats := NewRequestStatistics()
+	timestamp := time.Date(2026, 3, 20, 12, 0, 0, 0, time.UTC)
+	result := stats.MergeSnapshot(StatisticsSnapshot{
+		APIs: map[string]APISnapshot{
+			"test-key": {
+				Models: map[string]ModelSnapshot{
+					"gpt-5.4": {
+						Details: []RequestDetail{{
+							Timestamp:    timestamp,
+							RequestType:  " STREAM ",
+							FirstTokenMs: -5,
+							UserAgent:    "  test-client/1.0 \n " + strings.Repeat("x", 200),
+							Source:       "user@example.com",
+							AuthIndex:    "0",
+							Tokens: TokenStats{
+								InputTokens:  10,
+								OutputTokens: 20,
+								TotalTokens:  30,
+							},
+						}},
+					},
+				},
+			},
+		},
+	})
+	if result.Added != 1 || result.Skipped != 0 {
+		t.Fatalf("merge = %+v, want added=1 skipped=0", result)
+	}
+
+	details := stats.Snapshot().APIs["test-key"].Models["gpt-5.4"].Details
+	if len(details) != 1 {
+		t.Fatalf("details len = %d, want 1", len(details))
+	}
+	if details[0].RequestType != RequestTypeStream {
+		t.Fatalf("request_type = %q, want %q", details[0].RequestType, RequestTypeStream)
+	}
+	if details[0].FirstTokenMs != 0 {
+		t.Fatalf("first_token_ms = %d, want 0", details[0].FirstTokenMs)
+	}
+	if strings.Contains(details[0].UserAgent, "\n") {
+		t.Fatalf("user_agent should be single-line, got %q", details[0].UserAgent)
+	}
+	if len([]rune(details[0].UserAgent)) != 160 {
+		t.Fatalf("user_agent rune length = %d, want 160", len([]rune(details[0].UserAgent)))
+	}
+}
+
+func TestRequestStatisticsMergeSnapshotBackfillsDuplicateUsageMetadata(t *testing.T) {
+	stats := NewRequestStatistics()
+	timestamp := time.Date(2026, 3, 20, 12, 0, 0, 0, time.UTC)
+	baseDetail := RequestDetail{
+		Timestamp: timestamp,
+		Source:    "user@example.com",
+		ClientIP:  "198.51.100.1",
+		AuthIndex: "0",
+		Tokens: TokenStats{
+			InputTokens:  10,
+			OutputTokens: 20,
+			TotalTokens:  30,
+		},
+	}
+	first := StatisticsSnapshot{
+		APIs: map[string]APISnapshot{
+			"test-key": {
+				Models: map[string]ModelSnapshot{
+					"gpt-5.4": {Details: []RequestDetail{baseDetail}},
+				},
+			},
+		},
+	}
+	secondDetail := baseDetail
+	secondDetail.RequestType = RequestTypeStream
+	secondDetail.FirstTokenMs = 333
+	secondDetail.UserAgent = "test-client/1.0"
+	second := StatisticsSnapshot{
+		APIs: map[string]APISnapshot{
+			"test-key": {
+				Models: map[string]ModelSnapshot{
+					"gpt-5.4": {Details: []RequestDetail{secondDetail}},
+				},
+			},
+		},
+	}
+
+	result := stats.MergeSnapshot(first)
+	if result.Added != 1 || result.Skipped != 0 {
+		t.Fatalf("first merge = %+v, want added=1 skipped=0", result)
+	}
+	result = stats.MergeSnapshot(second)
+	if result.Added != 0 || result.Skipped != 1 {
+		t.Fatalf("second merge = %+v, want added=0 skipped=1", result)
+	}
+
+	snapshot := stats.Snapshot()
+	if snapshot.TotalRequests != 1 {
+		t.Fatalf("snapshot.TotalRequests = %d, want 1", snapshot.TotalRequests)
+	}
+	details := snapshot.APIs["test-key"].Models["gpt-5.4"].Details
+	if len(details) != 1 {
+		t.Fatalf("details len = %d, want 1", len(details))
+	}
+	if details[0].RequestType != RequestTypeStream {
+		t.Fatalf("request_type = %q, want %q", details[0].RequestType, RequestTypeStream)
+	}
+	if details[0].FirstTokenMs != 333 {
+		t.Fatalf("first_token_ms = %d, want 333", details[0].FirstTokenMs)
+	}
+	if details[0].UserAgent != "test-client/1.0" {
+		t.Fatalf("user_agent = %q, want %q", details[0].UserAgent, "test-client/1.0")
 	}
 }
 

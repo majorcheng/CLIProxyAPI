@@ -117,6 +117,9 @@ func (h *BaseAPIHandler) ForwardStream(c *gin.Context, flusher http.Flusher, can
 				cancel(nil)
 				return
 			}
+			if len(chunk) > 0 {
+				markAPIResponseTimestamp(c)
+			}
 			writeChunk(chunk)
 			pendingBytes += len(chunk)
 			flushPending(false)

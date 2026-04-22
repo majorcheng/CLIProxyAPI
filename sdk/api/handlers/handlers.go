@@ -60,6 +60,15 @@ type pinnedAuthContextKey struct{}
 type selectedAuthCallbackContextKey struct{}
 type executionSessionContextKey struct{}
 
+// StreamRouteConfig 描述流式请求的“调度模型”和“执行模型”。
+// Images 等特殊链路需要按能力模型选 auth，但仍用固定主模型构造上游请求。
+type StreamRouteConfig struct {
+	ExecutionModel      string
+	SelectionModel      string
+	AllowedProviders    []string
+	AllowImageOnlyModel bool
+}
+
 // WithPinnedAuthID returns a child context that requests execution on a specific auth ID.
 func WithPinnedAuthID(ctx context.Context, authID string) context.Context {
 	authID = strings.TrimSpace(authID)
@@ -721,21 +730,62 @@ func (h *BaseAPIHandler) ExecuteCountWithAuthManager(ctx context.Context, handle
 func (h *BaseAPIHandler) ExecuteStreamWithAuthManager(ctx context.Context, handlerType, modelName string, rawJSON []byte, alt string) (<-chan []byte, http.Header, <-chan *interfaces.ErrorMessage) {
 	providers, normalizedModel, errMsg := h.getRequestDetails(modelName)
 	if errMsg != nil {
-		errChan := make(chan *interfaces.ErrorMessage, 1)
-		errChan <- errMsg
-		close(errChan)
-		return nil, nil, errChan
+		return closedStreamResult(errMsg)
 	}
+	return h.executeStreamWithResolvedRoute(ctx, handlerType, StreamRouteConfig{
+		ExecutionModel: normalizedModel,
+		SelectionModel: normalizedModel,
+	}, providers, rawJSON, alt)
+}
+
+// ExecuteStreamWithAuthManagerForRoute 允许调用方显式拆分调度模型与执行模型。
+// 典型场景是 OpenAI Images：本地按 `gpt-image-2` 校验/选 auth，但上游主模型固定为 `gpt-5.4-mini`。
+func (h *BaseAPIHandler) ExecuteStreamWithAuthManagerForRoute(ctx context.Context, handlerType string, route StreamRouteConfig, rawJSON []byte, alt string) (<-chan []byte, http.Header, <-chan *interfaces.ErrorMessage) {
+	selectionModel := strings.TrimSpace(route.SelectionModel)
+	if selectionModel == "" {
+		selectionModel = strings.TrimSpace(route.ExecutionModel)
+	}
+	if selectionModel == "" {
+		return closedStreamResult(&interfaces.ErrorMessage{
+			StatusCode: http.StatusBadRequest,
+			Error:      fmt.Errorf("model is required"),
+		})
+	}
+	providers, normalizedSelectionModel, errMsg := h.getRequestDetailsWithOptions(selectionModel, route.AllowImageOnlyModel)
+	if errMsg != nil {
+		return closedStreamResult(errMsg)
+	}
+	providers = filterAllowedProviders(providers, route.AllowedProviders)
+	if len(providers) == 0 {
+		return closedStreamResult(&interfaces.ErrorMessage{
+			StatusCode: http.StatusBadGateway,
+			Error:      fmt.Errorf("model %s is not available on required providers", normalizedSelectionModel),
+		})
+	}
+	executionModel := strings.TrimSpace(route.ExecutionModel)
+	if executionModel == "" {
+		executionModel = normalizedSelectionModel
+	}
+	return h.executeStreamWithResolvedRoute(ctx, handlerType, StreamRouteConfig{
+		ExecutionModel: executionModel,
+		SelectionModel: normalizedSelectionModel,
+	}, providers, rawJSON, alt)
+}
+
+func (h *BaseAPIHandler) executeStreamWithResolvedRoute(ctx context.Context, handlerType string, route StreamRouteConfig, providers []string, rawJSON []byte, alt string) (<-chan []byte, http.Header, <-chan *interfaces.ErrorMessage) {
 	primeRequestTranslationCache(handlerType, rawJSON)
 	reqMeta := requestExecutionMetadata(ctx)
 	applyClientRoutingPolicyMetadata(reqMeta, ctx, h.Cfg)
-	reqMeta[coreexecutor.RequestedModelMetadataKey] = normalizedModel
+	reqMeta[coreexecutor.RequestedModelMetadataKey] = route.ExecutionModel
+	if selectionModel := strings.TrimSpace(route.SelectionModel); selectionModel != "" && !strings.EqualFold(selectionModel, route.ExecutionModel) {
+		reqMeta[coreexecutor.SelectionModelMetadataKey] = selectionModel
+	}
 	payload := rawJSON
 	if len(payload) == 0 {
 		payload = nil
 	}
 	req := coreexecutor.Request{
-		Model:   normalizedModel,
+		Model:   route.ExecutionModel,
 		Payload: payload,
 	}
 	opts := coreexecutor.Options{
@@ -747,23 +797,8 @@ func (h *BaseAPIHandler) ExecuteStreamWithAuthManager(ctx context.Context, handl
 	opts.Metadata = reqMeta
 	streamResult, err := h.AuthManager.ExecuteStream(ctx, providers, req, opts)
 	if err != nil {
-		err = enrichAuthSelectionError(err, providers, normalizedModel)
-		errChan := make(chan *interfaces.ErrorMessage, 1)
-		status := http.StatusInternalServerError
-		if se, ok := err.(interface{ StatusCode() int }); ok && se != nil {
-			if code := se.StatusCode(); code > 0 {
-				status = code
-			}
-		}
-		var addon http.Header
-		if he, ok := err.(interface{ Headers() http.Header }); ok && he != nil {
-			if hdr := he.Headers(); hdr != nil {
-				addon = hdr.Clone()
-			}
-		}
-		errChan <- &interfaces.ErrorMessage{StatusCode: status, Error: err, Addon: addon}
-		close(errChan)
-		return nil, nil, errChan
+		err = enrichAuthSelectionError(err, providers, route.SelectionModel)
+		return closedStreamResult(streamErrorResult(err))
 	}
 	passthroughHeadersEnabled := PassthroughHeadersEnabled(h.Cfg)
 	// Capture upstream headers from the initial connection synchronously before the goroutine starts.
@@ -857,7 +892,7 @@ func (h *BaseAPIHandler) ExecuteStreamWithAuthManager(ctx context.Context, handl
 								chunks = retryResult.Chunks
 								continue outer
 							}
-							streamErr = enrichAuthSelectionError(retryErr, providers, normalizedModel)
+							streamErr = enrichAuthSelectionError(retryErr, providers, route.SelectionModel)
 						}
 					}
 
@@ -946,6 +981,10 @@ func statusFromError(err error) int {
 }
 
 func (h *BaseAPIHandler) getRequestDetails(modelName string) (providers []string, normalizedModel string, err *interfaces.ErrorMessage) {
+	return h.getRequestDetailsWithOptions(modelName, false)
+}
+
+func (h *BaseAPIHandler) getRequestDetailsWithOptions(modelName string, allowImageOnlyModel bool) (providers []string, normalizedModel string, err *interfaces.ErrorMessage) {
 	resolvedModelName := modelName
 	initialSuffix := thinking.ParseSuffix(modelName)
 	if initialSuffix.ModelName == "auto" {
@@ -961,6 +1000,14 @@ func (h *BaseAPIHandler) getRequestDetails(modelName string) (providers []string
 
 	parsed := thinking.ParseSuffix(resolvedModelName)
 	baseModel := strings.TrimSpace(parsed.ModelName)
+
+	// `gpt-image-2` 只允许走 OpenAI Images 入口，避免误投到聊天/补全文本接口。
+	if strings.EqualFold(baseModel, "gpt-image-2") && !allowImageOnlyModel {
+		return nil, "", &interfaces.ErrorMessage{
+			StatusCode: http.StatusServiceUnavailable,
+			Error:      fmt.Errorf("model %s is only supported on /v1/images/generations and /v1/images/edits", baseModel),
+		}
+	}
 
 	providers = util.GetProviderName(baseModel)
 	// Fallback: if baseModel has no provider but differs from resolvedModelName,
@@ -979,6 +1026,56 @@ func (h *BaseAPIHandler) getRequestDetails(modelName string) (providers []string
 	// The thinking suffix is preserved in the model name itself, so no
 	// metadata-based configuration passing is needed.
 	return providers, resolvedModelName, nil
+}
+
+func closedStreamResult(errMsg *interfaces.ErrorMessage) (<-chan []byte, http.Header, <-chan *interfaces.ErrorMessage) {
+	errChan := make(chan *interfaces.ErrorMessage, 1)
+	if errMsg != nil {
+		errChan <- errMsg
+	}
+	close(errChan)
+	return nil, nil, errChan
+}
+
+func streamErrorResult(err error) *interfaces.ErrorMessage {
+	if err == nil {
+		return nil
+	}
+	status := http.StatusInternalServerError
+	if se, ok := err.(interface{ StatusCode() int }); ok && se != nil {
+		if code := se.StatusCode(); code > 0 {
+			status = code
+		}
+	}
+	var addon http.Header
+	if he, ok := err.(interface{ Headers() http.Header }); ok && he != nil {
+		if hdr := he.Headers(); hdr != nil {
+			addon = hdr.Clone()
+		}
+	}
+	return &interfaces.ErrorMessage{StatusCode: status, Error: err, Addon: addon}
+}
+
+func filterAllowedProviders(providers []string, allowed []string) []string {
+	if len(allowed) == 0 {
+		return append([]string(nil), providers...)
+	}
+	allowedSet := make(map[string]struct{}, len(allowed))
+	for _, provider := range allowed {
+		name := strings.ToLower(strings.TrimSpace(provider))
+		if name == "" {
+			continue
+		}
+		allowedSet[name] = struct{}{}
+	}
+	filtered := make([]string, 0, len(providers))
+	for _, provider := range providers {
+		name := strings.ToLower(strings.TrimSpace(provider))
+		if _, ok := allowedSet[name]; ok {
+			filtered = append(filtered, provider)
+		}
+	}
+	return filtered
 }
 
 func cloneBytes(src []byte) []byte {

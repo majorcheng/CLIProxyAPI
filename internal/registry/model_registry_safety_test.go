@@ -166,10 +166,10 @@ func TestCodexPlanStaticModelsMatchSelectivePortedCatalog(t *testing.T) {
 		models  []*ModelInfo
 		wantIDs []string
 	}{
-		{name: "codex-free", models: GetCodexFreeModels(), wantIDs: []string{"gpt-5.2", "gpt-5.3-codex", "gpt-5.4", "gpt-5.4-mini"}},
-		{name: "codex-team", models: GetCodexTeamModels(), wantIDs: []string{"gpt-5.2", "gpt-5.3-codex", "gpt-5.4", "gpt-5.4-mini"}},
-		{name: "codex-plus", models: GetCodexPlusModels(), wantIDs: []string{"gpt-5.2", "gpt-5.3-codex", "gpt-5.3-codex-spark", "gpt-5.4", "gpt-5.4-mini"}},
-		{name: "codex-pro", models: GetCodexProModels(), wantIDs: []string{"gpt-5.2", "gpt-5.3-codex", "gpt-5.3-codex-spark", "gpt-5.4", "gpt-5.4-mini"}},
+		{name: "codex-free", models: GetCodexFreeModels(), wantIDs: []string{"gpt-5.2", "gpt-5.3-codex", "gpt-5.4", "gpt-5.4-mini", "gpt-image-2"}},
+		{name: "codex-team", models: GetCodexTeamModels(), wantIDs: []string{"gpt-5.2", "gpt-5.3-codex", "gpt-5.4", "gpt-5.4-mini", "gpt-image-2"}},
+		{name: "codex-plus", models: GetCodexPlusModels(), wantIDs: []string{"gpt-5.2", "gpt-5.3-codex", "gpt-5.3-codex-spark", "gpt-5.4", "gpt-5.4-mini", "gpt-image-2"}},
+		{name: "codex-pro", models: GetCodexProModels(), wantIDs: []string{"gpt-5.2", "gpt-5.3-codex", "gpt-5.3-codex-spark", "gpt-5.4", "gpt-5.4-mini", "gpt-image-2"}},
 	}
 
 	for _, tt := range tests {
@@ -178,11 +178,31 @@ func TestCodexPlanStaticModelsMatchSelectivePortedCatalog(t *testing.T) {
 			if !reflect.DeepEqual(gotIDs, tt.wantIDs) {
 				t.Fatalf("static model ids = %v, want %v", gotIDs, tt.wantIDs)
 			}
-			last := tt.models[len(tt.models)-1]
-			if last == nil || last.ID != "gpt-5.4-mini" || last.Thinking == nil || len(last.Thinking.Levels) == 0 {
-				t.Fatalf("expected gpt-5.4-mini with thinking levels at tail of %s, got %+v", tt.name, last)
+			info := LookupStaticModelInfo("gpt-image-2")
+			if info == nil || info.DisplayName != "GPT Image 2" {
+				t.Fatalf("expected builtin gpt-image-2 in static lookup, got %+v", info)
+			}
+			gpt54Mini := LookupStaticModelInfo("gpt-5.4-mini")
+			if gpt54Mini == nil || gpt54Mini.Thinking == nil || len(gpt54Mini.Thinking.Levels) == 0 {
+				t.Fatalf("expected gpt-5.4-mini thinking metadata, got %+v", gpt54Mini)
 			}
 		})
+	}
+}
+
+func TestLookupStaticModelInfo_KimiK26Exists(t *testing.T) {
+	info := LookupStaticModelInfo("kimi-k2.6")
+	if info == nil {
+		t.Fatalf("LookupStaticModelInfo returned nil for kimi-k2.6")
+	}
+	if info.DisplayName != "Kimi K2.6" {
+		t.Fatalf("display name = %q, want %q", info.DisplayName, "Kimi K2.6")
+	}
+	if info.MaxCompletionTokens != 65536 {
+		t.Fatalf("max completion tokens = %d, want %d", info.MaxCompletionTokens, 65536)
+	}
+	if info.Thinking == nil || !info.Thinking.DynamicAllowed {
+		t.Fatalf("expected kimi-k2.6 thinking metadata, got %+v", info.Thinking)
 	}
 }
 

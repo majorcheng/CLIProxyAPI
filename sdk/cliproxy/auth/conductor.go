@@ -654,6 +654,13 @@ func (m *Manager) preparedExecutionModels(auth *Auth, routeModel string) ([]stri
 	return filterExecutionModels(auth, routeModel, candidates, pooled), pooled
 }
 
+func (m *Manager) executionModelsForRequest(auth *Auth, routeModel, execModel string) ([]string, bool) {
+	if strings.TrimSpace(routeModel) != "" && !strings.EqualFold(strings.TrimSpace(routeModel), strings.TrimSpace(execModel)) {
+		return []string{strings.TrimSpace(execModel)}, false
+	}
+	return m.preparedExecutionModels(auth, execModel)
+}
+
 func (m *Manager) prepareExecutionModels(auth *Auth, routeModel string) []string {
 	models, _ := m.preparedExecutionModels(auth, routeModel)
 	return models
@@ -1490,8 +1497,8 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 	if len(providers) == 0 {
 		return cliproxyexecutor.Response{}, &Error{Code: "provider_not_found", Message: "no provider supplied"}
 	}
-	routeModel := req.Model
-	opts = ensureRequestedModelMetadata(opts, routeModel)
+	routeModel := selectionModelFromMetadata(opts.Metadata, req.Model)
+	opts = ensureRequestedModelMetadata(opts, req.Model)
 	opts = ensureSessionAffinityMetadata(opts, m.selector)
 	opts = ensureRequestSimHashMetadata(opts, m.selector)
 	tried := make(map[string]struct{})
@@ -1539,7 +1546,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 		}
 		execCtx = withRequestSimHash(execCtx, opts.Metadata)
 
-		models, pooled := m.preparedExecutionModels(auth, routeModel)
+		models, pooled := m.executionModelsForRequest(auth, routeModel, req.Model)
 		if len(models) == 0 {
 			release()
 			continue
@@ -1605,8 +1612,8 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 	if len(providers) == 0 {
 		return cliproxyexecutor.Response{}, &Error{Code: "provider_not_found", Message: "no provider supplied"}
 	}
-	routeModel := req.Model
-	opts = ensureRequestedModelMetadata(opts, routeModel)
+	routeModel := selectionModelFromMetadata(opts.Metadata, req.Model)
+	opts = ensureRequestedModelMetadata(opts, req.Model)
 	opts = ensureSessionAffinityMetadata(opts, m.selector)
 	opts = ensureRequestSimHashMetadata(opts, m.selector)
 	tried := make(map[string]struct{})
@@ -1654,7 +1661,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 		}
 		execCtx = withRequestSimHash(execCtx, opts.Metadata)
 
-		models, pooled := m.preparedExecutionModels(auth, routeModel)
+		models, pooled := m.executionModelsForRequest(auth, routeModel, req.Model)
 		if len(models) == 0 {
 			release()
 			continue
@@ -1720,8 +1727,8 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 	if len(providers) == 0 {
 		return nil, &Error{Code: "provider_not_found", Message: "no provider supplied"}
 	}
-	routeModel := req.Model
-	opts = ensureRequestedModelMetadata(opts, routeModel)
+	routeModel := selectionModelFromMetadata(opts.Metadata, req.Model)
+	opts = ensureRequestedModelMetadata(opts, req.Model)
 	opts = ensureSessionAffinityMetadata(opts, m.selector)
 	opts = ensureRequestSimHashMetadata(opts, m.selector)
 	tried := make(map[string]struct{})
@@ -1776,7 +1783,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 			execCtx = context.WithValue(execCtx, "cliproxy.roundtripper", rt)
 		}
 		execCtx = withRequestSimHash(execCtx, opts.Metadata)
-		models, pooled := m.preparedExecutionModels(auth, routeModel)
+		models, pooled := m.executionModelsForRequest(auth, routeModel, req.Model)
 		if len(models) == 0 {
 			release()
 			continue
@@ -1833,6 +1840,28 @@ func ensureRequestedModelMetadata(opts cliproxyexecutor.Options, requestedModel 
 	meta[cliproxyexecutor.RequestedModelMetadataKey] = requestedModel
 	opts.Metadata = meta
 	return opts
+}
+
+func selectionModelFromMetadata(meta map[string]any, fallback string) string {
+	fallback = strings.TrimSpace(fallback)
+	if len(meta) == 0 {
+		return fallback
+	}
+	raw, ok := meta[cliproxyexecutor.SelectionModelMetadataKey]
+	if !ok || raw == nil {
+		return fallback
+	}
+	switch v := raw.(type) {
+	case string:
+		if trimmed := strings.TrimSpace(v); trimmed != "" {
+			return trimmed
+		}
+	case []byte:
+		if trimmed := strings.TrimSpace(string(v)); trimmed != "" {
+			return trimmed
+		}
+	}
+	return fallback
 }
 
 func hasRequestedModelMetadata(meta map[string]any) bool {

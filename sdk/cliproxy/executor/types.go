@@ -13,6 +13,9 @@ const RequestedModelMetadataKey = "requested_model"
 const (
 	// PinnedAuthMetadataKey locks execution to a specific auth ID.
 	PinnedAuthMetadataKey = "pinned_auth_id"
+	// SelectionModelMetadataKey 表示调度/可用性检查使用的模型名。
+	// 当执行载荷必须使用另一个上游主模型时，仍可按真实能力模型筛选 auth。
+	SelectionModelMetadataKey = "selection_model"
 	// SelectedAuthMetadataKey stores the auth ID selected by the scheduler.
 	SelectedAuthMetadataKey = "selected_auth_id"
 	// SelectedAuthCallbackMetadataKey carries an optional callback invoked with the selected auth ID.

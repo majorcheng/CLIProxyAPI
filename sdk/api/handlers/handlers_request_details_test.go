@@ -1,7 +1,9 @@
 package handlers
 
 import (
+	"net/http"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -144,5 +146,24 @@ func TestGetRequestDetails_DoesNotTreatActiveProviderAsModelSupport(t *testing.T
 	}
 	if model != "" {
 		t.Fatalf("getRequestDetails() model = %q, want empty", model)
+	}
+}
+
+func TestGetRequestDetails_ImageModelReturns503(t *testing.T) {
+	handler := NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, coreauth.NewManager(nil, nil, nil))
+
+	_, _, errMsg := handler.getRequestDetails("gpt-image-2")
+	if errMsg == nil {
+		t.Fatalf("expected error for gpt-image-2, got nil")
+	}
+	if errMsg.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want %d", errMsg.StatusCode, http.StatusServiceUnavailable)
+	}
+	if errMsg.Error == nil {
+		t.Fatalf("expected error message, got nil")
+	}
+	message := errMsg.Error.Error()
+	if !strings.Contains(message, "/v1/images/generations") || !strings.Contains(message, "/v1/images/edits") {
+		t.Fatalf("unexpected message: %q", message)
 	}
 }

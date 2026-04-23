@@ -975,3 +975,181 @@
 - `timeout 60s go test ./internal/usage ./internal/api/handlers/management ./internal/logging ./internal/api/middleware ./sdk/api/handlers -timeout 60s` 通过。
 - `timeout 60s go test ./... -run '^$'` 通过。
 - `git diff --check` 通过。
+
+## 2026-04-23 reviewer：Codex free 共享阻断范围过宽
+
+### Observations
+
+- reviewer 指出 `sdk/cliproxy/auth/codex_quota_scope.go::codexFreeSharedBlockFromModelState` 当前只看 `Unavailable + NextRetryAfter`，会把 `model_not_supported`、普通 `404`、`5xx/408` 都当成 free token 级共享阻断。
+- 现场代码确认：`sdk/cliproxy/auth/conductor.go::MarkResult` 在 `isModelSupportResultError(...)`、`case 404`、`case 408/500/502/503/504` 分支都会先写当前模型的 `NextRetryAfter`，随后统一调用 `codexFreeSharedBlockFromModelState(...)` 决定是否镜像到全 token。
+- 现场代码确认：当前 `codexFreeSharedBlockFromAuthState(...)` 也只看 `auth.Unavailable + auth.NextRetryAfter`，因此即便聚合态来自非账号级错误，也可能被 selector 提前当成共享阻断。
+
+### Hypotheses
+
+#### H1: 共享阻断 helper 没有检查错误类型，导致所有未来不可用状态都被扩散（ROOT HYPOTHESIS）
+- Supports: helper 当前没有用 `FailureHTTPStatus` / `LastError` 做 token-scope 分类。
+- Conflicts: 无。
+- Test: 把 helper 收窄到 `401/402/403/429`，再补 `model_not_supported`、`404`、`503` 负向测试，验证 sibling model 不再受影响。
+
+#### H2: 问题只在 `MarkResult` 的 mirror 调用点，helper 本身没问题
+- Supports: mirror 是实际把状态扩散到所有模型的最后一步。
+- Conflicts: selector/scheduler 也直接消费 helper；即便不 mirror，聚合态 helper 仍可能误判共享阻断。
+- Test: 同时检查 `codexFreeSharedBlockFromAuthState(...)` 与 `codexFreeSharedBlockFromModelState(...)`。
+
+#### H3: 产品语义其实就是“Codex free 任意模型失败都扩散全 token”
+- Supports: 之前实现确实沿这个方向扩了。
+- Conflicts: 既有 memory 和本轮 reviewer 都把共享边界收口到账号级错误；现有测试也只覆盖 `401/429`，没有覆盖 `model_not_supported/404/5xx`。
+- Test: 若真是预期，应补覆盖三类场景；当前先按 reviewer 合理边界收窄实现。
+
+### Experiments
+
+- 代码阅读确认 H1/H2：`codexFreeSharedBlockFromModelState(...)` 当前只要 `state.Unavailable && state.NextRetryAfter.After(now)` 就返回 blocked；`codexFreeSharedBlockFromAuthState(...)` 对聚合态也同样宽。
+- 将 helper 收窄为只认 `401/402/403/429`：
+  - auth 聚合态改为依赖 `currentPersistableFailureHTTPStatus(auth)`。
+  - model state 改为依赖 `currentPersistableModelFailureHTTPStatus(state)`。
+  - 保留 quota 专项分支，但移除 `StatusDisabled` 的自动共享扩散。
+- 新增负向回归测试：
+  - `TestCodexFreeSharedBlockFromModelState_OnlyAccountScopedStatusesShare`
+  - `TestManagerMarkResult_CodexFreeModelScopedFailuresDoNotHideSiblingModels`
+  - `TestManagerMarkResult_CodexFreeHTTP503DoesNotBlockSiblingModel`
+
+### Root Cause
+
+- Codex free 共享阻断 helper 缺少账号级错误分类，错误地把所有“未来不可用”的模型状态都提升成 token 级共享阻断。
+
+### Fix Results
+
+- `sdk/cliproxy/auth/codex_quota_scope.go` 现在只把 `401/402/403/429` 识别为 Codex free token 级共享错误；`model_not_supported`、普通 `404`、`5xx/408` 继续只影响当前模型。
+- `selector.go::isAuthBlockedForModel` 与 `scheduler.go::projectAggregatedAuthState` 通过收窄后的 helper 自动继承新边界，无需额外分支。
+- `conductor.go::MarkResult` 保留共享镜像调用点，但只有命中账号级错误时才会镜像到 sibling models；模型能力错误与瞬时错误不再误扩散。
+
+### Verification
+
+- `timeout 60s go test ./sdk/cliproxy/auth ./sdk/cliproxy -run 'CodexFree|ExcludedModels' -count=1` 通过。
+- `timeout 60s go test ./sdk/cliproxy ./sdk/cliproxy/auth ./internal/registry -count=1` 通过。
+- `timeout 60s go test ./... -run '^$'` 通过。
+- `git diff --check` 通过。
+
+## 2026-04-23 Codex free：fill-first 队列顺序统一
+
+### Observations
+
+- 用户进一步确认：既然 Codex free 已经统一成“能力面不区分模型、账号级错误共享”，那 fill-first 下 free token 的请求顺序也应该一致。
+- 代码复核确认，`sdk/cliproxy/auth/selector.go::FillFirstSelector.Pick` 当前是 `getAvailableAuths(...) -> sortAuthsByFirstRegisteredAt(...) -> 取第一个`；它对“当前模型可用集合”排序后再选头部。
+- 代码复核确认，`sdk/cliproxy/auth/scheduler.go::pickSingle` 仍按 `providerState.ensureModelLocked(modelKey, ...)` 走 per-model shard，但 shard 内部实际通过 `readyView.pickFirstRegistered(...)` 选出首次入池时间最早的 ready auth。
+- 这意味着 scheduler 侧原本就更接近“稳定顺序 + 当前模型局部跳过”；selector 侧语义虽然结果通常等价，但没有把这层意图显式写出来。
+
+### Hypotheses
+
+#### H1: 真正需要修的是 selector 的表达方式，而不是 scheduler 的整体算法（ROOT HYPOTHESIS）
+- Supports: scheduler 已经通过 `pickFirstRegistered(...)` 保持稳定顺序；selector 仍是先过滤可用集合再排序。
+- Conflicts: 如果 per-model shard 真会改变 fill-first 的相对顺序，那 scheduler 也得跟着改。
+- Test: 把 selector 改成“扫描稳定顺序并局部跳过当前模型不可用 auth”，再补 selector/scheduler 两侧回归测试验证跨模型结果。
+
+#### H2: scheduler 也需要改成 provider 级共享队列，否则不同模型还是会乱序
+- Supports: `pickSingle(...)` 入口仍然拿的是 `modelKey` shard。
+- Conflicts: shard 内选择器用的是 `pickFirstRegistered(...)`，只要静态模型集一致、模型级错误只做局部 skip，结果已经等价于共享顺序。
+- Test: 用同一组 Codex free auth 对两个模型分别 `pickSingle(...)`，看是否表现为“老账号在当前模型失败时被局部跳过、其它模型仍优先老账号”。
+
+#### H3: 其实无需代码改动，只补测试就够了
+- Supports: 经过代码阅读，scheduler 的现状已经满足目标语义。
+- Conflicts: selector 侧没有显式把这条语义钉死，后续改动容易再次退回“按当前模型重排可用集合”的思路。
+- Test: 若只补测试，不改 selector helper，则语义仍然主要靠读代码推断；本轮先做最小 helper 收口。
+
+### Experiments
+
+- 先做只读核对：确认 `readyView.pickFirstRegistered(...)` 已经按 `firstRegisteredAtLess(...)` 比较，不依赖 `auth.ID` 顺序；因此 scheduler 侧不需要额外重写全局队列。
+- 新增 `sdk/cliproxy/auth/fill_first_selection.go`：把 fill-first 选择显式收口为“稳定队列上的首个可用账号 + 冷却摘要”，模型级失败仅对当前请求局部跳过。
+- `sdk/cliproxy/auth/selector.go::FillFirstSelector.Pick` 改为复用 `scanFillFirstCandidates(...)`，不再通过“取当前模型可用切片再排序”来隐式表达语义。
+- 新增 `sdk/cliproxy/auth/codex_free_fill_first_order_test.go`：
+  - `TestFillFirstSelectorPick_CodexFreeKeepsSharedOrderAcrossModels`
+  - `TestSchedulerPickSingle_CodexFreeKeepsSharedOrderAcrossModels`
+- 首次实验发现新增 scheduler 测试失败为 `auth_not_found`；复核后确认不是生产逻辑问题，而是测试基座 `scheduler_test.go::registerSchedulerModels` 每次只注册一个模型，第二次注册覆盖了第一组模型。
+- 将测试改为本地 `registerSchedulerModelSet(...)` 一次注册同一 auth 的两个模型后，selector/scheduler 两侧回归均通过。
+
+### Root Cause
+
+- 问题不在 scheduler 的实际 fill-first 选择算法，而在 selector 没有把“稳定顺序 + 当前模型局部跳过”的 Codex free 语义显式写死，缺少直接回归测试时容易被误判成“不同模型队列顺序不一致”。
+
+### Fix Results
+
+- `sdk/cliproxy/auth/fill_first_selection.go::scanFillFirstCandidates` 新增统一 helper，明确 fill-first 按稳定顺序挑选，而不是按当前模型重排整个队列。
+- `sdk/cliproxy/auth/selector.go::{shouldPreferCodexWebsocket,FillFirstSelector.Pick}` 现在直接复用该 helper；Codex websocket 优先仍保留在同一优先级桶内生效。
+- `sdk/cliproxy/auth/codex_free_fill_first_order_test.go` 锁定了目标语义：
+  - 老 free token 在模型 A 上命中模型级 404 时，模型 A 请求会局部跳到下一个 token；
+  - 但模型 B 请求仍然会优先选择这枚更早入池的 token。
+- scheduler 生产代码本轮未改：代码级核对与回归测试都表明它已经满足相同语义。
+
+### Verification
+
+- `timeout 60s go test ./sdk/cliproxy/auth ./sdk/cliproxy -run 'CodexFree|ExcludedModels|FillFirst' -count=1` 通过。
+- `timeout 60s go test ./sdk/cliproxy ./sdk/cliproxy/auth ./internal/registry -count=1` 通过。
+- `timeout 60s go test ./... -run '^$'` 通过。
+- `git diff --check` 通过。
+
+## 2026-04-23 reviewer follow-up：Codex free shared success 清理过宽与 thinking suffix 残留
+
+### Observations
+
+- reviewer 指出 `sdk/cliproxy/auth/conductor.go::MarkResult` 的 success 分支当前只要命中 `codexFreeSharesModelState(auth)`，就会调用 `resetCodexFreeSharedModelStates(...)` 清空整枚 free token 的全部 runtime states，并对全部模型统一 `ResumeClientModel(...)`。
+- 代码复核确认：这个 helper 之前依赖 `sdk/cliproxy/auth/codex_quota_scope.go::codexFreeSharedRuntimeModelIDs(...)`，它会把 registry model IDs 与 `Auth.ModelStates` 统一 canonical 到 base model，再批量 reset / resume。
+- 这会产生两个错误：
+  - 模型 A 的 `404 / model_not_supported / 503` 会在模型 B success 时被误恢复；
+  - `gpt-5.4(high)` 这类 exact suffix key 不会被 shared success 清掉，因为 shared helper 最终只处理 base key。
+- 现场代码还确认：`sdk/cliproxy/auth/selector.go::isAuthBlockedForModel` 先查 exact key、再回退 base key，因此 stale suffix state 只要残留，就会一直拦住 exact suffix 请求。
+
+### Hypotheses
+
+#### H1: success 路径把“shared clear”与“模型家族当前请求恢复”混成一套全量 reset，导致无关模型级失败被误清（ROOT HYPOTHESIS）
+- Supports: `resetCodexFreeSharedModelStates(...)` 直接遍历全部 shared runtime model IDs。
+- Conflicts: 无。
+- Test: 拆成“当前请求模型家族 reset”与“仅 token-scoped states shared clear”，再补 sibling model-specific failure 回归。
+
+#### H2: suffix 残留的根因是 shared runtime helper 先做 canonical 去重，exact key 从未被清理
+- Supports: 原 helper 对 `Auth.ModelStates` key 调 `canonicalModelKey(...)` 后再 dedupe；selector 又优先查 exact key。
+- Conflicts: 无。
+- Test: 改成运行态 key 保留 exact/suffix，不再跟 registry model IDs 共用同一套 helper；补 success 后 exact suffix 恢复回归。
+
+#### H3: 只修 success reset 还不够，failure 侧 shared mirror 继续把 source state 覆盖到所有兄弟模型，也会让恢复边界失真
+- Supports: 原 `mirrorCodexFreeSharedModelState(...)` 会把当前 source state clone 到全部模型；这会让 shared failure 与模型级 failure 混在同一批 runtime states 里。
+- Conflicts: 若只靠 auth 聚合态/shared helper 就足够阻断兄弟模型，则 mirror 不再必要。
+- Test: 删掉 shared mirror，仅保留 auth 聚合态 + registry/session-affinity 联动，再跑现有 shared runtime / quota 回归。
+
+### Experiments
+
+- 先按 reviewer 提示做代码级复核，确认 P1/P2 都成立：
+  - success 确实会无差别清空全部 shared runtime model IDs；
+  - shared runtime helper 确实会把 suffix key canonical 掉，导致 exact key 清不掉。
+- 新增 `sdk/cliproxy/auth/model_state_scope.go`，把两类概念拆开：
+  - `modelStateFamilyKeys(...)` 只处理运行态 state key，保留 exact/base/已有同家族 suffix；
+  - `registryModelFamilyIDs(...)` 只处理 registry 真实 model IDs。
+- 修改 `sdk/cliproxy/auth/conductor.go::MarkResult`：
+  - success 先清“当前请求模型家族”的 runtime keys；
+  - Codex free 若存在 token-scoped shared block，再只清 token-scoped runtime keys，并在批量 `Resume` 之后根据剩余 model states 重新挂回仍应保留的模型级 suspend/quota；
+  - failure 不再 `mirrorCodexFreeSharedModelState(...)`，只更新当前模型家族状态，shared block 继续通过 auth 聚合态生效。
+- 新增回归测试：
+  - `TestManagerMarkResult_CodexFreeSuccessKeepsSiblingModelSpecificFailure`
+  - `TestManagerMarkResult_CodexFreeSharedSuccessReappliesSiblingModelSpecificFailure`
+  - `TestManagerMarkResult_CodexFreeSharedSuccessClearsThinkingSuffixState`
+
+### Root Cause
+
+- Codex free shared success 之前错误地复用了“全 token runtime model IDs”做统一 reset/resume，把 token-scoped shared clear、模型级 failure 保留，以及 exact suffix key 清理三个语义混成了一层处理。
+
+### Fix Results
+
+- `sdk/cliproxy/auth/model_state_scope.go` 新增了运行态模型家族 key、registry model family IDs、token-scoped runtime keys 与剩余 registry block 重建 helper，明确分离“state key”与“registry model ID”。
+- `sdk/cliproxy/auth/conductor.go::MarkResult` 的 success 路径现在只会：
+  - 清当前请求模型家族；
+  - 若存在 shared block，再额外清 token-scoped keys；
+  - shared clear 批量恢复 registry 后，会把仍然有效的模型级 `404 / model_not_supported` 等状态重新挂回 registry。
+- `sdk/cliproxy/auth/conductor.go::MarkResult` 的 failure 路径不再把 shared failure clone 到全部兄弟模型；兄弟模型阻断继续由 auth 聚合态与 `codexFreeSharedBlockForAuth(...)` 提供。
+- `sdk/cliproxy/auth/codex_quota_scope.go` 删除了旧的 `codexFreeSharedRuntimeModelIDs(...)`，避免后续再把 runtime key 与 registry model IDs 混用。
+
+### Verification
+
+- `timeout 60s go test ./sdk/cliproxy/auth -run 'CodexFree|ThinkingSuffix' -count=1` 通过。
+- `timeout 60s go test ./sdk/cliproxy/auth ./sdk/cliproxy -run 'CodexFree|ExcludedModels|FillFirst' -count=1` 通过。
+- `timeout 60s go test ./sdk/cliproxy ./sdk/cliproxy/auth ./internal/registry -count=1` 通过。
+- `timeout 60s go test ./... -run '^$'` 通过。
+- `git diff --check` 通过。

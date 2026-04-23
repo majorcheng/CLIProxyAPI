@@ -2479,16 +2479,13 @@ func (s *Service) registerModelsForAuth(a *coreauth.Auth) {
 		}
 		models = applyExcludedModels(models, excluded)
 	case "codex":
-		codexPlanType := ""
-		if a.Attributes != nil {
-			codexPlanType = strings.TrimSpace(a.Attributes["plan_type"])
-		}
-		switch strings.ToLower(codexPlanType) {
+		codexPlanType := coreauth.AuthChatGPTPlanType(a)
+		switch codexPlanType {
 		case "pro":
 			models = registry.GetCodexProModels()
 		case "plus":
 			models = registry.GetCodexPlusModels()
-		case "team", "business", "go":
+		case "team":
 			models = registry.GetCodexTeamModels()
 		case "free":
 			models = registry.GetCodexFreeModels()
@@ -2502,6 +2499,10 @@ func (s *Service) registerModelsForAuth(a *coreauth.Auth) {
 			if authKind == "apikey" {
 				excluded = entry.ExcludedModels
 			}
+		}
+		if codexPlanType == "free" {
+			// free 账号的额度与可用性都是 token 级，不再允许配置裁掉单个模型。
+			excluded = nil
 		}
 		models = applyExcludedModels(models, excluded)
 	case "iflow":

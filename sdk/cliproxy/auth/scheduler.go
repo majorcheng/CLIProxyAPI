@@ -1001,6 +1001,9 @@ func projectAggregatedAuthState(auth *Auth, modelKey string, override *ModelStat
 		maxBackoff     int
 		maxStrike      int
 		overrideSeen   bool
+		sharedBlocked  bool
+		sharedReason   blockReason
+		sharedNext     time.Time
 	)
 
 	for currentModelKey, currentState := range auth.ModelStates {
@@ -1023,6 +1026,12 @@ func projectAggregatedAuthState(auth *Auth, modelKey string, override *ModelStat
 		) {
 			continue
 		}
+		if codexFreeSharesModelState(auth) {
+			blocked, reason, next := codexFreeSharedBlockFromModelState(effectiveState, now)
+			if blocked {
+				sharedBlocked, sharedReason, sharedNext = mergeCodexFreeSharedBlock(sharedBlocked, sharedReason, sharedNext, reason, next)
+			}
+		}
 	}
 	if !overrideSeen {
 		accumulateProjectedAggregateState(
@@ -1037,6 +1046,12 @@ func projectAggregatedAuthState(auth *Auth, modelKey string, override *ModelStat
 			&maxBackoff,
 			&maxStrike,
 		)
+		if codexFreeSharesModelState(auth) {
+			blocked, reason, next := codexFreeSharedBlockFromModelState(override, now)
+			if blocked {
+				sharedBlocked, sharedReason, sharedNext = mergeCodexFreeSharedBlock(sharedBlocked, sharedReason, sharedNext, reason, next)
+			}
+		}
 	}
 	if !hasState {
 		return projected
@@ -1056,6 +1071,12 @@ func projectAggregatedAuthState(auth *Auth, modelKey string, override *ModelStat
 	if next, ok := codexFreeSharedQuotaRetryAfter(auth, projected.quota, now); ok {
 		projected.unavailable = true
 		projected.nextRetryAfter = next
+	} else if sharedBlocked {
+		projected.unavailable = true
+		projected.nextRetryAfter = sharedNext
+		if sharedReason == blockReasonDisabled {
+			projected.status = StatusDisabled
+		}
 	} else if allUnavailable {
 		projected.unavailable = true
 		projected.nextRetryAfter = earliestRetry

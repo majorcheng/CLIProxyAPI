@@ -167,14 +167,15 @@ func authWebsocketsEnabled(auth *Auth) bool {
 	return false
 }
 
-func preferCodexWebsocketAuths(ctx context.Context, provider string, available []*Auth) []*Auth {
-	if len(available) == 0 {
-		return available
-	}
+func shouldPreferCodexWebsocket(ctx context.Context, provider string) bool {
 	if !cliproxyexecutor.DownstreamWebsocket(ctx) {
-		return available
+		return false
 	}
-	if !strings.EqualFold(strings.TrimSpace(provider), "codex") {
+	return strings.EqualFold(strings.TrimSpace(provider), "codex")
+}
+
+func preferCodexWebsocketAuths(ctx context.Context, provider string, available []*Auth) []*Auth {
+	if len(available) == 0 || !shouldPreferCodexWebsocket(ctx, provider) {
 		return available
 	}
 
@@ -354,13 +355,11 @@ func groupByVirtualParent(auths []*Auth) (map[string][]*Auth, []string) {
 func (s *FillFirstSelector) Pick(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth) (*Auth, error) {
 	_ = opts
 	now := time.Now()
-	available, err := getAvailableAuths(auths, provider, model, now)
-	if err != nil {
-		return nil, err
+	result := scanFillFirstCandidates(auths, model, shouldPreferCodexWebsocket(ctx, provider), now, nil)
+	if result.picked != nil {
+		return result.picked, nil
 	}
-	available = preferCodexWebsocketAuths(ctx, provider, available)
-	sortAuthsByFirstRegisteredAt(available)
-	return available[0], nil
+	return nil, fillFirstUnavailableError(provider, model, now, result)
 }
 
 func isAuthBlockedForModel(auth *Auth, model string, now time.Time) (bool, blockReason, time.Time) {
@@ -370,8 +369,8 @@ func isAuthBlockedForModel(auth *Auth, model string, now time.Time) (bool, block
 	if auth.Disabled || auth.Status == StatusDisabled {
 		return true, blockReasonDisabled, time.Time{}
 	}
-	if next, ok := codexFreeSharedQuotaRetryAfter(auth, auth.Quota, now); ok {
-		return true, blockReasonCooldown, next
+	if blocked, reason, next := codexFreeSharedBlockForAuth(auth, now); blocked {
+		return true, reason, next
 	}
 	if model != "" {
 		if len(auth.ModelStates) > 0 {

@@ -2457,6 +2457,10 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	setModelQuotaIDs := []string(nil)
 	resumeModelIDs := []string(nil)
 	suspendModelIDs := []string(nil)
+	reapplyModelQuotaIDs := []string(nil)
+	reapplySuspendReasons := map[string]string(nil)
+	forceSchedulerUpsert := false
+	invalidateAffinity := false
 	var authSnapshot *Auth
 	var modelStateSnapshot *ModelState
 	var persistSnapshot *Auth
@@ -2470,8 +2474,33 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 		}
 		if result.Success {
 			if result.Model != "" {
-				state := ensureModelState(auth, result.Model)
-				resetModelState(state, now)
+				runtimeKeys := modelStateFamilyKeys(auth, result.Model)
+				sharedKeys := []string(nil)
+				if codexFreeSharesModelState(auth) {
+					sharedKeys = codexFreeTokenScopedRuntimeStateKeys(auth, now)
+				}
+				resetKeys := append([]string(nil), runtimeKeys...)
+				resetKeys = appendUniqueModelIDs(resetKeys, sharedKeys...)
+				if len(resetKeys) == 0 {
+					resetKeys = []string{strings.TrimSpace(result.Model)}
+				}
+				for _, modelKey := range resetKeys {
+					resetModelState(ensureModelState(auth, modelKey), now)
+				}
+				if len(sharedKeys) > 0 {
+					ids := codexFreeSharedModelIDs(result.AuthID, result.Model)
+					clearModelQuotaIDs = append([]string(nil), ids...)
+					resumeModelIDs = append([]string(nil), ids...)
+					reapplyModelQuotaIDs, reapplySuspendReasons = registryActionsForBlockedModelStates(auth, now)
+					forceSchedulerUpsert = true
+				} else {
+					ids := registryModelFamilyIDs(result.AuthID, result.Model)
+					clearModelQuotaIDs = append([]string(nil), ids...)
+					resumeModelIDs = append([]string(nil), ids...)
+					if len(runtimeKeys) > 1 {
+						forceSchedulerUpsert = true
+					}
+				}
 				updateAggregatedAvailability(auth, now)
 				if !hasModelError(auth, now) {
 					auth.LastError = nil
@@ -2482,10 +2511,6 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 				auth.UpdatedAt = now
 				shouldResumeModel = true
 				clearModelQuota = true
-				if codexFree429BlocksAllModels(auth) {
-					clearModelQuotaIDs = codexFreeSharedQuotaModelIDs(result.AuthID, result.Model)
-					resumeModelIDs = append([]string(nil), clearModelQuotaIDs...)
-				}
 			} else {
 				clearAuthStateOnSuccess(auth, now)
 			}
@@ -2493,7 +2518,11 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 			if result.Model != "" {
 				if !isRequestScopedNotFoundResultError(result.Error) {
 					disableCooling := quotaCooldownDisabledForAuth(auth)
-					state := ensureModelState(auth, result.Model)
+					stateKeys := modelStateFamilyKeys(auth, result.Model)
+					if len(stateKeys) == 0 {
+						stateKeys = []string{strings.TrimSpace(result.Model)}
+					}
+					state := ensureModelState(auth, stateKeys[0])
 					state.Unavailable = true
 					state.Status = StatusError
 					state.UpdatedAt = now
@@ -2586,6 +2615,30 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 							state.NextRetryAfter = time.Time{}
 						}
 					}
+					for _, modelKey := range stateKeys[1:] {
+						auth.ModelStates[modelKey] = state.Clone()
+					}
+					modelRegistryIDs := registryModelFamilyIDs(result.AuthID, result.Model)
+					if codexFreeSharesModelState(auth) {
+						if blocked, _, _ := codexFreeSharedBlockFromModelState(state, now); blocked {
+							forceSchedulerUpsert = true
+							invalidateAffinity = true
+							if setModelQuota {
+								setModelQuotaIDs = append([]string(nil), codexFreeSharedQuotaModelIDs(result.AuthID, result.Model)...)
+							}
+							if shouldSuspendModel {
+								suspendModelIDs = append([]string(nil), codexFreeSharedModelIDs(result.AuthID, result.Model)...)
+							}
+						}
+					} else if len(stateKeys) > 1 {
+						forceSchedulerUpsert = true
+					}
+					if setModelQuota && len(setModelQuotaIDs) == 0 {
+						setModelQuotaIDs = append([]string(nil), modelRegistryIDs...)
+					}
+					if shouldSuspendModel && len(suspendModelIDs) == 0 {
+						suspendModelIDs = append([]string(nil), modelRegistryIDs...)
+					}
 
 					auth.Status = StatusError
 					auth.UpdatedAt = now
@@ -2599,7 +2652,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 		if m.store != nil && !shouldSkipPersist(ctx) {
 			persistSnapshot = auth.Clone()
 		}
-		if useSchedulerFastPath {
+		if useSchedulerFastPath && !forceSchedulerUpsert {
 			if state := auth.ModelStates[result.Model]; state != nil {
 				modelStateSnapshot = state.Clone()
 			}
@@ -2631,7 +2684,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	if clearModelQuota && result.Model != "" {
 		clearIDs := clearModelQuotaIDs
 		if len(clearIDs) == 0 {
-			clearIDs = []string{result.Model}
+			clearIDs = registryModelFamilyIDs(result.AuthID, result.Model)
 		}
 		for _, modelID := range clearIDs {
 			registry.GetGlobalRegistry().ClearModelQuotaExceeded(result.AuthID, modelID)
@@ -2640,7 +2693,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	if setModelQuota && result.Model != "" {
 		setIDs := setModelQuotaIDs
 		if len(setIDs) == 0 {
-			setIDs = []string{result.Model}
+			setIDs = registryModelFamilyIDs(result.AuthID, result.Model)
 		}
 		for _, modelID := range setIDs {
 			registry.GetGlobalRegistry().SetModelQuotaExceeded(result.AuthID, modelID)
@@ -2649,22 +2702,31 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	if shouldResumeModel {
 		resumeIDs := resumeModelIDs
 		if len(resumeIDs) == 0 {
-			resumeIDs = []string{result.Model}
+			resumeIDs = registryModelFamilyIDs(result.AuthID, result.Model)
 		}
 		for _, modelID := range resumeIDs {
 			registry.GetGlobalRegistry().ResumeClientModel(result.AuthID, modelID)
 		}
+		for _, modelID := range reapplyModelQuotaIDs {
+			registry.GetGlobalRegistry().SetModelQuotaExceeded(result.AuthID, modelID)
+		}
+		for modelID, reason := range reapplySuspendReasons {
+			registry.GetGlobalRegistry().SuspendClientModel(result.AuthID, modelID, reason)
+		}
 	} else if shouldSuspendModel {
 		suspendIDs := suspendModelIDs
 		if len(suspendIDs) == 0 {
-			suspendIDs = []string{result.Model}
+			suspendIDs = registryModelFamilyIDs(result.AuthID, result.Model)
 		}
 		for _, modelID := range suspendIDs {
 			registry.GetGlobalRegistry().SuspendClientModel(result.AuthID, modelID, suspendReason)
 		}
 		if sharedQuotaCooldown {
-			invalidateSessionAffinityAuth(m.selector, result.AuthID)
+			invalidateAffinity = true
 		}
+	}
+	if invalidateAffinity {
+		invalidateSessionAffinityAuth(m.selector, result.AuthID)
 	}
 
 	// 反馈型 selector 只在进程内维护评分，不参与持久化，因此在结果落库后再喂回运行态统计。
@@ -2715,6 +2777,9 @@ func updateAggregatedAvailability(auth *Auth, now time.Time) {
 	quotaRecover := time.Time{}
 	maxBackoffLevel := 0
 	maxStrikeCount := 0
+	sharedBlocked := false
+	sharedReason := blockReasonNone
+	sharedNext := time.Time{}
 	for _, state := range auth.ModelStates {
 		if state == nil {
 			continue
@@ -2750,6 +2815,12 @@ func updateAggregatedAvailability(auth *Auth, now time.Time) {
 				maxStrikeCount = state.Quota.StrikeCount
 			}
 		}
+		if codexFreeSharesModelState(auth) {
+			blocked, reason, next := codexFreeSharedBlockFromModelState(state, now)
+			if blocked {
+				sharedBlocked, sharedReason, sharedNext = mergeCodexFreeSharedBlock(sharedBlocked, sharedReason, sharedNext, reason, next)
+			}
+		}
 	}
 	if quotaExceeded {
 		auth.Quota.Exceeded = true
@@ -2767,6 +2838,14 @@ func updateAggregatedAvailability(auth *Auth, now time.Time) {
 	if next, ok := codexFreeSharedQuotaRetryAfter(auth, auth.Quota, now); ok {
 		auth.Unavailable = true
 		auth.NextRetryAfter = next
+		return
+	}
+	if sharedBlocked {
+		auth.Unavailable = true
+		auth.NextRetryAfter = sharedNext
+		if sharedReason == blockReasonDisabled {
+			auth.Status = StatusDisabled
+		}
 		return
 	}
 	auth.Unavailable = allUnavailable

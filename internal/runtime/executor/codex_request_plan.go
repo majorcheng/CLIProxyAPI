@@ -200,7 +200,8 @@ func normalizeCodexPreparedBody(body []byte, mode codexPreparedRequestPlanMode, 
 			body = setCodexJSONStringField(body, "instructions", "")
 		}
 	}
-	return normalizeCodexInstructions(body)
+	body = normalizeCodexInstructions(body)
+	return ensureCodexImageGenerationTool(body, baseModel)
 }
 
 type codexPreparedBodyState struct {
@@ -267,7 +268,8 @@ func normalizeCodexPreparedBodyFallback(body []byte, mode codexPreparedRequestPl
 		body = deleteJSONFieldIfExists(body, "stream")
 		body = ensureJSONStringField(body, "instructions", "")
 	}
-	return normalizeCodexInstructions(body)
+	body = normalizeCodexInstructions(body)
+	return ensureCodexImageGenerationTool(body, baseModel)
 }
 
 func setJSONStringFieldIfNeeded(body []byte, path, value string) []byte {

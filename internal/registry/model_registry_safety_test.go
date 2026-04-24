@@ -167,9 +167,9 @@ func TestCodexPlanStaticModelsMatchSelectivePortedCatalog(t *testing.T) {
 		wantIDs []string
 	}{
 		{name: "codex-free", models: GetCodexFreeModels(), wantIDs: []string{"gpt-5.2", "gpt-5.3-codex", "gpt-5.4", "gpt-5.4-mini", "gpt-image-2"}},
-		{name: "codex-team", models: GetCodexTeamModels(), wantIDs: []string{"gpt-5.2", "gpt-5.3-codex", "gpt-5.4", "gpt-5.4-mini", "gpt-image-2"}},
-		{name: "codex-plus", models: GetCodexPlusModels(), wantIDs: []string{"gpt-5.2", "gpt-5.3-codex", "gpt-5.3-codex-spark", "gpt-5.4", "gpt-5.4-mini", "gpt-image-2"}},
-		{name: "codex-pro", models: GetCodexProModels(), wantIDs: []string{"gpt-5.2", "gpt-5.3-codex", "gpt-5.3-codex-spark", "gpt-5.4", "gpt-5.4-mini", "gpt-image-2"}},
+		{name: "codex-team", models: GetCodexTeamModels(), wantIDs: []string{"gpt-5.2", "gpt-5.3-codex", "gpt-5.4", "gpt-5.4-mini", "gpt-5.5", "gpt-image-2"}},
+		{name: "codex-plus", models: GetCodexPlusModels(), wantIDs: []string{"gpt-5.2", "gpt-5.3-codex", "gpt-5.3-codex-spark", "gpt-5.4", "gpt-5.4-mini", "gpt-5.5", "gpt-image-2"}},
+		{name: "codex-pro", models: GetCodexProModels(), wantIDs: []string{"gpt-5.2", "gpt-5.3-codex", "gpt-5.3-codex-spark", "gpt-5.4", "gpt-5.4-mini", "gpt-5.5", "gpt-image-2"}},
 	}
 
 	for _, tt := range tests {
@@ -187,6 +187,28 @@ func TestCodexPlanStaticModelsMatchSelectivePortedCatalog(t *testing.T) {
 				t.Fatalf("expected gpt-5.4-mini thinking metadata, got %+v", gpt54Mini)
 			}
 		})
+	}
+}
+
+func TestLookupStaticModelInfo_GPT55MatchesSelectivePortedCatalog(t *testing.T) {
+	info := LookupStaticModelInfo("gpt-5.5")
+	if info == nil {
+		t.Fatal("LookupStaticModelInfo returned nil for gpt-5.5")
+	}
+	if info.DisplayName != "GPT 5.5" {
+		t.Fatalf("display name = %q, want %q", info.DisplayName, "GPT 5.5")
+	}
+	if info.Description != "Frontier model for complex coding, research, and real-world work." {
+		t.Fatalf("description = %q, want %q", info.Description, "Frontier model for complex coding, research, and real-world work.")
+	}
+	if info.ContextLength != 272000 {
+		t.Fatalf("context length = %d, want %d", info.ContextLength, 272000)
+	}
+	if info.MaxCompletionTokens != 128000 {
+		t.Fatalf("max completion tokens = %d, want %d", info.MaxCompletionTokens, 128000)
+	}
+	if info.Thinking == nil || !reflect.DeepEqual(info.Thinking.Levels, []string{"low", "medium", "high", "xhigh"}) {
+		t.Fatalf("thinking levels = %+v, want [low medium high xhigh]", info.Thinking)
 	}
 }
 

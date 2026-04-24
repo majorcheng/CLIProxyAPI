@@ -1153,3 +1153,42 @@
 - `timeout 60s go test ./sdk/cliproxy ./sdk/cliproxy/auth ./internal/registry -count=1` 通过。
 - `timeout 60s go test ./... -run '^$'` 通过。
 - `git diff --check` 通过。
+
+----
+
+# 2026-04-24 review follow-up 调试记录
+
+## Observations
+- review 指出 alias 路由 `/backend-api/codex/responses*` 已注册，但 `internal/api/middleware/request_logging.go::isResponsesWebsocketUpgrade` 只识别 `/v1/responses`，因此 GET websocket alias 不会进入现有 request logging 链路。
+- 当前 `internal/logging/gin_logger.go::aiAPIPrefixes` 已补 `/v1/images`，但未补 `/backend-api/codex`，所以 alias POST 请求不会生成 request_id，主日志与 request log 无法串联。
+- 当前 `internal/runtime/executor/codex_request_plan.go::{normalizeCodexPreparedBody,normalizeCodexPreparedBodyFallback}` 会无条件调用 `internal/runtime/executor/codex_image_tool.go::ensureCodexImageGenerationTool`，唯一跳过条件是 model 后缀 `spark`。
+- 需要进一步核对图片入口如何构造 Codex request，确认 image tool 注入是否应当只在显式图片语义请求上触发，而不是所有普通文本请求。
+
+## Hypotheses
+### H1: alias 日志断链的根因是路径白名单没有同步扩到 `/backend-api/codex/responses`（ROOT HYPOTHESIS）
+- Supports: `isResponsesWebsocketUpgrade` 对路径做精确等值判断；`aiAPIPrefixes` 也只覆盖 `/v1/*` 与 `/api/provider/*`。
+- Conflicts: 暂无。
+- Test: 仅扩展路径识别并补定向测试，验证 alias GET/POST 都被判定为 Responses/AI API 路径。
+
+### H2: 图片工具注入过宽的根因是当前 helper 只按模型后缀过滤，没有读请求本身的图片意图
+- Supports: `ensureCodexImageGenerationTool` 只接受 `body, baseModel` 两个参数；任何普通文本 request 进入 `normalizeCodexPreparedBody` 都会被扩展工具集。
+- Conflicts: 上游 commit 标题是“for all Codex upstream requests”，需要结合本仓当前 `/v1/images` 专门桥接实现重新收口本地边界。
+- Test: 查看 `openai_images_build.go` 的图片桥接 payload 是否已有明确 `tool_choice=image_generation` 或 `tools` 语义；若有，则把自动注入收口为“仅显式图片意图请求生效”，并补普通文本请求不注入测试。
+
+### H3: 如果图片桥接 payload 已经显式声明 `tool_choice=image_generation`，那么代理层根本不需要对普通文本请求做兜底注入
+- Supports: review 提到普通文本请求的工具集合会被静默扩大；如果图片入口已显式带工具意图，则缩窄到显式图片请求即可同时满足图片功能与普通文本语义稳定。
+- Conflicts: 仍需确认 direct `/v1/responses` 图片请求是否也会显式带该 tool_choice。
+- Test: 检查 `buildImagesResponsesRequest` 与相关 tests，确认图片请求的最小稳定标记。
+
+## Experiments
+- E1: 将 `internal/api/middleware/request_logging.go::isResponsesWebsocketUpgrade` 的路径识别从仅 `/v1/responses` 扩到同时接受 `/backend-api/codex/responses`，并在 `internal/api/middleware/request_logging_test.go` 补 alias websocket GET 用例。结果：`go test ./internal/api/middleware -run 'TestShouldSkipMethodForRequestLogging' -count=1` 通过，说明 alias GET 已重新进入 request logging 主链。
+- E2: 将 `internal/logging/gin_logger.go::aiAPIPrefixes` 补入 `/backend-api/codex`，并在 `internal/logging/gin_logger_images_test.go` 增加 alias 路径断言。结果：`go test ./internal/logging -run 'Test(IsAIAPIPathIncludesImages|IsAIAPIPathIncludesCodexAliasResponses|GinLogrusLogger_MainLogIncludesUserAgent|SummarizeUserAgentForMainLog_NormalizesAndTruncates)' -count=1` 通过，说明 alias POST/compact 已重新拿到 AI API request_id 口径。
+- E3: 将 `internal/runtime/executor/codex_image_tool.go` 的注入条件从“非 spark 一律注入”收口为“请求显式声明 image_generation 意图（`tool_choice.type=image_generation` 或已有 image_generation tool）时才补齐工具”，并补普通文本请求不注入测试。结果：`go test ./internal/runtime/executor -run 'Test(CodexPrepareRequestPlan_(InjectsImageGenerationToolForExplicitImageIntent|DoesNotInjectImageGenerationToolForPlainTextRequest|DoesNotDuplicateImageGenerationTool|SkipsImageGenerationToolForSpark|StripsStreamOptions)|ParseRetryDelaySupports(SecondsMessage|HumanDurationMessage))' -count=1` 通过，说明普通文本请求的工具集合不再被静默扩大。
+
+## Root Cause
+- Root cause 1: alias 路由只补了 `internal/api/server.go::setupRoutes`，但没有同步扩展 `internal/api/middleware/request_logging.go::isResponsesWebsocketUpgrade` 与 `internal/logging/gin_logger.go::aiAPIPrefixes` 的路径白名单，导致新入口功能可用但观测链路断开。
+- Root cause 2: `internal/runtime/executor/codex_image_tool.go::ensureCodexImageGenerationTool` 过去只按模型后缀过滤，没有读取请求本身的图片意图，导致所有非 spark 的普通 Codex 请求都会被静默扩展工具集合。
+
+## Fix
+- Fix 1: alias Responses 的 GET/POST/compact 现在都重新纳入现有 request logging / request_id 主链。
+- Fix 2: image_generation 注入现在只对显式图片请求生效；普通文本请求维持原始工具集合不变。

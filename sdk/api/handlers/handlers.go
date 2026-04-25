@@ -59,6 +59,7 @@ const (
 type pinnedAuthContextKey struct{}
 type selectedAuthCallbackContextKey struct{}
 type executionSessionContextKey struct{}
+type disallowFreeAuthContextKey struct{}
 
 // StreamRouteConfig 描述流式请求的“调度模型”和“执行模型”。
 // Images 等特殊链路需要按能力模型选 auth，但仍用固定主模型构造上游请求。
@@ -102,6 +103,15 @@ func WithExecutionSessionID(ctx context.Context, sessionID string) context.Conte
 		ctx = context.Background()
 	}
 	return context.WithValue(ctx, executionSessionContextKey{}, sessionID)
+}
+
+// WithDisallowFreeAuth 返回一个要求跳过已知免费档凭证的子 context。
+// 当前主要用于 OpenAI Images -> Codex 路径，避免图片请求落到 free-tier auth。
+func WithDisallowFreeAuth(ctx context.Context) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithValue(ctx, disallowFreeAuthContextKey{}, true)
 }
 
 // BuildErrorResponseBody builds an OpenAI-compatible JSON error response body.
@@ -221,7 +231,21 @@ func requestExecutionMetadata(ctx context.Context) map[string]any {
 	if executionSessionID := executionSessionIDFromContext(ctx); executionSessionID != "" {
 		meta[coreexecutor.ExecutionSessionMetadataKey] = executionSessionID
 	}
+	if disallowFreeAuthFromContext(ctx) {
+		meta[coreexecutor.DisallowFreeAuthMetadataKey] = true
+	}
 	return meta
+}
+
+// applyRequestIntentMetadata 把需要提前影响 auth selection 的请求意图写入 execution metadata。
+// 这里必须在 handlers 层完成，因为 selection 发生在 executor/request-plan 之前。
+func applyRequestIntentMetadata(meta map[string]any, rawJSON []byte) {
+	if meta == nil {
+		return
+	}
+	if coreexecutor.RequestHasExplicitImageGenerationIntent(rawJSON) {
+		meta[coreexecutor.DisallowFreeAuthMetadataKey] = true
+	}
 }
 
 // applyClientRoutingPolicyMetadata 将入站 client api-key 的路由限制收口成
@@ -401,6 +425,14 @@ func executionSessionIDFromContext(ctx context.Context) string {
 	default:
 		return ""
 	}
+}
+
+func disallowFreeAuthFromContext(ctx context.Context) bool {
+	if ctx == nil {
+		return false
+	}
+	raw, ok := ctx.Value(disallowFreeAuthContextKey{}).(bool)
+	return ok && raw
 }
 
 // BaseAPIHandler contains the handlers for API endpoints.
@@ -635,6 +667,7 @@ func (h *BaseAPIHandler) ExecuteWithAuthManager(ctx context.Context, handlerType
 	}
 	primeRequestTranslationCache(handlerType, rawJSON)
 	reqMeta := requestExecutionMetadata(ctx)
+	applyRequestIntentMetadata(reqMeta, rawJSON)
 	applyClientRoutingPolicyMetadata(reqMeta, ctx, h.Cfg)
 	reqMeta[coreexecutor.RequestedModelMetadataKey] = normalizedModel
 	payload := rawJSON
@@ -684,6 +717,7 @@ func (h *BaseAPIHandler) ExecuteCountWithAuthManager(ctx context.Context, handle
 	}
 	primeRequestTranslationCache(handlerType, rawJSON)
 	reqMeta := requestExecutionMetadata(ctx)
+	applyRequestIntentMetadata(reqMeta, rawJSON)
 	applyClientRoutingPolicyMetadata(reqMeta, ctx, h.Cfg)
 	reqMeta[coreexecutor.RequestedModelMetadataKey] = normalizedModel
 	payload := rawJSON
@@ -775,6 +809,7 @@ func (h *BaseAPIHandler) ExecuteStreamWithAuthManagerForRoute(ctx context.Contex
 func (h *BaseAPIHandler) executeStreamWithResolvedRoute(ctx context.Context, handlerType string, route StreamRouteConfig, providers []string, rawJSON []byte, alt string) (<-chan []byte, http.Header, <-chan *interfaces.ErrorMessage) {
 	primeRequestTranslationCache(handlerType, rawJSON)
 	reqMeta := requestExecutionMetadata(ctx)
+	applyRequestIntentMetadata(reqMeta, rawJSON)
 	applyClientRoutingPolicyMetadata(reqMeta, ctx, h.Cfg)
 	reqMeta[coreexecutor.RequestedModelMetadataKey] = route.ExecutionModel
 	if selectionModel := strings.TrimSpace(route.SelectionModel); selectionModel != "" && !strings.EqualFold(selectionModel, route.ExecutionModel) {

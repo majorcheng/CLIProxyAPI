@@ -82,6 +82,7 @@ func (h *OpenAIAPIHandler) executeImagesRequest(c *gin.Context, payload imagesRe
 func (h *OpenAIAPIHandler) collectImagesFromResponses(c *gin.Context, responsesReq []byte, routeModel string, responseFormat string) {
 	c.Header("Content-Type", "application/json")
 	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
+	cliCtx = handlers.WithDisallowFreeAuth(cliCtx)
 	stopKeepAlive := h.StartNonStreamingKeepAlive(c, cliCtx)
 	dataChan, upstreamHeaders, errChan := h.ExecuteStreamWithAuthManagerForRoute(cliCtx, "openai-response", handlers.StreamRouteConfig{
 		ExecutionModel:      defaultImagesMainModel,
@@ -110,6 +111,7 @@ func (h *OpenAIAPIHandler) streamImagesFromResponses(c *gin.Context, responsesRe
 		return
 	}
 	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
+	cliCtx = handlers.WithDisallowFreeAuth(cliCtx)
 	dataChan, upstreamHeaders, errChan := h.ExecuteStreamWithAuthManagerForRoute(cliCtx, "openai-response", handlers.StreamRouteConfig{
 		ExecutionModel:      defaultImagesMainModel,
 		SelectionModel:      routeModel,

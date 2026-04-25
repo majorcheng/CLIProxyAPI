@@ -3,6 +3,7 @@ package executor
 import (
 	"strings"
 
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
@@ -13,7 +14,7 @@ var codexImageGenerationToolArrayJSON = []byte(`[{"type":"image_generation","out
 // ensureCodexImageGenerationTool 只在请求已显式表达图片生成意图时补齐内建图片工具。
 // 这样既保住图片入口的最小兼容兜底，也避免普通文本请求被静默扩大工具集合。
 func ensureCodexImageGenerationTool(body []byte, baseModel string) []byte {
-	if shouldSkipCodexImageGenerationTool(baseModel) || !codexRequestWantsImageGeneration(body) {
+	if shouldSkipCodexImageGenerationTool(baseModel) || !cliproxyexecutor.RequestHasExplicitImageGenerationIntent(body) {
 		return body
 	}
 
@@ -41,20 +42,4 @@ func ensureCodexImageGenerationTool(body []byte, baseModel string) []byte {
 
 func shouldSkipCodexImageGenerationTool(baseModel string) bool {
 	return strings.HasSuffix(strings.ToLower(strings.TrimSpace(baseModel)), "spark")
-}
-
-func codexRequestWantsImageGeneration(body []byte) bool {
-	if strings.TrimSpace(gjson.GetBytes(body, "tool_choice.type").String()) == "image_generation" {
-		return true
-	}
-	tools := gjson.GetBytes(body, "tools")
-	if !tools.Exists() || !tools.IsArray() {
-		return false
-	}
-	for _, tool := range tools.Array() {
-		if strings.TrimSpace(tool.Get("type").String()) == "image_generation" {
-			return true
-		}
-	}
-	return false
 }

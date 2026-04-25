@@ -24,6 +24,7 @@ type imageRouteExecutorCall struct {
 	Model          string
 	RequestedModel string
 	SelectionModel string
+	DisallowFree   bool
 }
 
 type imageRouteCaptureExecutor struct {
@@ -45,6 +46,7 @@ func (e *imageRouteCaptureExecutor) ExecuteStream(_ context.Context, auth *corea
 		Model:          req.Model,
 		RequestedModel: metadataString(opts.Metadata, coreexecutor.RequestedModelMetadataKey),
 		SelectionModel: metadataString(opts.Metadata, coreexecutor.SelectionModelMetadataKey),
+		DisallowFree:   metadataBool(opts.Metadata, coreexecutor.DisallowFreeAuthMetadataKey),
 	})
 	e.mu.Unlock()
 
@@ -116,8 +118,45 @@ func TestImagesGenerations_RoutesByImageModelAndExecutesWithMainModel(t *testing
 	if codexCalls[0].SelectionModel != defaultImagesToolModel {
 		t.Fatalf("selection_model = %q, want %q", codexCalls[0].SelectionModel, defaultImagesToolModel)
 	}
+	if !codexCalls[0].DisallowFree {
+		t.Fatal("expected disallow_free_auth metadata for images route")
+	}
 	if got := len(openaiExecutor.Calls()); got != 0 {
 		t.Fatalf("openai executor calls = %d, want 0", got)
+	}
+}
+
+func TestImagesGenerations_DisallowFreeCodexAuthDuringSelection(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	manager := coreauth.NewManager(nil, &coreauth.RoundRobinSelector{}, nil)
+	codexExecutor := &imageRouteCaptureExecutor{id: "codex"}
+	manager.RegisterExecutor(codexExecutor)
+
+	registerImageTestAuthWithAttributes(t, manager, "auth-codex-free", "codex", []string{"gpt-image-2"}, map[string]string{"plan_type": "free"})
+	registerImageTestAuthWithAttributes(t, manager, "auth-codex-plus", "codex", []string{"gpt-image-2"}, map[string]string{"plan_type": "plus"})
+
+	base := handlers.NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, manager)
+	h := NewOpenAIAPIHandler(base)
+	router := gin.New()
+	router.POST("/v1/images/generations", h.ImagesGenerations)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/images/generations", strings.NewReader(`{"prompt":"draw a cat"}`))
+	req.Header.Set("Content-Type", "application/json")
+	resp := httptest.NewRecorder()
+	router.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d, body=%s", resp.Code, http.StatusOK, resp.Body.String())
+	}
+	calls := codexExecutor.Calls()
+	if len(calls) != 1 {
+		t.Fatalf("codex executor calls = %d, want 1", len(calls))
+	}
+	if calls[0].AuthID != "auth-codex-plus" {
+		t.Fatalf("selected auth = %q, want %q", calls[0].AuthID, "auth-codex-plus")
+	}
+	if !calls[0].DisallowFree {
+		t.Fatal("expected disallow_free_auth metadata for images route")
 	}
 }
 
@@ -217,8 +256,12 @@ func TestStartImagesStream_CompletedThenCloseFinishesWithoutError(t *testing.T) 
 }
 
 func registerImageTestAuth(t *testing.T, manager *coreauth.Manager, authID, provider string, models []string) {
+	registerImageTestAuthWithAttributes(t, manager, authID, provider, models, nil)
+}
+
+func registerImageTestAuthWithAttributes(t *testing.T, manager *coreauth.Manager, authID, provider string, models []string, attrs map[string]string) {
 	t.Helper()
-	auth := &coreauth.Auth{ID: authID, Provider: provider, Status: coreauth.StatusActive}
+	auth := &coreauth.Auth{ID: authID, Provider: provider, Status: coreauth.StatusActive, Attributes: attrs}
 	if _, err := manager.Register(context.Background(), auth); err != nil {
 		t.Fatalf("Register(%s): %v", authID, err)
 	}
@@ -255,5 +298,17 @@ func metadataString(meta map[string]any, key string) string {
 		return ""
 	}
 	value, _ := raw.(string)
+	return value
+}
+
+func metadataBool(meta map[string]any, key string) bool {
+	if len(meta) == 0 {
+		return false
+	}
+	raw, ok := meta[key]
+	if !ok || raw == nil {
+		return false
+	}
+	value, _ := raw.(bool)
 	return value
 }

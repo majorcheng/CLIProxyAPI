@@ -1192,3 +1192,43 @@
 ## Fix
 - Fix 1: alias Responses 的 GET/POST/compact 现在都重新纳入现有 request logging / request_id 主链。
 - Fix 2: image_generation 注入现在只对显式图片请求生效；普通文本请求维持原始工具集合不变。
+
+## 2026-04-25 v6.9.37 review fix
+
+### Observations
+- 当前 `disallow_free_auth` 只在 `sdk/api/handlers/openai/openai_images_handlers.go` 的 Images 路由写入；普通 Codex 显式图片意图请求不会带这个 metadata。
+- 当前 Codex 图片工具注入真相源仍是 `internal/runtime/executor/codex_request_plan.go -> ensureCodexImageGenerationTool(...)`，selection 发生在此之前。
+- `sdk/cliproxy/auth/conductor.go::isFreeCodexAuth` 只读取 `auth.Attributes["plan_type"]`，未复用仓内统一的 `AuthChatGPTPlanType(auth)` 回退逻辑。
+
+### Hypotheses
+- H1(ROOT): 需要在 handlers 层对“显式图片意图请求”提前写入 `DisallowFreeAuthMetadataKey`，否则 selection 阶段无法跳过 free-tier Codex。
+- H2: `isFreeCodexAuth` 应该改为复用 `AuthChatGPTPlanType(auth)`，否则 metadata-only 的 free auth 会漏过过滤。
+- H3: 只改 auth selection 不够，还要补 handlers/route 测试，分别覆盖普通图片意图 metadata 写入与 metadata-only free auth 的跳过。
+
+### Experiments
+- E1: 在 handlers 执行链增加“显式图片意图 -> disallow_free_auth” metadata 注入，并补最小测试验证。
+- E2: 将 `isFreeCodexAuth` 改为复用 `AuthChatGPTPlanType(auth)`，再补 metadata-only free auth 的回归测试。
+
+- E1 结果：在 `sdk/api/handlers/handlers.go::{ExecuteWithAuthManager,ExecuteCountWithAuthManager,executeStreamWithResolvedRoute}` 统一调用 `applyRequestIntentMetadata(...)`，对显式 `image_generation` 意图请求提前写入 `DisallowFreeAuthMetadataKey`。同时把请求意图判断抽到 `sdk/cliproxy/executor::RequestHasExplicitImageGenerationIntent(...)`，并让 `internal/runtime/executor/codex_image_tool.go::ensureCodexImageGenerationTool` 复用同一口径。验证：
+  - `timeout 60s go test ./sdk/cliproxy/executor -run 'TestRequestHasExplicitImageGenerationIntent' -count=1` 通过；
+  - `timeout 60s go test ./sdk/api/handlers -run 'Test(ExecuteWithAuthManager_DisallowFreeCodexForExplicitImageIntent|ExecuteCountWithAuthManager_DisallowFreeCodexForExplicitImageIntent|ExecuteStreamWithAuthManager_DisallowFreeCodexForExplicitImageIntent|RequestExecutionMetadataIncludesExecutionSessionWithoutIdempotencyKey|RequestExecutionMetadataIncludesDisallowFreeAuth)' -count=1` 通过；
+  - `timeout 60s go test ./internal/runtime/executor -run 'TestCodexPrepareRequestPlan_(InjectsImageGenerationToolForExplicitImageIntent|DoesNotInjectImageGenerationToolForPlainTextRequest|DoesNotDuplicateImageGenerationTool|SkipsImageGenerationToolForSpark)' -count=1` 通过；
+  - `timeout 60s go test ./sdk/api/handlers/openai -run 'TestImagesGenerations_(RoutesByImageModelAndExecutesWithMainModel|DisallowFreeCodexAuthDuringSelection)' -count=1` 通过。
+- E2 结果：`sdk/cliproxy/auth/conductor.go::isFreeCodexAuth` 已改为复用 `sdk/cliproxy/auth/registration_order.go::AuthChatGPTPlanType(auth)`，metadata-only 的 `plan_type=free` 现在也会被 `disallow_free_auth` 正确跳过。验证：`timeout 60s go test ./sdk/cliproxy/auth -run 'TestManager_PickNextMixed_DisallowFreeAuthSkips(CodexFreePlan|MetadataOnlyCodexFreePlan)' -count=1` 通过。
+
+### Root Cause
+- Root cause 1: `disallow_free_auth` 之前只在 OpenAI Images 专用路由写入，普通 `Responses/Chat` 这类显式图片意图请求在进入 auth selection 时没有任何 free-tier 过滤信号。
+- Root cause 2: `sdk/cliproxy/auth/conductor.go::isFreeCodexAuth` 自己重复实现了 `plan_type` 判断，却没有复用仓内统一的 `AuthChatGPTPlanType(auth)`，导致 metadata-only 的 free auth 与其他 Codex free 语义不一致。
+
+### Fix
+- Fix 1: 新增 `sdk/cliproxy/executor/request_intent.go`，把“显式图片意图”抽成共享 helper；handlers 选 auth 与 Codex request-plan 图片工具注入现在复用同一真相源。
+- Fix 2: handlers 的三条执行链现在都会在 selection 前对显式图片请求补 `DisallowFreeAuthMetadataKey`，因此普通 Codex 图片意图请求与 `/v1/images/*` 一样，都会跳过 free-tier Codex auth。
+- Fix 3: `sdk/cliproxy/auth/conductor.go::isFreeCodexAuth` 现在复用 `AuthChatGPTPlanType(auth)`，统一 Attributes 与 Metadata 的 `plan_type` 读取口径。
+
+### Verification
+- `timeout 60s go test ./sdk/cliproxy/executor -run 'TestRequestHasExplicitImageGenerationIntent' -count=1` 通过。
+- `timeout 60s go test ./sdk/api/handlers -run 'Test(ExecuteWithAuthManager_DisallowFreeCodexForExplicitImageIntent|ExecuteCountWithAuthManager_DisallowFreeCodexForExplicitImageIntent|ExecuteStreamWithAuthManager_DisallowFreeCodexForExplicitImageIntent|RequestExecutionMetadataIncludesExecutionSessionWithoutIdempotencyKey|RequestExecutionMetadataIncludesDisallowFreeAuth)' -count=1` 通过。
+- `timeout 60s go test ./internal/runtime/executor -run 'TestCodexPrepareRequestPlan_(InjectsImageGenerationToolForExplicitImageIntent|DoesNotInjectImageGenerationToolForPlainTextRequest|DoesNotDuplicateImageGenerationTool|SkipsImageGenerationToolForSpark)' -count=1` 通过。
+- `timeout 60s go test ./sdk/api/handlers/openai -run 'TestImagesGenerations_(RoutesByImageModelAndExecutesWithMainModel|DisallowFreeCodexAuthDuringSelection)' -count=1` 通过。
+- `timeout 60s go test ./sdk/cliproxy/auth -run 'TestManager_PickNextMixed_DisallowFreeAuthSkips(CodexFreePlan|MetadataOnlyCodexFreePlan)' -count=1` 通过。
+- `timeout 60s go test ./... -run '^$'` 通过。

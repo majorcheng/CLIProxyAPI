@@ -18,3 +18,12 @@ func TestRequestExecutionMetadataIncludesExecutionSessionWithoutIdempotencyKey(t
 		t.Fatalf("unexpected idempotency key in metadata: %v", meta[idempotencyKeyMetadataKey])
 	}
 }
+
+func TestRequestExecutionMetadataIncludesDisallowFreeAuth(t *testing.T) {
+	ctx := WithDisallowFreeAuth(context.Background())
+
+	meta := requestExecutionMetadata(ctx)
+	if got := meta[coreexecutor.DisallowFreeAuthMetadataKey]; got != true {
+		t.Fatalf("DisallowFreeAuthMetadataKey = %v, want true", got)
+	}
+}

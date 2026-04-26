@@ -192,6 +192,9 @@ func TestGetOpenAICompatIncludesEntryAndFallbackAuthIndex(t *testing.T) {
 		t.Fatalf("openai-compatibility items = %#v", payload["openai-compatibility"])
 	}
 	alpha := items[0].(map[string]any)
+	if disabled, ok := alpha["disabled"].(bool); !ok || disabled {
+		t.Fatalf("alpha disabled = %#v, want false", alpha["disabled"])
+	}
 	entries, ok := alpha["api-key-entries"].([]any)
 	if !ok || len(entries) != 2 {
 		t.Fatalf("alpha api-key-entries = %#v", alpha["api-key-entries"])
@@ -260,6 +263,9 @@ func TestPatchOpenAICompatResponseIncludesAuthIndex(t *testing.T) {
 	if !ok {
 		t.Fatalf("unexpected response item type: %T", items[0])
 	}
+	if disabled, ok := item["disabled"].(bool); !ok || disabled {
+		t.Fatalf("disabled = %#v, want false", item["disabled"])
+	}
 	if got, _ := item["priority"].(float64); got != 7 {
 		t.Fatalf("priority = %v, want 7", got)
 	}
@@ -272,6 +278,58 @@ func TestPatchOpenAICompatResponseIncludesAuthIndex(t *testing.T) {
 		if got, _ := entry["auth-index"].(string); got == "" {
 			t.Fatalf("entry[%d] missing auth-index: %#v", i, entry)
 		}
+	}
+}
+
+func TestGetOpenAICompatIncludesDisabledField(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	cfg := &config.Config{
+		OpenAICompatibility: []config.OpenAICompatibility{{
+			Name:          "Disabled Compat",
+			BaseURL:       "https://disabled.example.com",
+			Disabled:      true,
+			APIKeyEntries: []config.OpenAICompatibilityAPIKey{{APIKey: "disabled-key"}},
+		}},
+	}
+	manager := coreauth.NewManager(nil, nil, nil)
+	registerConfigSynthesizedAuths(t, manager, cfg)
+	h, configPath := newOpenAICompatTestHandler(t, ""+
+		"openai-compatibility:\n"+
+		"  - name: \"Disabled Compat\"\n"+
+		"    disabled: true\n"+
+		"    base-url: \"https://disabled.example.com\"\n"+
+		"    api-key-entries:\n"+
+		"      - api-key: \"disabled-key\"\n")
+	cfgFromDisk, err := config.LoadConfig(configPath)
+	if err != nil {
+		t.Fatalf("reload config: %v", err)
+	}
+	h.SetConfig(cfgFromDisk)
+	h.SetAuthManager(manager)
+
+	rec := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(rec)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/v0/management/openai-compatibility", nil)
+
+	h.GetOpenAICompat(ctx)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	items := decodeObjectListField(t, rec, "openai-compatibility")
+	if len(items) != 1 {
+		t.Fatalf("items len = %d, want 1", len(items))
+	}
+	if disabled, ok := items[0]["disabled"].(bool); !ok || !disabled {
+		t.Fatalf("disabled = %#v, want true", items[0]["disabled"])
+	}
+	entries, ok := items[0]["api-key-entries"].([]any)
+	if !ok || len(entries) != 1 {
+		t.Fatalf("api-key-entries = %#v", items[0]["api-key-entries"])
+	}
+	if got, _ := entries[0].(map[string]any)["auth-index"].(string); got != "" {
+		t.Fatalf("disabled compat auth-index = %q, want empty", got)
 	}
 }
 

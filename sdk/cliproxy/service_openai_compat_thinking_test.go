@@ -97,3 +97,40 @@ func TestRegisterModelsForAuth_OpenAICompatibility_ExplicitThinkingEnablesManage
 		t.Fatalf("unexpected thinking levels: %+v", got.Thinking)
 	}
 }
+
+func TestRegisterModelsForAuth_OpenAICompatibility_DisabledProviderUnregistersModels(t *testing.T) {
+	modelID := "compat-disabled-" + t.Name()
+	authID := "auth-" + t.Name()
+	service := &Service{
+		cfg: &config.Config{
+			OpenAICompatibility: []config.OpenAICompatibility{{
+				Name:     "compat-disabled",
+				Disabled: true,
+				Models: []config.OpenAICompatibilityModel{{
+					Name:  "upstream-disabled",
+					Alias: modelID,
+				}},
+			}},
+		},
+	}
+	auth := &coreauth.Auth{
+		ID:       authID,
+		Provider: "openai-compatibility",
+		Status:   coreauth.StatusActive,
+		Attributes: map[string]string{
+			"compat_name": "compat-disabled",
+		},
+	}
+
+	reg := GlobalModelRegistry()
+	reg.RegisterClient(auth.ID, "compat-disabled", []*registry.ModelInfo{{ID: modelID}})
+	t.Cleanup(func() {
+		reg.UnregisterClient(auth.ID)
+	})
+
+	service.registerModelsForAuth(auth)
+
+	if got := registry.LookupModelInfo(modelID, "compat-disabled"); got != nil {
+		t.Fatalf("expected disabled compat provider to unregister %q, got %+v", modelID, got)
+	}
+}

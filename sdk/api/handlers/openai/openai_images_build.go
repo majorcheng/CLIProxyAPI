@@ -38,7 +38,7 @@ func buildImagesResponsesRequest(payload imagesRequestPayload) ([]byte, error) {
 		"reasoning":           map[string]any{"effort": "medium", "summary": "auto"},
 		"parallel_tool_calls": true,
 		"include":             []string{"reasoning.encrypted_content"},
-		"model":               defaultImagesMainModel,
+		"model":               buildImagesMainModel(payload.Model),
 		"store":               false,
 		"tool_choice":         map[string]any{"type": "image_generation"},
 		"tools":               []any{buildImageToolPayload(payload)},
@@ -47,6 +47,18 @@ func buildImagesResponsesRequest(payload imagesRequestPayload) ([]byte, error) {
 		},
 	}
 	return json.Marshal(requestBody)
+}
+
+// buildImagesMainModel 复用图片模型前缀，保证执行主模型与选路模型落在同一路由空间。
+func buildImagesMainModel(toolModel string) string {
+	trimmed := strings.TrimSpace(toolModel)
+	if idx := strings.LastIndex(trimmed, "/"); idx > 0 && idx < len(trimmed)-1 {
+		prefix := strings.TrimSpace(trimmed[:idx])
+		if prefix != "" {
+			return prefix + "/" + defaultImagesMainModel
+		}
+	}
+	return defaultImagesMainModel
 }
 
 // buildImagesInputContent 统一拼装 prompt 与可选 input_image 数组。

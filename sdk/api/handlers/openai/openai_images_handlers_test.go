@@ -41,6 +41,22 @@ func TestBuildImagesResponsesRequest_BuildsToolChoiceAndInputImages(t *testing.T
 	}
 }
 
+func TestBuildImagesResponsesRequest_PreservesToolPrefixOnMainModel(t *testing.T) {
+	payload := imagesRequestPayload{
+		Action: "generate",
+		Prompt: "draw a cat",
+		Model:  "team-a/gpt-image-2",
+	}
+
+	raw, err := buildImagesResponsesRequest(payload)
+	if err != nil {
+		t.Fatalf("buildImagesResponsesRequest() error = %v", err)
+	}
+	if got := gjson.GetBytes(raw, "model").String(); got != "team-a/"+defaultImagesMainModel {
+		t.Fatalf("model = %q, want %q", got, "team-a/"+defaultImagesMainModel)
+	}
+}
+
 func TestExtractImagesFromResponsesCompleted_ParsesImagesAndUsage(t *testing.T) {
 	payload := []byte(`{
 		"type":"response.completed",

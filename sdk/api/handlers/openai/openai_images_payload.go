@@ -208,7 +208,7 @@ func normalizeImagesPayload(payload imagesRequestPayload) (imagesRequestPayload,
 	if payload.Model == "" {
 		payload.Model = defaultImagesToolModel
 	}
-	if !strings.EqualFold(payload.Model, defaultImagesToolModel) {
+	if !isSupportedImagesToolModel(payload.Model) {
 		return imagesRequestPayload{}, fmt.Errorf("Invalid request: model %q is not supported for /v1/images (only %s is supported)", payload.Model, defaultImagesToolModel)
 	}
 	if payload.ResponseFormat == "" {
@@ -218,6 +218,17 @@ func normalizeImagesPayload(payload imagesRequestPayload) (imagesRequestPayload,
 		return imagesRequestPayload{}, fmt.Errorf("Invalid request: image is required")
 	}
 	return payload, nil
+}
+
+func isSupportedImagesToolModel(model string) bool {
+	trimmed := strings.TrimSpace(model)
+	if strings.EqualFold(trimmed, defaultImagesToolModel) {
+		return true
+	}
+	if idx := strings.LastIndex(trimmed, "/"); idx > 0 && idx < len(trimmed)-1 {
+		return strings.EqualFold(strings.TrimSpace(trimmed[idx+1:]), defaultImagesToolModel)
+	}
+	return false
 }
 
 // collectImageURLs 提取 JSON 模式下的输入图片 URL，并拒绝 file_id。

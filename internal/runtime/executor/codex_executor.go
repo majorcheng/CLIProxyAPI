@@ -30,9 +30,10 @@ import (
 )
 
 const (
-	codexUserAgent  = "codex-tui/0.118.0 (Ubuntu 24.4.0; x86_64) xterm-256color (codex-tui; 0.118.0)"
-	codexOriginator = "codex-tui"
-	codexSandbox    = "seccomp"
+	codexUserAgent             = "codex-tui/0.118.0 (Ubuntu 24.4.0; x86_64) xterm-256color (codex-tui; 0.118.0)"
+	codexOriginator            = "codex-tui"
+	codexSandbox               = "seccomp"
+	codexDefaultImageToolModel = "gpt-image-2"
 	// Give non-stream /responses a short chance to reach EOF so keep-alive
 	// connections can be reused without reintroducing long tail latency.
 	codexCompletedDrainGracePeriod = 100 * time.Millisecond
@@ -222,7 +223,7 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 		return resp, err
 	}
 
-	data, err := readCodexCompletedEvent(ctx, e.cfg, httpResp.Body, reporter)
+	data, err := readCodexCompletedEvent(ctx, e.cfg, httpResp.Body, body, reporter)
 	if err != nil {
 		if _, ok := err.(statusErr); !ok {
 			recordAPIResponseError(ctx, e.cfg, err)
@@ -426,6 +427,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 					if detail, ok := parseCodexUsage(data); ok {
 						reporter.publish(ctx, detail)
 					}
+					publishCodexImageToolUsage(ctx, reporter, body, data)
 					data = patchCodexCompletedOutput(data, outputItemsByIndex, outputItemsFallback)
 					translatedLine = append([]byte("data: "), data...)
 				}
@@ -658,7 +660,7 @@ func (e *CodexExecutor) cacheHelper(ctx context.Context, from sdktranslator.Form
 	return newCodexHTTPRequest(ctx, url, rawJSON, conversationID)
 }
 
-func readCodexCompletedEvent(ctx context.Context, cfg *config.Config, body io.ReadCloser, reporter *usageReporter) ([]byte, error) {
+func readCodexCompletedEvent(ctx context.Context, cfg *config.Config, body io.ReadCloser, requestBody []byte, reporter *usageReporter) ([]byte, error) {
 	reader := bufio.NewReader(body)
 	outputItemsByIndex := make(map[int64][]byte)
 	var outputItemsFallback [][]byte
@@ -676,6 +678,7 @@ func readCodexCompletedEvent(ctx context.Context, cfg *config.Config, body io.Re
 					if detail, ok := parseCodexUsage(completedData); ok {
 						reporter.publish(ctx, detail)
 					}
+					publishCodexImageToolUsage(ctx, reporter, requestBody, completedData)
 					reporter.ensurePublished(ctx)
 					drainCodexCompletedBody(ctx, cfg, reader, body)
 					return bytes.Clone(completedData), nil
@@ -888,11 +891,96 @@ func newCodexStatusErr(statusCode int, body []byte) statusErr {
 	if isCodexModelCapacityError(body) {
 		errCode = http.StatusTooManyRequests
 	}
+	body = classifyCodexStatusError(errCode, body)
 	err := statusErr{code: errCode, msg: string(body)}
 	if retryAfter := parseCodexRetryAfter(errCode, body, time.Now()); retryAfter != nil {
 		err.retryAfter = retryAfter
 	}
 	return err
+}
+
+func classifyCodexStatusError(statusCode int, body []byte) []byte {
+	code, errType, ok := codexStatusErrorClassification(statusCode, body)
+	if !ok {
+		return body
+	}
+	message := gjson.GetBytes(body, "error.message").String()
+	if message == "" {
+		message = gjson.GetBytes(body, "message").String()
+	}
+	if message == "" {
+		message = strings.TrimSpace(string(body))
+	}
+	if message == "" {
+		message = http.StatusText(statusCode)
+	}
+	out := []byte(`{"error":{}}`)
+	out, _ = sjson.SetBytes(out, "error.message", message)
+	out, _ = sjson.SetBytes(out, "error.type", errType)
+	out, _ = sjson.SetBytes(out, "error.code", code)
+	return out
+}
+
+func codexStatusErrorClassification(statusCode int, body []byte) (code string, errType string, ok bool) {
+	errorMessage := strings.ToLower(strings.TrimSpace(gjson.GetBytes(body, "error.message").String()))
+	if errorMessage == "" {
+		errorMessage = strings.ToLower(strings.TrimSpace(gjson.GetBytes(body, "message").String()))
+	}
+	lower := strings.ToLower(strings.TrimSpace(string(body)))
+	upstreamCode := strings.ToLower(strings.TrimSpace(gjson.GetBytes(body, "error.code").String()))
+	upstreamType := strings.ToLower(strings.TrimSpace(gjson.GetBytes(body, "error.type").String()))
+	isInvalidRequest := upstreamType == "" || upstreamType == "invalid_request_error"
+
+	switch {
+	case statusCode == http.StatusRequestEntityTooLarge ||
+		upstreamCode == "context_length_exceeded" ||
+		upstreamCode == "context_too_large" ||
+		isInvalidRequest && (strings.Contains(errorMessage, "context length") ||
+			strings.Contains(errorMessage, "context_length") ||
+			strings.Contains(errorMessage, "maximum context") ||
+			strings.Contains(errorMessage, "too many tokens")):
+		return "context_too_large", "invalid_request_error", true
+	case strings.Contains(lower, "invalid signature in thinking block") ||
+		strings.Contains(lower, "invalid_encrypted_content"):
+		return "thinking_signature_invalid", "invalid_request_error", true
+	case upstreamCode == "previous_response_not_found" ||
+		strings.Contains(lower, "previous_response_not_found") ||
+		(strings.Contains(lower, "previous_response_id") && strings.Contains(lower, "not found")):
+		return "previous_response_not_found", "invalid_request_error", true
+	case statusCode == http.StatusUnauthorized ||
+		upstreamType == "authentication_error" ||
+		upstreamCode == "invalid_api_key" ||
+		strings.Contains(lower, "invalid or expired token") ||
+		strings.Contains(lower, "refresh_token_reused"):
+		return "auth_unavailable", "authentication_error", true
+	default:
+		return "", "", false
+	}
+}
+
+func publishCodexImageToolUsage(ctx context.Context, reporter *usageReporter, requestBody []byte, completedData []byte) {
+	detail, ok := parseCodexImageToolUsage(completedData)
+	if !ok {
+		return
+	}
+	reporter.ensurePublished(ctx)
+	reporter.publishAdditionalModel(ctx, codexImageGenerationToolModel(requestBody), detail)
+}
+
+func codexImageGenerationToolModel(body []byte) string {
+	tools := gjson.GetBytes(body, "tools")
+	if tools.IsArray() {
+		for _, tool := range tools.Array() {
+			if tool.Get("type").String() != "image_generation" {
+				continue
+			}
+			if model := strings.TrimSpace(tool.Get("model").String()); model != "" {
+				return model
+			}
+			break
+		}
+	}
+	return codexDefaultImageToolModel
 }
 
 func isCodexModelCapacityError(errorBody []byte) bool {

@@ -126,6 +126,46 @@ func TestImagesGenerations_RoutesByImageModelAndExecutesWithMainModel(t *testing
 	}
 }
 
+func TestImagesGenerations_PrefixedImageModelAlsoPrefixesExecutionModel(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	manager := coreauth.NewManager(nil, nil, nil)
+	codexExecutor := &imageRouteCaptureExecutor{id: "codex"}
+	manager.RegisterExecutor(codexExecutor)
+
+	registerImageTestAuth(t, manager, "auth-codex-prefixed", "codex", []string{"team-a/gpt-image-2"})
+
+	base := handlers.NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, manager)
+	h := NewOpenAIAPIHandler(base)
+	router := gin.New()
+	router.POST("/v1/images/generations", h.ImagesGenerations)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/images/generations", strings.NewReader(`{"prompt":"draw a cat","model":"team-a/gpt-image-2"}`))
+	req.Header.Set("Content-Type", "application/json")
+	resp := httptest.NewRecorder()
+	router.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d, body=%s", resp.Code, http.StatusOK, resp.Body.String())
+	}
+
+	calls := codexExecutor.Calls()
+	if len(calls) != 1 {
+		t.Fatalf("codex executor calls = %d, want 1", len(calls))
+	}
+	if calls[0].AuthID != "auth-codex-prefixed" {
+		t.Fatalf("codex auth id = %q, want %q", calls[0].AuthID, "auth-codex-prefixed")
+	}
+	if calls[0].Model != "team-a/"+defaultImagesMainModel {
+		t.Fatalf("codex request model = %q, want %q", calls[0].Model, "team-a/"+defaultImagesMainModel)
+	}
+	if calls[0].RequestedModel != "team-a/"+defaultImagesMainModel {
+		t.Fatalf("requested_model = %q, want %q", calls[0].RequestedModel, "team-a/"+defaultImagesMainModel)
+	}
+	if calls[0].SelectionModel != "team-a/gpt-image-2" {
+		t.Fatalf("selection_model = %q, want %q", calls[0].SelectionModel, "team-a/gpt-image-2")
+	}
+}
+
 func TestImagesGenerations_DisallowFreeCodexAuthDuringSelection(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	manager := coreauth.NewManager(nil, &coreauth.RoundRobinSelector{}, nil)

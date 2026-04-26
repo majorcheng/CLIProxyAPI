@@ -20,6 +20,7 @@ type usageReporter struct {
 	model       string
 	authID      string
 	authIndex   string
+	authType    string
 	apiKey      string
 	source      string
 	requestedAt time.Time
@@ -34,6 +35,7 @@ func newUsageReporter(ctx context.Context, provider, model string, auth *cliprox
 		requestedAt: time.Now(),
 		apiKey:      apiKey,
 		source:      resolveUsageSource(auth, apiKey),
+		authType:    resolveUsageAuthType(auth),
 	}
 	if auth != nil {
 		reporter.authID = auth.ID
@@ -50,6 +52,18 @@ func (r *usageReporter) publishFailure(ctx context.Context) {
 	r.publishWithOutcome(ctx, usage.Detail{}, true)
 }
 
+func (r *usageReporter) publishAdditionalModel(ctx context.Context, model string, detail usage.Detail) {
+	if r == nil {
+		return
+	}
+	model = strings.TrimSpace(model)
+	if model == "" {
+		return
+	}
+	detail = normalizeUsageDetailTotal(detail)
+	usage.PublishRecord(ctx, r.buildRecordForModel(model, detail, false))
+}
+
 func (r *usageReporter) trackFailure(ctx context.Context, errPtr *error) {
 	if r == nil || errPtr == nil {
 		return
@@ -63,17 +77,22 @@ func (r *usageReporter) publishWithOutcome(ctx context.Context, detail usage.Det
 	if r == nil {
 		return
 	}
+	detail = normalizeUsageDetailTotal(detail)
+	// 成功请求即使 usage 全为 0 也要落一条记录；
+	// 否则管理端会把“请求成功但上游未计费/未返回 token”的场景误判成根本没发生过。
+	r.once.Do(func() {
+		usage.PublishRecord(ctx, r.buildRecord(detail, failed))
+	})
+}
+
+func normalizeUsageDetailTotal(detail usage.Detail) usage.Detail {
 	if detail.TotalTokens == 0 {
 		total := detail.InputTokens + detail.OutputTokens + detail.ReasoningTokens
 		if total > 0 {
 			detail.TotalTokens = total
 		}
 	}
-	// 成功请求即使 usage 全为 0 也要落一条记录；
-	// 否则管理端会把“请求成功但上游未计费/未返回 token”的场景误判成根本没发生过。
-	r.once.Do(func() {
-		usage.PublishRecord(ctx, r.buildRecord(detail, failed))
-	})
+	return detail
 }
 
 // ensurePublished guarantees that a usage record is emitted exactly once.
@@ -93,13 +112,21 @@ func (r *usageReporter) buildRecord(detail usage.Detail, failed bool) usage.Reco
 	if r == nil {
 		return usage.Record{Detail: detail, Failed: failed}
 	}
+	return r.buildRecordForModel(r.model, detail, failed)
+}
+
+func (r *usageReporter) buildRecordForModel(model string, detail usage.Detail, failed bool) usage.Record {
+	if r == nil {
+		return usage.Record{Model: model, Detail: detail, Failed: failed}
+	}
 	return usage.Record{
 		Provider:    r.provider,
-		Model:       r.model,
+		Model:       model,
 		Source:      r.source,
 		APIKey:      r.apiKey,
 		AuthID:      r.authID,
 		AuthIndex:   r.authIndex,
+		AuthType:    r.authType,
 		RequestedAt: r.requestedAt,
 		Latency:     r.latency(),
 		Failed:      failed,
@@ -183,23 +210,32 @@ func resolveUsageSource(auth *cliproxyauth.Auth, ctxAPIKey string) string {
 	return ""
 }
 
+func resolveUsageAuthType(auth *cliproxyauth.Auth) string {
+	if auth == nil {
+		return ""
+	}
+	kind, _ := auth.AccountInfo()
+	kind = strings.TrimSpace(kind)
+	if kind == "api_key" {
+		return "apikey"
+	}
+	return kind
+}
+
 func parseCodexUsage(data []byte) (usage.Detail, bool) {
 	usageNode := gjson.ParseBytes(data).Get("response.usage")
 	if !usageNode.Exists() {
 		return usage.Detail{}, false
 	}
-	detail := usage.Detail{
-		InputTokens:  usageNode.Get("input_tokens").Int(),
-		OutputTokens: usageNode.Get("output_tokens").Int(),
-		TotalTokens:  usageNode.Get("total_tokens").Int(),
+	return parseOpenAIStyleUsageNode(usageNode), true
+}
+
+func parseCodexImageToolUsage(data []byte) (usage.Detail, bool) {
+	usageNode := gjson.ParseBytes(data).Get("response.tool_usage.image_gen")
+	if !usageNode.Exists() || !usageNode.IsObject() {
+		return usage.Detail{}, false
 	}
-	if cached := usageNode.Get("input_tokens_details.cached_tokens"); cached.Exists() {
-		detail.CachedTokens = cached.Int()
-	}
-	if reasoning := usageNode.Get("output_tokens_details.reasoning_tokens"); reasoning.Exists() {
-		detail.ReasoningTokens = reasoning.Int()
-	}
-	return detail, true
+	return parseOpenAIStyleUsageNode(usageNode), true
 }
 
 func parseOpenAIUsage(data []byte) usage.Detail {
@@ -207,6 +243,10 @@ func parseOpenAIUsage(data []byte) usage.Detail {
 	if !usageNode.Exists() {
 		return usage.Detail{}
 	}
+	return parseOpenAIStyleUsageNode(usageNode)
+}
+
+func parseOpenAIStyleUsageNode(usageNode gjson.Result) usage.Detail {
 	inputNode := usageNode.Get("prompt_tokens")
 	if !inputNode.Exists() {
 		inputNode = usageNode.Get("input_tokens")

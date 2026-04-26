@@ -137,13 +137,13 @@ func TestGetAvailableModelsReturnsClonedSupportedParameters(t *testing.T) {
 }
 
 func TestLookupModelInfoReturnsCloneForStaticDefinitions(t *testing.T) {
-	first := LookupModelInfo("glm-4.6")
+	first := LookupModelInfo("gpt-5.4")
 	if first == nil || first.Thinking == nil || len(first.Thinking.Levels) == 0 {
 		t.Fatalf("expected static model with thinking levels, got %+v", first)
 	}
 	first.Thinking.Levels[0] = "mutated"
 
-	second := LookupModelInfo("glm-4.6")
+	second := LookupModelInfo("gpt-5.4")
 	if second == nil || second.Thinking == nil || len(second.Thinking.Levels) == 0 || second.Thinking.Levels[0] == "mutated" {
 		t.Fatalf("expected static lookup clone, got %+v", second)
 	}
@@ -166,10 +166,10 @@ func TestCodexPlanStaticModelsMatchSelectivePortedCatalog(t *testing.T) {
 		models  []*ModelInfo
 		wantIDs []string
 	}{
-		{name: "codex-free", models: GetCodexFreeModels(), wantIDs: []string{"gpt-5.2", "gpt-5.3-codex", "gpt-5.4", "gpt-5.4-mini", "gpt-image-2"}},
-		{name: "codex-team", models: GetCodexTeamModels(), wantIDs: []string{"gpt-5.2", "gpt-5.3-codex", "gpt-5.4", "gpt-5.4-mini", "gpt-5.5", "gpt-image-2"}},
-		{name: "codex-plus", models: GetCodexPlusModels(), wantIDs: []string{"gpt-5.2", "gpt-5.3-codex", "gpt-5.3-codex-spark", "gpt-5.4", "gpt-5.4-mini", "gpt-5.5", "gpt-image-2"}},
-		{name: "codex-pro", models: GetCodexProModels(), wantIDs: []string{"gpt-5.2", "gpt-5.3-codex", "gpt-5.3-codex-spark", "gpt-5.4", "gpt-5.4-mini", "gpt-5.5", "gpt-image-2"}},
+		{name: "codex-free", models: GetCodexFreeModels(), wantIDs: []string{"gpt-5.2", "gpt-5.3-codex", "gpt-5.4", "gpt-5.4-mini", "codex-auto-review", "gpt-image-2"}},
+		{name: "codex-team", models: GetCodexTeamModels(), wantIDs: []string{"gpt-5.2", "gpt-5.3-codex", "gpt-5.4", "gpt-5.4-mini", "gpt-5.5", "codex-auto-review", "gpt-image-2"}},
+		{name: "codex-plus", models: GetCodexPlusModels(), wantIDs: []string{"gpt-5.2", "gpt-5.3-codex", "gpt-5.3-codex-spark", "gpt-5.4", "gpt-5.4-mini", "gpt-5.5", "codex-auto-review", "gpt-image-2"}},
+		{name: "codex-pro", models: GetCodexProModels(), wantIDs: []string{"gpt-5.2", "gpt-5.3-codex", "gpt-5.3-codex-spark", "gpt-5.4", "gpt-5.4-mini", "gpt-5.5", "codex-auto-review", "gpt-image-2"}},
 	}
 
 	for _, tt := range tests {
@@ -187,6 +187,28 @@ func TestCodexPlanStaticModelsMatchSelectivePortedCatalog(t *testing.T) {
 				t.Fatalf("expected gpt-5.4-mini thinking metadata, got %+v", gpt54Mini)
 			}
 		})
+	}
+}
+
+func TestLookupStaticModelInfo_CodexAutoReviewMatchesUpstreamCatalog(t *testing.T) {
+	info := LookupStaticModelInfo("codex-auto-review")
+	if info == nil {
+		t.Fatal("LookupStaticModelInfo returned nil for codex-auto-review")
+	}
+	if info.DisplayName != "Codex Auto Review" {
+		t.Fatalf("display name = %q, want %q", info.DisplayName, "Codex Auto Review")
+	}
+	if info.Description != "Automatic approval review model for Codex." {
+		t.Fatalf("description = %q, want %q", info.Description, "Automatic approval review model for Codex.")
+	}
+	if info.ContextLength != 272000 {
+		t.Fatalf("context length = %d, want %d", info.ContextLength, 272000)
+	}
+	if info.MaxCompletionTokens != 128000 {
+		t.Fatalf("max completion tokens = %d, want %d", info.MaxCompletionTokens, 128000)
+	}
+	if info.Thinking == nil || !reflect.DeepEqual(info.Thinking.Levels, []string{"low", "medium", "high", "xhigh"}) {
+		t.Fatalf("thinking levels = %+v, want [low medium high xhigh]", info.Thinking)
 	}
 }
 

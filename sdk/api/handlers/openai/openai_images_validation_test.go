@@ -103,6 +103,16 @@ func TestDecodeImagesGenerationsRequest_RejectsUnsupportedModel(t *testing.T) {
 	}
 }
 
+func TestDecodeImagesGenerationsRequest_AcceptsPrefixedToolModel(t *testing.T) {
+	payload, err := decodeImagesGenerationsRequest([]byte(`{"prompt":"draw it","model":"team-a/gpt-image-2"}`))
+	if err != nil {
+		t.Fatalf("decodeImagesGenerationsRequest() error = %v", err)
+	}
+	if payload.Model != "team-a/gpt-image-2" {
+		t.Fatalf("model = %q, want %q", payload.Model, "team-a/gpt-image-2")
+	}
+}
+
 func newMultipartImagesEditContext(t *testing.T, fields map[string]string, files []multipartImageSpec) *gin.Context {
 	t.Helper()
 	gin.SetMode(gin.TestMode)

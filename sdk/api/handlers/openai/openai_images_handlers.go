@@ -9,6 +9,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/api/handlers"
+	"github.com/tidwall/gjson"
 )
 
 // ImagesGenerations 处理 `/v1/images/generations`，并桥接到 Codex Responses 图片调用链。
@@ -85,7 +86,7 @@ func (h *OpenAIAPIHandler) collectImagesFromResponses(c *gin.Context, responsesR
 	cliCtx = handlers.WithDisallowFreeAuth(cliCtx)
 	stopKeepAlive := h.StartNonStreamingKeepAlive(c, cliCtx)
 	dataChan, upstreamHeaders, errChan := h.ExecuteStreamWithAuthManagerForRoute(cliCtx, "openai-response", handlers.StreamRouteConfig{
-		ExecutionModel:      defaultImagesMainModel,
+		ExecutionModel:      imagesExecutionModelFromRequest(responsesReq),
 		SelectionModel:      routeModel,
 		AllowedProviders:    []string{"codex"},
 		AllowImageOnlyModel: true,
@@ -113,12 +114,20 @@ func (h *OpenAIAPIHandler) streamImagesFromResponses(c *gin.Context, responsesRe
 	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
 	cliCtx = handlers.WithDisallowFreeAuth(cliCtx)
 	dataChan, upstreamHeaders, errChan := h.ExecuteStreamWithAuthManagerForRoute(cliCtx, "openai-response", handlers.StreamRouteConfig{
-		ExecutionModel:      defaultImagesMainModel,
+		ExecutionModel:      imagesExecutionModelFromRequest(responsesReq),
 		SelectionModel:      routeModel,
 		AllowedProviders:    []string{"codex"},
 		AllowImageOnlyModel: true,
 	}, responsesReq, "")
 	h.startImagesStream(c, flusher, func(err error) { cliCancel(err) }, dataChan, errChan, upstreamHeaders, responseFormat, streamPrefix)
+}
+
+func imagesExecutionModelFromRequest(responsesReq []byte) string {
+	model := strings.TrimSpace(gjson.GetBytes(responsesReq, "model").String())
+	if model == "" {
+		return defaultImagesMainModel
+	}
+	return model
 }
 
 // startImagesStream 先窥探首帧，决定返回 JSON 错误还是正式切换到 SSE。

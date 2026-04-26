@@ -321,6 +321,7 @@ nonstream-keepalive-interval: 0
 # OpenAI 兼容 provider
 # openai-compatibility:
 #   - name: "openrouter" # provider 名称；用于展示、路由标识等位置。
+#     disabled: false # 可选：设为 true 时保留配置但禁用该 provider
 #     prefix: "test" # 可选：要求调用类似 "test/kimi-k2" 才能命中该 provider 的凭证
 #     base-url: "https://openrouter.ai/api/v1" # provider 的 base URL。
 #     headers:

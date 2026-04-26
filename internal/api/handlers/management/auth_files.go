@@ -916,7 +916,7 @@ func (h *Handler) UploadAuthFile(c *gin.Context) {
 		c.JSON(400, gin.H{"error": "failed to read body"})
 		return
 	}
-	if err = h.writeAuthFile(ctx, filepath.Base(name), data); err != nil {
+	if _, err = h.writeAuthFile(ctx, filepath.Base(name), data); err != nil {
 		c.JSON(500, gin.H{"error": err.Error()})
 		return
 	}
@@ -1063,16 +1063,17 @@ func (h *Handler) storeUploadedAuthFile(ctx context.Context, file *multipart.Fil
 	if err != nil {
 		return "", fmt.Errorf("failed to read uploaded file: %w", err)
 	}
-	if err := h.writeAuthFile(ctx, name, data); err != nil {
+	savedName, err := h.writeAuthFile(ctx, name, data)
+	if err != nil {
 		return "", err
 	}
-	return name, nil
+	return savedName, nil
 }
 
-func (h *Handler) writeAuthFile(ctx context.Context, name string, data []byte) error {
+func (h *Handler) writeAuthFile(ctx context.Context, name string, data []byte) (string, error) {
 	cfg := h.currentConfigSnapshot()
 	if cfg == nil {
-		return fmt.Errorf("configuration unavailable")
+		return "", fmt.Errorf("configuration unavailable")
 	}
 	dst := filepath.Join(cfg.AuthDir, filepath.Base(name))
 	if !filepath.IsAbs(dst) {
@@ -1082,8 +1083,18 @@ func (h *Handler) writeAuthFile(ctx context.Context, name string, data []byte) e
 	}
 	auth, err := h.buildAuthFromFileData(dst, data)
 	if err != nil {
-		return err
+		return "", err
 	}
+	if codexAuthIdentityFromMetadata(auth.Metadata) != "" && strings.EqualFold(strings.TrimSpace(auth.Provider), "codex") {
+		return h.writeUploadedCodexAuthFile(ctx, dst, auth, data)
+	}
+	if err = h.persistBuiltAuthFile(ctx, dst, auth, data); err != nil {
+		return "", err
+	}
+	return filepath.Base(dst), nil
+}
+
+func (h *Handler) persistBuiltAuthFile(ctx context.Context, dst string, auth *coreauth.Auth, data []byte) error {
 	payload := data
 	if auth.Metadata != nil {
 		normalized, errMarshal := json.Marshal(auth.Metadata)
@@ -1300,6 +1311,12 @@ func (h *Handler) buildAuthFromFileData(path string, data []byte) (*coreauth.Aut
 		label = email
 	}
 	lastRefresh, hasLastRefresh := extractLastRefreshTimestamp(metadata)
+	disabled, _ := metadata["disabled"].(bool)
+	status := coreauth.StatusActive
+	if disabled {
+		status = coreauth.StatusDisabled
+	}
+	proxyURL := stringValue(metadata, "proxy_url")
 
 	authID := h.authIDForPath(path)
 	if authID == "" {
@@ -1318,7 +1335,9 @@ func (h *Handler) buildAuthFromFileData(path string, data []byte) (*coreauth.Aut
 		Provider:   provider,
 		FileName:   filepath.Base(path),
 		Label:      label,
-		Status:     coreauth.StatusActive,
+		Status:     status,
+		Disabled:   disabled,
+		ProxyURL:   proxyURL,
 		Attributes: attr,
 		Metadata:   metadata,
 		CreatedAt:  time.Now(),
@@ -2140,20 +2159,10 @@ func (h *Handler) RequestCodexToken(c *gin.Context) {
 			}
 		}
 
-		// Create token storage and persist
+		// Create token storage and persist。若同账号旧 auth 已存在，这里会复用旧文件路径，
+		// 避免 management 再次登录把同一账号额外落成第二份 JSON。
 		tokenStorage := openaiAuth.CreateTokenStorage(bundle)
-		fileName := codex.CredentialFileName(tokenStorage.Email, planType, hashAccountID, true)
-		record := &coreauth.Auth{
-			ID:       fileName,
-			Provider: "codex",
-			FileName: fileName,
-			Storage:  tokenStorage,
-			Metadata: map[string]any{
-				"email":      tokenStorage.Email,
-				"account_id": tokenStorage.AccountID,
-			},
-		}
-		savedPath, errSave := h.saveTokenRecord(ctx, record)
+		savedPath, errSave := h.saveCodexTokenRecord(ctx, tokenStorage, planType, hashAccountID)
 		if errSave != nil {
 			SetOAuthSessionError(state, "Failed to save authentication tokens")
 			log.Errorf("Failed to save authentication tokens: %v", errSave)

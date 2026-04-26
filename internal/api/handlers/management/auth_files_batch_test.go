@@ -295,7 +295,7 @@ func TestUploadAuthFile_BatchMultipart_PreservesFirstRegisteredAtOnSameNameUploa
 	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, manager)
 
 	firstContent := `{"type":"codex","email":"alpha@example.com"}`
-	if err := h.writeAuthFile(context.Background(), "alpha.json", []byte(firstContent)); err != nil {
+	if _, err := h.writeAuthFile(context.Background(), "alpha.json", []byte(firstContent)); err != nil {
 		t.Fatalf("first writeAuthFile() error = %v", err)
 	}
 	firstAuth, ok := manager.GetByID("alpha.json")
@@ -308,7 +308,7 @@ func TestUploadAuthFile_BatchMultipart_PreservesFirstRegisteredAtOnSameNameUploa
 	}
 
 	secondContent := `{"type":"codex","email":"alpha+updated@example.com"}`
-	if err := h.writeAuthFile(context.Background(), "alpha.json", []byte(secondContent)); err != nil {
+	if _, err := h.writeAuthFile(context.Background(), "alpha.json", []byte(secondContent)); err != nil {
 		t.Fatalf("second writeAuthFile() error = %v", err)
 	}
 
@@ -430,6 +430,32 @@ func TestBuildAuthFromFileData_CodexPlanTypeFromIDToken(t *testing.T) {
 	}
 	if got := auth.Attributes["plan_type"]; got != "plus" {
 		t.Fatalf("auth.Attributes[plan_type] = %q, want %q", got, "plus")
+	}
+}
+
+func TestBuildAuthFromFileData_ReflectsDisabledAndProxyURL(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	gin.SetMode(gin.TestMode)
+
+	authDir := t.TempDir()
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, nil)
+
+	content := []byte(`{"type":"codex","email":"alpha@example.com","disabled":true,"proxy_url":"http://proxy.example.com"}`)
+	auth, err := h.buildAuthFromFileData(filepath.Join(authDir, "alpha.json"), content)
+	if err != nil {
+		t.Fatalf("buildAuthFromFileData() error = %v", err)
+	}
+	if auth == nil {
+		t.Fatal("buildAuthFromFileData() auth = nil")
+	}
+	if !auth.Disabled {
+		t.Fatal("expected auth.Disabled = true")
+	}
+	if auth.Status != coreauth.StatusDisabled {
+		t.Fatalf("auth.Status = %q, want %q", auth.Status, coreauth.StatusDisabled)
+	}
+	if auth.ProxyURL != "http://proxy.example.com" {
+		t.Fatalf("auth.ProxyURL = %q, want %q", auth.ProxyURL, "http://proxy.example.com")
 	}
 }
 

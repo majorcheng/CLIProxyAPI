@@ -42,6 +42,7 @@ type Handler struct {
 	configFilePath      string
 	mu                  sync.RWMutex
 	attemptsMu          sync.Mutex
+	codexPersistMu      sync.Mutex
 	failedAttempts      map[string]*attemptInfo // keyed by client IP
 	authManager         *coreauth.Manager
 	usageStats          *usage.RequestStatistics

@@ -1232,3 +1232,116 @@
 - `timeout 60s go test ./sdk/api/handlers/openai -run 'TestImagesGenerations_(RoutesByImageModelAndExecutesWithMainModel|DisallowFreeCodexAuthDuringSelection)' -count=1` 通过。
 - `timeout 60s go test ./sdk/cliproxy/auth -run 'TestManager_PickNextMixed_DisallowFreeAuthSkips(CodexFreePlan|MetadataOnlyCodexFreePlan)' -count=1` 通过。
 - `timeout 60s go test ./... -run '^$'` 通过。
+
+---
+
+# Codex management 同账号不同文件名重复落盘调试记录（2026-04-26）
+
+## Observations
+
+- `internal/api/handlers/management/auth_files.go::RequestCodexToken` 当前在拿到 `CodexTokenStorage` 后，直接用 `codex.CredentialFileName(...)` 结果作为 `record.ID` 与 `record.FileName`，然后调用 `saveTokenRecord(...)` 落盘。
+- `internal/api/handlers/management/auth_files.go::UploadAuthFile -> storeUploadedAuthFile -> writeAuthFile` 这条上传链路同样是先按上传文件名生成 `dst`，再按 `dst/path` 构造 `auth.ID`，没有任何 `account_id` / `email` 级别的复用判断。
+- `internal/api/handlers/management/auth_files.go::saveTokenRecord` 不会按 `account_id` 或 `email` 查重，只是把 record 交给 `coreauth.Store.Save(...)`。
+- `sdk/auth/filestore.go::FileTokenStore.Save` 与 `::resolveAuthPath` 只按最终路径写文件，不理解“同账号”语义。
+- `internal/api/handlers/management/auth_files.go::buildAuthFromFileData` 与 `::upsertAuthRecord` 在运行态注册阶段也是按“文件路径 -> auth.ID”更新，而不是按 `account_id` 更新。
+- `internal/auth/codex/token.go::CodexTokenStorage` 与 `internal/auth/codex/openai_auth.go::CreateTokenStorage` 已经把 `account_id`、`email` 放在顶层 token JSON，可作为同账号判定依据。
+- 现有仓库里有 provider 级重复校验范式：`internal/auth/iflow/cookie_helpers.go::CheckDuplicateBXAuth` 会在 management 保存前先扫描 authDir 判重。
+
+## Hypotheses
+
+### H1: 根因是 Codex management 把“文件名/路径”当成身份主键，缺少基于 `account_id` 的保存前复用逻辑（ROOT HYPOTHESIS）
+- Supports: `RequestCodexToken` 直接以 `CredentialFileName(...)` 作为 `record.ID/FileName`；保存链和运行态 upsert 都不查 `account_id`。
+- Conflicts: 若旧文件和新文件恰好同名，当前会表现成覆盖更新而不是重复新增，但这只是路径相同的副作用，不是账号查重。
+- Test: 在 management 保存前新增“按 `account_id`/email 查找现有 Codex auth 并复用旧路径”逻辑，验证同账号不同文件名场景只保留一份文件。
+
+### H2: 只修“查重后复用旧路径”还不够，并发 management callback 仍可能各自落不同文件
+- Supports: 现有 store 只有路径锁，没有“账号锁”；两个并发请求若目标文件名不同，路径锁互不冲突。
+- Conflicts: 单机 management OAuth 新增账号通常不高频，并发窗口很短。
+- Test: 在 management Codex 保存链路增加最小互斥保护，确保“查现有 -> 选目标路径 -> 保存”是一个临界区；补并发回归或至少结构化单元测试。
+
+### H3: 复用旧文件时若直接复制全部旧 metadata，会把旧 token 字段覆盖回新 token
+- Supports: `internal/misc/credentials.go::MergeMetadata` 是“source struct -> map 后，再让 metadata 覆盖同名键”；如果把旧 metadata 整体塞回 record，新 token 顶层字段会被旧值覆盖。
+- Conflicts: 如果只保留少数安全键，例如 `cli_proxy_first_registered_at`，这个问题不会发生。
+- Test: 实现时只继承旧 auth 的安全持久化字段与路径信息，不整体复制旧 metadata。
+
+## Experiments
+
+- 只读核对 `RequestCodexToken -> saveTokenRecord -> FileTokenStore.Save` 与 `buildAuthFromFileData -> upsertAuthRecord` 链路，确认当前不存在任何按 `account_id`/`email` 的重复检测。
+- 只读核对 `CodexTokenStorage` 与 `MergeMetadata`，确认可以用 `account_id` 判重，但复用旧 auth 时不能整体拷贝旧 metadata。
+- E1 结果：新增 `internal/api/handlers/management/auth_files_codex_identity.go`，把同账号复用逻辑收口到 `saveCodexTokenRecord(...)`：默认先按现有命名规则生成 record，再在持锁区内通过 `findExistingCodexAuthByIdentity(...)` 按 `account_id` / 标准化 `email` 查找已有 Codex 文件；命中后调用 `reuseExistingCodexAuthTarget(...)` 复用旧 `ID/FileName/path` 保存，不再生成第二份文件。
+- E2 结果：`Handler` 新增 `codexPersistMu`，把“查现有 -> 选保存目标 -> saveTokenRecord”串成一个临界区。并发测试证明同账号两个并发保存最终只会落一份 JSON，两个 goroutine 返回的 `savedPath` 相同。
+- E3 结果：复用旧路径时只继承 `cli_proxy_first_registered_at`、`proxy_url`、`disabled` 与旧文件路径，不整体复制旧 metadata，因此不会把旧 token 字段覆盖回新 token；新增测试也验证了新 access/refresh token 会正确写入旧文件。
+
+## Root Cause
+
+- 根因是 management 侧两条 Codex 落盘入口都把“文件名/路径”当成身份锚点：
+  - `internal/api/handlers/management/auth_files.go::RequestCodexToken` 对 OAuth 回调结果按生成文件名保存；
+  - `internal/api/handlers/management/auth_files.go::writeAuthFile` 对上传 JSON 按上传文件名保存；
+  保存前都没有基于 `account_id` / `email` 复用已有 auth 文件，因此“同账号但不同文件名”会被误当成第二条独立 auth 落盘。
+
+## Fix
+
+- `internal/api/handlers/management/auth_files.go::RequestCodexToken` 现在改为调用 `saveCodexTokenRecord(...)`，不再直接把默认文件名交给 `saveTokenRecord(...)`。
+- `internal/api/handlers/management/auth_files.go::writeAuthFile` 现在改为返回真实保存文件名；当上传内容是 Codex 且能识别账号身份时，会改走新增的 `writeUploadedCodexAuthFile(...)`，在持锁区内先按账号查已有旧文件，再决定真正的目标路径。
+- 新增 `internal/api/handlers/management/auth_files_codex_identity.go`：
+  - `saveCodexTokenRecord(...)` 负责在 management/Codex 落盘前做同账号复用；
+  - `findExistingCodexAuthByIdentity(...)` 先看 live manager，再回退扫描 auth store；
+  - `reuseExistingCodexAuthTarget(...)` 复用旧 `ID/FileName/path`，并保留 `cli_proxy_first_registered_at`、`proxy_url`、`disabled`；
+  - `writeUploadedCodexAuthFile(...)` 与 `reuseExistingUploadedCodexAuthTarget(...)` 负责把上传 JSON 映射回旧 auth 文件，并在上传内容没显式声明时保留旧 `disabled` / `proxy_url`；
+  - `preferOlderCodexAuth(...)` 在历史重复文件并存时优先选择最早入池的旧文件。
+- `internal/api/handlers/management/handler.go::Handler` 新增 `codexPersistMu`，为 Codex management 保存提供最小互斥保护，避免并发 callback 各自落成不同文件。
+- 新增 / 更新测试：
+  - `internal/api/handlers/management/auth_files_codex_identity_test.go` 覆盖 OAuth 保存、上传 JSON 复用旧文件、显式 `disabled=false` 覆盖旧值，以及并发保存只落一份文件；
+  - `internal/api/handlers/management/auth_files_batch_test.go` 同步适配 `writeAuthFile(...)` 返回真实保存名的新签名。
+
+## Verification
+
+- `timeout 60s go test ./internal/api/handlers/management -run 'Test(SaveCodexTokenRecord_|WriteAuthFile_Codex|UploadAuthFile_BatchMultipart_PreservesFirstRegisteredAtOnSameNameUpload)' -count=1` 通过。
+- `timeout 60s go test ./internal/api/handlers/management -count=1` 通过。
+- `timeout 60s go test ./... -run '^$'` 通过。
+- `git diff --check` 通过。
+
+## 2026-04-26 Codex management 上传 reviewer follow-up
+
+### Observations
+
+- `internal/api/handlers/management/auth_files.go::buildAuthFromFileData` 之前只把上传 JSON 里的 `disabled` / `proxy_url` 留在 `auth.Metadata`，构造出来的 live auth 固定是 `StatusActive`、`Disabled=false`、`ProxyURL=""`。
+- `internal/api/handlers/management/auth_files_codex_identity.go::reuseExistingUploadedCodexAuthTarget` 只在上传内容缺失 `disabled` / `proxy_url` 时保留旧值，因此“显式上传新值立即生效”的运行态语义仍然是断开的。
+- `internal/api/handlers/management/auth_files.go::buildAuthFileEntry` 读的是 `auth.Disabled`；`sdk/cliproxy/rtprovider.go::RoundTripperFor` 读的是 `auth.ProxyURL`。这意味着只改文件内容、不改 live auth 字段，会出现“文件已变、内存态没变”。
+- 同账号上传复用旧文件时，`internal/api/handlers/management/auth_files.go::buildAuthFromFileData` 只有在上传内容自身能解析出 plan 时才会写 `Attributes["plan_type"]`；若上传的是不带 `plan_type` / `id_token` 的瘦身 JSON，旧 auth 的 free/plus/pro/team 语义会丢失。
+
+### Hypotheses
+
+#### H1(ROOT): 需要在 `buildAuthFromFileData` 阶段把 `disabled` / `proxy_url` 直接投影到 live auth 字段，而不是只放 metadata
+- Supports: live 列表和运行态代理选择都读取 `Auth` 结构体字段，不读取原始 metadata map。
+- Conflicts: 无。
+- Test: 让 `buildAuthFromFileData` 读取上传 JSON 的 `disabled` / `proxy_url` 并设置到 `auth.Status` / `auth.Disabled` / `auth.ProxyURL`，再补最小测试验证。
+
+#### H2: 复用旧文件时需要额外保留旧 `plan_type`，否则 stripped upload 会把同账号 auth 的套餐语义抹掉
+- Supports: `AuthChatGPTPlanType(auth)` 只看 `Attributes["plan_type"]` / `Metadata["plan_type"]`，上传内容缺失 plan 时不会自动回填旧值。
+- Conflicts: 若上传内容本身带 `plan_type` 或 `id_token`，则不该被旧值覆盖。
+- Test: 仅在新 auth 解析不出 plan 时，回填旧 auth 的 `plan_type`，并补 stripped upload 回归测试。
+
+### Experiments
+
+- E1: 在 `internal/api/handlers/management/auth_files.go::buildAuthFromFileData` 中直接读取 `disabled` / `proxy_url`，并用它们初始化 `Status` / `Disabled` / `ProxyURL`。结果：新增 `TestBuildAuthFromFileData_ReflectsDisabledAndProxyURL` 后，显式上传 `disabled=true` 与新 `proxy_url` 时，live auth 立即反映到运行态字段。
+- E2: 在 `internal/api/handlers/management/auth_files_codex_identity.go::reuseExistingUploadedCodexAuthTarget` 中新增 `preserveExistingCodexPlanType(...)`，仅在新上传内容解析不出 plan 时回填旧 auth 的 `plan_type` 到 `Attributes` 与 `Metadata`。结果：新增 `TestWriteAuthFile_CodexUploadPreservesExistingPlanType` 后，上传不带 `plan_type` / `id_token` 的同账号 JSON，不会清掉既有 free plan 语义。
+- E3: 扩展 `TestWriteAuthFile_CodexUploadExplicitDisabledOverridesExisting`，同时断言真实落盘 payload 与 live auth 的 `Disabled/Status/ProxyURL` 一起更新。结果：通过，证明“显式上传新值立即生效”已闭环。
+
+### Root Cause
+
+- 根因 1：上传 JSON 的 `disabled` / `proxy_url` 之前只进入持久化 metadata，没有同步投影到 live auth 结构体字段，导致 management 展示和运行态选路继续沿用旧值。
+- 根因 2：同账号上传复用旧文件时，代码只保留了旧路径与少量本地管理字段，却没有在“新 payload 本身缺 plan”的情况下保留旧 `plan_type`，从而会意外抹掉 free/plus/pro/team 语义。
+
+### Fix
+
+- `internal/api/handlers/management/auth_files.go::buildAuthFromFileData` 现在会直接从上传 JSON 读取 `disabled` / `proxy_url`，并初始化 `auth.Status` / `auth.Disabled` / `auth.ProxyURL`，让显式上传的新值立即进入 live auth。
+- `internal/api/handlers/management/auth_files_codex_identity.go::preserveExistingCodexPlanType` 只在新 auth 解析不出 plan 时，回填旧 auth 的 `plan_type` 到 `Attributes` 与 `Metadata`，保证 stripped upload 不会清掉 Codex 套餐语义。
+- `internal/api/handlers/management/auth_files_codex_identity_test.go` 与 `internal/api/handlers/management/auth_files_batch_test.go` 新增/更新回归，分别锁定运行态字段同步与 `plan_type` 保留边界。
+
+### Verification
+
+- `timeout 60s go test ./internal/api/handlers/management -run 'Test(BuildAuthFromFileData_(ReflectsDisabledAndProxyURL|CodexPlanTypeFromIDToken)|SaveCodexTokenRecord_|WriteAuthFile_Codex|UploadAuthFile_BatchMultipart_PreservesFirstRegisteredAtOnSameNameUpload)' -count=1` 通过。
+- `timeout 60s go test ./internal/api/handlers/management -count=1` 通过。
+- `timeout 60s go test ./... -run '^$'` 通过。
+- `git diff --check` 通过。

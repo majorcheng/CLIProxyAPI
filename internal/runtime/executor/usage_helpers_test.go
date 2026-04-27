@@ -103,6 +103,15 @@ func TestParseCodexImageToolUsage(t *testing.T) {
 	}
 }
 
+func TestCodexResponseUsedImageGenerationTool(t *testing.T) {
+	if !codexResponseUsedImageGenerationTool([]byte(`{"response":{"output":[{"type":"image_generation_call","result":"aGVsbG8="}]}}`)) {
+		t.Fatal("expected image_generation_call output to count as real image tool usage")
+	}
+	if codexResponseUsedImageGenerationTool([]byte(`{"response":{"output":[{"type":"message","content":[{"type":"output_text","text":"ok"}]}],"tool_usage":{"image_gen":{"num_images":1}}}}`)) {
+		t.Fatal("expected plain text output with image_gen metadata only to stay false")
+	}
+}
+
 func TestResolveUsageAuthTypeNormalizesAPIKey(t *testing.T) {
 	auth := &cliproxyauth.Auth{
 		Attributes: map[string]string{

@@ -238,6 +238,21 @@ func parseCodexImageToolUsage(data []byte) (usage.Detail, bool) {
 	return parseOpenAIStyleUsageNode(usageNode), true
 }
 
+// codexResponseUsedImageGenerationTool 只在 completed.output 中出现真实图片输出项时返回 true。
+// 单独存在 tool_usage.image_gen 不能证明普通文本请求真的调用了图片工具。
+func codexResponseUsedImageGenerationTool(data []byte) bool {
+	output := gjson.ParseBytes(data).Get("response.output")
+	if !output.Exists() || !output.IsArray() {
+		return false
+	}
+	for _, item := range output.Array() {
+		if item.Get("type").String() == "image_generation_call" {
+			return true
+		}
+	}
+	return false
+}
+
 func parseOpenAIUsage(data []byte) usage.Detail {
 	usageNode := gjson.ParseBytes(data).Get("usage")
 	if !usageNode.Exists() {

@@ -424,11 +424,12 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 				case "response.output_item.done":
 					collectCodexOutputItemDone(data, outputItemsByIndex, &outputItemsFallback)
 				case "response.completed":
+					data = patchCodexCompletedOutput(data, outputItemsByIndex, outputItemsFallback)
 					if detail, ok := parseCodexUsage(data); ok {
 						reporter.publish(ctx, detail)
 					}
 					publishCodexImageToolUsage(ctx, reporter, body, data)
-					data = patchCodexCompletedOutput(data, outputItemsByIndex, outputItemsFallback)
+					reporter.ensurePublished(ctx)
 					translatedLine = append([]byte("data: "), data...)
 				}
 			}
@@ -959,10 +960,13 @@ func codexStatusErrorClassification(statusCode int, body []byte) (code string, e
 }
 
 func publishCodexImageToolUsage(ctx context.Context, reporter *usageReporter, requestBody []byte, completedData []byte) {
-	detail, ok := parseCodexImageToolUsage(completedData)
-	if !ok {
+	if !cliproxyexecutor.RequestHasExplicitImageGenerationIntent(requestBody) {
 		return
 	}
+	if !codexResponseUsedImageGenerationTool(completedData) {
+		return
+	}
+	detail, _ := parseCodexImageToolUsage(completedData)
 	reporter.ensurePublished(ctx)
 	reporter.publishAdditionalModel(ctx, codexImageGenerationToolModel(requestBody), detail)
 }

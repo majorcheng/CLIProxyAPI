@@ -122,3 +122,12 @@ func TestResolveUsageAuthTypeNormalizesAPIKey(t *testing.T) {
 		t.Fatalf("resolveUsageAuthType() = %q, want %q", got, "apikey")
 	}
 }
+
+func TestHasNonZeroTokenUsage(t *testing.T) {
+	if hasNonZeroTokenUsage(usage.Detail{}) {
+		t.Fatal("expected zero detail to be treated as zero-token usage")
+	}
+	if !hasNonZeroTokenUsage(usage.Detail{OutputTokens: 1}) {
+		t.Fatal("expected non-zero detail to be treated as token usage")
+	}
+}

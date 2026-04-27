@@ -1,8 +1,11 @@
 package handlers
 
 import (
+	"net/http"
+	"net/http/httptest"
 	"testing"
 
+	"github.com/gin-gonic/gin"
 	coreexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 	"golang.org/x/net/context"
 )
@@ -25,5 +28,32 @@ func TestRequestExecutionMetadataIncludesDisallowFreeAuth(t *testing.T) {
 	meta := requestExecutionMetadata(ctx)
 	if got := meta[coreexecutor.DisallowFreeAuthMetadataKey]; got != true {
 		t.Fatalf("DisallowFreeAuthMetadataKey = %v, want true", got)
+	}
+}
+
+func TestHeadersFromContextClonesGinRequestHeaders(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	ginCtx, _ := gin.CreateTestContext(recorder)
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	req.Header.Set("X-Session-ID", "session-123")
+	req.Header.Set("X-Amp-Thread-Id", "amp-thread-1")
+	ginCtx.Request = req
+
+	ctx := context.WithValue(context.Background(), "gin", ginCtx)
+	headers := headersFromContext(ctx)
+	if headers == nil {
+		t.Fatal("headersFromContext() = nil, want cloned headers")
+	}
+	if got := headers.Get("X-Session-ID"); got != "session-123" {
+		t.Fatalf("X-Session-ID = %q, want %q", got, "session-123")
+	}
+	if got := headers.Get("X-Amp-Thread-Id"); got != "amp-thread-1" {
+		t.Fatalf("X-Amp-Thread-Id = %q, want %q", got, "amp-thread-1")
+	}
+
+	headers.Set("X-Session-ID", "mutated")
+	if got := ginCtx.Request.Header.Get("X-Session-ID"); got != "session-123" {
+		t.Fatalf("original header = %q, want %q after clone mutation", got, "session-123")
 	}
 }

@@ -31,6 +31,7 @@ type ConvertCodexResponseToClaudeParams struct {
 	ThinkingBlockOpen         bool
 	ThinkingStopPending       bool
 	ThinkingSignature         string
+	ThinkingSummarySeen       bool
 }
 
 func appendClaudeSSEEvent(output *strings.Builder, event, payload string) {
@@ -96,11 +97,8 @@ func ConvertCodexResponseToClaude(_ context.Context, _ string, originalRequestRa
 		if params.ThinkingBlockOpen && params.ThinkingStopPending {
 			finalizeCodexThinkingBlock(params, &output)
 		}
-		template = `{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}`
-		template, _ = sjson.Set(template, "index", params.BlockIndex)
-		params.ThinkingBlockOpen = true
-		params.ThinkingStopPending = false
-		appendClaudeSSEEvent(&output, "content_block_start", template)
+		params.ThinkingSummarySeen = true
+		startCodexThinkingBlock(params, &output)
 
 	case "response.reasoning_summary_text.delta":
 		template = `{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":""}}`
@@ -110,9 +108,6 @@ func ConvertCodexResponseToClaude(_ context.Context, _ string, originalRequestRa
 
 	case "response.reasoning_summary_part.done":
 		params.ThinkingStopPending = true
-		if params.ThinkingSignature != "" {
-			finalizeCodexThinkingBlock(params, &output)
-		}
 
 	case "response.content_part.added":
 		template = `{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}`
@@ -177,9 +172,6 @@ func ConvertCodexResponseToClaude(_ context.Context, _ string, originalRequestRa
 
 		case "reasoning":
 			params.ThinkingSignature = itemResult.Get("encrypted_content").String()
-			if params.ThinkingStopPending {
-				finalizeCodexThinkingBlock(params, &output)
-			}
 		}
 
 	case "response.output_item.done":
@@ -238,7 +230,11 @@ func ConvertCodexResponseToClaude(_ context.Context, _ string, originalRequestRa
 			if signature := itemResult.Get("encrypted_content").String(); signature != "" {
 				params.ThinkingSignature = signature
 			}
-			finalizeCodexThinkingBlock(params, &output)
+			if params.ThinkingSummarySeen {
+				finalizeCodexThinkingBlock(params, &output)
+			} else {
+				finalizeCodexSignatureOnlyThinkingBlock(params, &output)
+			}
 		}
 
 	case "response.function_call_arguments.delta":
@@ -448,6 +444,7 @@ func ClaudeTokenCount(ctx context.Context, count int64) string {
 func finalizeCodexThinkingBlock(params *ConvertCodexResponseToClaudeParams, output *strings.Builder) {
 	if !params.ThinkingBlockOpen {
 		params.ThinkingSignature = ""
+		params.ThinkingSummarySeen = false
 		return
 	}
 
@@ -466,4 +463,28 @@ func finalizeCodexThinkingBlock(params *ConvertCodexResponseToClaudeParams, outp
 	params.ThinkingBlockOpen = false
 	params.ThinkingStopPending = false
 	params.ThinkingSignature = ""
+	params.ThinkingSummarySeen = false
+}
+
+func startCodexThinkingBlock(params *ConvertCodexResponseToClaudeParams, output *strings.Builder) {
+	if params.ThinkingBlockOpen {
+		params.ThinkingStopPending = false
+		return
+	}
+	template := `{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}`
+	template, _ = sjson.Set(template, "index", params.BlockIndex)
+	params.ThinkingBlockOpen = true
+	params.ThinkingStopPending = false
+	appendClaudeSSEEvent(output, "content_block_start", template)
+}
+
+func finalizeCodexSignatureOnlyThinkingBlock(params *ConvertCodexResponseToClaudeParams, output *strings.Builder) {
+	// 某些上游序列只在 reasoning item 里给 encrypted_content，没有 summary 事件。
+	// 这里要主动补一个空的 thinking block，才能把 signature 还给 Claude 客户端。
+	if strings.TrimSpace(params.ThinkingSignature) == "" {
+		params.ThinkingSummarySeen = false
+		return
+	}
+	startCodexThinkingBlock(params, output)
+	finalizeCodexThinkingBlock(params, output)
 }

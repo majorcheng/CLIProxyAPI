@@ -44,7 +44,7 @@ func TestCodexExecutorExecute_DoesNotPublishImageUsageForPlainTextRequest(t *tes
 	assertUsageModelAbsent(t, apiKey, "gpt-image-2", 300*time.Millisecond)
 }
 
-func TestCodexExecutorExecute_PublishesImageUsageForRealImageCall(t *testing.T) {
+func TestCodexExecutorExecute_SkipsImageUsageForRealImageCallWithoutImageUsageTokens(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		_, _ = io.WriteString(w, "data: "+codexCompletedWithImageCallJSON("resp_image_call", "gpt-5.2")+"\n")
@@ -67,12 +67,39 @@ func TestCodexExecutorExecute_PublishesImageUsageForRealImageCall(t *testing.T) 
 		t.Fatalf("response id = %q, want %q", gotID, "resp_image_call")
 	}
 
+	assertUsageModelAbsent(t, apiKey, "team-a/gpt-image-2", 300*time.Millisecond)
+	assertUsageModelAbsent(t, apiKey, "gpt-image-2", 300*time.Millisecond)
+}
+
+func TestCodexExecutorExecute_PublishesImageUsageForRealImageCallWithImageUsageTokens(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: "+codexCompletedWithImageCallAndImageUsageJSON("resp_image_call_usage", "gpt-5.2")+"\n")
+	}))
+	defer server.Close()
+
+	apiKey := fmt.Sprintf("real-image-call-usage-%d", time.Now().UnixNano())
+	ctx := newCodexUsageTestContext(apiKey)
+	executor := NewCodexExecutor(&config.Config{})
+	resp, err := executor.Execute(
+		ctx,
+		newCodexTestAuth(server.URL, "image-call-usage-key"),
+		newCodexImageIntentRequest("gpt-5.2", "draw a cat", "team-a/gpt-image-2"),
+		cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("openai-response")},
+	)
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if gotID := gjson.GetBytes(resp.Payload, "id").String(); gotID != "resp_image_call_usage" {
+		t.Fatalf("response id = %q, want %q", gotID, "resp_image_call_usage")
+	}
+
 	modelStats := waitForUsageModel(t, apiKey, "team-a/gpt-image-2")
 	if modelStats.TotalRequests < 1 {
 		t.Fatalf("image model requests = %d, want >= 1", modelStats.TotalRequests)
 	}
-	if modelStats.TotalTokens != 0 {
-		t.Fatalf("image model total tokens = %d, want 0 when completed payload has no image usage token block", modelStats.TotalTokens)
+	if modelStats.TotalTokens != 7 {
+		t.Fatalf("image model total tokens = %d, want 7", modelStats.TotalTokens)
 	}
 	assertUsageModelAbsent(t, apiKey, "gpt-image-2", 300*time.Millisecond)
 }
@@ -158,6 +185,10 @@ func plainTextCodexCompletedWithImageUsageMetadataJSON(id string, model string) 
 
 func codexCompletedWithImageCallJSON(id string, model string) string {
 	return fmt.Sprintf(`{"type":"response.completed","response":{"id":%q,"object":"response","model":%q,"status":"completed","output":[{"type":"message","id":"msg_%s","role":"assistant","content":[{"type":"output_text","text":"ok"}]},{"type":"image_generation_call","result":"aGVsbG8=","output_format":"png"}],"usage":{"input_tokens":3,"output_tokens":5,"total_tokens":8}}}`, id, model, id)
+}
+
+func codexCompletedWithImageCallAndImageUsageJSON(id string, model string) string {
+	return fmt.Sprintf(`{"type":"response.completed","response":{"id":%q,"object":"response","model":%q,"status":"completed","output":[{"type":"message","id":"msg_%s","role":"assistant","content":[{"type":"output_text","text":"ok"}]},{"type":"image_generation_call","result":"aGVsbG8=","output_format":"png"}],"usage":{"input_tokens":3,"output_tokens":5,"total_tokens":8},"tool_usage":{"image_gen":{"input_tokens":2,"output_tokens":5,"total_tokens":7}}}}`, id, model, id)
 }
 
 func plainTextCodexCompletedWithoutUsageWithImageMetadataJSON(id string, model string) string {

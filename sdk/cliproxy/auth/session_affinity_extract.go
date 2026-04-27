@@ -85,6 +85,17 @@ func extractHeaderSessionID(headers http.Header) string {
 			return sessionID
 		}
 	}
+	if threadID := strings.TrimSpace(headers.Get("X-Amp-Thread-Id")); threadID != "" {
+		return threadID
+	}
+	for key, values := range headers {
+		if !strings.EqualFold(strings.TrimSpace(key), "X-Amp-Thread-Id") || len(values) == 0 {
+			continue
+		}
+		if threadID := strings.TrimSpace(values[0]); threadID != "" {
+			return threadID
+		}
+	}
 	return ""
 }
 

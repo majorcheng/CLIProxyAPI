@@ -117,6 +117,16 @@ func TestExtractSessionID_UsesExecutionSessionMetadata(t *testing.T) {
 	}
 }
 
+func TestExtractSessionID_UsesAmpThreadHeader(t *testing.T) {
+	t.Parallel()
+
+	headers := http.Header{"X-Amp-Thread-Id": []string{"amp-thread-42"}}
+	got := ExtractSessionID(headers, nil, nil)
+	if got != "header:amp-thread-42" {
+		t.Fatalf("ExtractSessionID() = %q, want %q", got, "header:amp-thread-42")
+	}
+}
+
 func TestEnsureRequestSimHashMetadata_WrappedSimHashSelector(t *testing.T) {
 	t.Parallel()
 

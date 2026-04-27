@@ -163,6 +163,126 @@ func TestConvertCodexResponseToClaude_StreamThinkingFinalizesPendingBlockBeforeN
 	}
 }
 
+func TestConvertCodexResponseToClaude_StreamThinkingUsesEarlyCapturedSignatureWhenDoneOmitsIt(t *testing.T) {
+	ctx := context.Background()
+	originalRequest := []byte(`{"messages":[]}`)
+	var param any
+
+	chunks := [][]byte{
+		[]byte("data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"reasoning\",\"encrypted_content\":\"enc_sig_early\"}}"),
+		[]byte("data: {\"type\":\"response.reasoning_summary_part.added\"}"),
+		[]byte("data: {\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"Let me think\"}"),
+		[]byte("data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"reasoning\"}}"),
+	}
+
+	var outputs []string
+	for _, chunk := range chunks {
+		outputs = append(outputs, ConvertCodexResponseToClaude(ctx, "", originalRequest, nil, chunk, &param)...)
+	}
+
+	signatureDeltaCount := 0
+	for _, out := range outputs {
+		for _, line := range strings.Split(out, "\n") {
+			if !strings.HasPrefix(line, "data: ") {
+				continue
+			}
+			data := gjson.Parse(strings.TrimPrefix(line, "data: "))
+			if data.Get("type").String() == "content_block_delta" && data.Get("delta.type").String() == "signature_delta" {
+				signatureDeltaCount++
+				if got := data.Get("delta.signature").String(); got != "enc_sig_early" {
+					t.Fatalf("unexpected signature delta: %q", got)
+				}
+			}
+		}
+	}
+
+	if signatureDeltaCount != 1 {
+		t.Fatalf("expected signature_delta from early-captured signature, got %d", signatureDeltaCount)
+	}
+}
+
+func TestConvertCodexResponseToClaude_StreamThinkingUsesFinalDoneSignature(t *testing.T) {
+	ctx := context.Background()
+	originalRequest := []byte(`{"messages":[]}`)
+	var param any
+
+	chunks := [][]byte{
+		[]byte("data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"reasoning\",\"encrypted_content\":\"enc_sig_initial\"}}"),
+		[]byte("data: {\"type\":\"response.reasoning_summary_part.added\"}"),
+		[]byte("data: {\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"Let me think\"}"),
+		[]byte("data: {\"type\":\"response.reasoning_summary_part.done\"}"),
+		[]byte("data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"reasoning\",\"encrypted_content\":\"enc_sig_final\"}}"),
+	}
+
+	var outputs []string
+	for _, chunk := range chunks {
+		outputs = append(outputs, ConvertCodexResponseToClaude(ctx, "", originalRequest, nil, chunk, &param)...)
+	}
+
+	signatureDeltaCount := 0
+	for _, out := range outputs {
+		for _, line := range strings.Split(out, "\n") {
+			if !strings.HasPrefix(line, "data: ") {
+				continue
+			}
+			data := gjson.Parse(strings.TrimPrefix(line, "data: "))
+			if data.Get("type").String() == "content_block_delta" && data.Get("delta.type").String() == "signature_delta" {
+				signatureDeltaCount++
+				if got := data.Get("delta.signature").String(); got != "enc_sig_final" {
+					t.Fatalf("unexpected signature delta: %q", got)
+				}
+			}
+		}
+	}
+
+	if signatureDeltaCount != 1 {
+		t.Fatalf("expected exactly one finalized signature_delta, got %d", signatureDeltaCount)
+	}
+}
+
+func TestConvertCodexResponseToClaude_StreamThinkingSignatureOnlyBlock(t *testing.T) {
+	ctx := context.Background()
+	originalRequest := []byte(`{"messages":[]}`)
+	var param any
+
+	chunks := [][]byte{
+		[]byte("data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"reasoning\",\"encrypted_content\":\"enc_sig_only\"}}"),
+	}
+
+	var outputs []string
+	for _, chunk := range chunks {
+		outputs = append(outputs, ConvertCodexResponseToClaude(ctx, "", originalRequest, nil, chunk, &param)...)
+	}
+
+	startFound := false
+	signatureDeltaFound := false
+	stopFound := false
+	for _, out := range outputs {
+		for _, line := range strings.Split(out, "\n") {
+			if !strings.HasPrefix(line, "data: ") {
+				continue
+			}
+			data := gjson.Parse(strings.TrimPrefix(line, "data: "))
+			switch data.Get("type").String() {
+			case "content_block_start":
+				if data.Get("content_block.type").String() == "thinking" {
+					startFound = true
+				}
+			case "content_block_delta":
+				if data.Get("delta.type").String() == "signature_delta" {
+					signatureDeltaFound = data.Get("delta.signature").String() == "enc_sig_only"
+				}
+			case "content_block_stop":
+				stopFound = true
+			}
+		}
+	}
+
+	if !startFound || !signatureDeltaFound || !stopFound {
+		t.Fatalf("signature-only reasoning should emit start/signature_delta/stop, outputs=%q", outputs)
+	}
+}
+
 func TestConvertCodexResponseToClaudeNonStream_ThinkingIncludesSignature(t *testing.T) {
 	ctx := context.Background()
 	originalRequest := []byte(`{"messages":[]}`)

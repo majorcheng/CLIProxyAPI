@@ -237,6 +237,18 @@ func requestExecutionMetadata(ctx context.Context) map[string]any {
 	return meta
 }
 
+func headersFromContext(ctx context.Context) http.Header {
+	if ctx == nil {
+		return nil
+	}
+	ginCtx, ok := ctx.Value("gin").(*gin.Context)
+	if !ok || ginCtx == nil || ginCtx.Request == nil {
+		return nil
+	}
+	// session affinity 需要看到原始入站 header，避免只在 metadata 里维护一小撮特判字段。
+	return ginCtx.Request.Header.Clone()
+}
+
 // applyRequestIntentMetadata 把需要提前影响 auth selection 的请求意图写入 execution metadata。
 // 这里必须在 handlers 层完成，因为 selection 发生在 executor/request-plan 之前。
 func applyRequestIntentMetadata(meta map[string]any, rawJSON []byte) {
@@ -683,6 +695,7 @@ func (h *BaseAPIHandler) ExecuteWithAuthManager(ctx context.Context, handlerType
 		Alt:             alt,
 		OriginalRequest: rawJSON,
 		SourceFormat:    sdktranslator.FromString(handlerType),
+		Headers:         headersFromContext(ctx),
 	}
 	opts.Metadata = reqMeta
 	resp, err := h.AuthManager.Execute(ctx, providers, req, opts)
@@ -733,6 +746,7 @@ func (h *BaseAPIHandler) ExecuteCountWithAuthManager(ctx context.Context, handle
 		Alt:             alt,
 		OriginalRequest: rawJSON,
 		SourceFormat:    sdktranslator.FromString(handlerType),
+		Headers:         headersFromContext(ctx),
 	}
 	opts.Metadata = reqMeta
 	resp, err := h.AuthManager.ExecuteCount(ctx, providers, req, opts)
@@ -828,6 +842,7 @@ func (h *BaseAPIHandler) executeStreamWithResolvedRoute(ctx context.Context, han
 		Alt:             alt,
 		OriginalRequest: rawJSON,
 		SourceFormat:    sdktranslator.FromString(handlerType),
+		Headers:         headersFromContext(ctx),
 	}
 	opts.Metadata = reqMeta
 	streamResult, err := h.AuthManager.ExecuteStream(ctx, providers, req, opts)

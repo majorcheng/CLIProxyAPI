@@ -6,6 +6,7 @@
 package claude
 
 import (
+	"encoding/base64"
 	"fmt"
 	"strconv"
 	"strings"
@@ -120,6 +121,15 @@ func ConvertClaudeRequestToCodex(modelName string, inputRawJSON []byte, _ bool) 
 				hasContent = true
 			}
 
+			appendReasoningContent := func(signature string) {
+				// Claude assistant 的 thinking signature 需要转回 Codex reasoning item，
+				// 否则后续继续请求时会丢掉上游要求的 reasoning continuity。
+				flushMessage()
+				reasoningItem := `{"type":"reasoning","summary":[],"content":null}`
+				reasoningItem, _ = sjson.Set(reasoningItem, "encrypted_content", signature)
+				template, _ = sjson.SetRaw(template, "input.-1", reasoningItem)
+			}
+
 			messageContentsResult := messageResult.Get("content")
 			if messageContentsResult.IsArray() {
 				messageContentResults := messageContentsResult.Array()
@@ -130,6 +140,13 @@ func ConvertClaudeRequestToCodex(modelName string, inputRawJSON []byte, _ bool) 
 					switch contentType {
 					case "text":
 						appendTextContent(messageContentResult.Get("text").String())
+					case "thinking":
+						if messageRole == "assistant" {
+							signature := strings.TrimSpace(messageContentResult.Get("signature").String())
+							if isFernetLikeReasoningSignature(signature) {
+								appendReasoningContent(signature)
+							}
+						}
 					case "image":
 						sourceResult := messageContentResult.Get("source")
 						if sourceResult.Exists() {
@@ -316,6 +333,34 @@ func ConvertClaudeRequestToCodex(modelName string, inputRawJSON []byte, _ bool) 
 	template, _ = sjson.Set(template, "include", []string{"reasoning.encrypted_content"})
 
 	return []byte(template)
+}
+
+func isFernetLikeReasoningSignature(signature string) bool {
+	const (
+		fernetVersionLen = 1
+		fernetTimestamp  = 8
+		fernetIV         = 16
+		fernetHMAC       = 32
+		aesBlockSize     = 16
+	)
+
+	signature = strings.TrimSpace(signature)
+	if !strings.HasPrefix(signature, "gAAAA") {
+		return false
+	}
+	decoded, err := base64.URLEncoding.DecodeString(signature)
+	if err != nil {
+		decoded, err = base64.RawURLEncoding.DecodeString(signature)
+		if err != nil {
+			return false
+		}
+	}
+	minLen := fernetVersionLen + fernetTimestamp + fernetIV + aesBlockSize + fernetHMAC
+	if len(decoded) < minLen || decoded[0] != 0x80 {
+		return false
+	}
+	ciphertextLen := len(decoded) - fernetVersionLen - fernetTimestamp - fernetIV - fernetHMAC
+	return ciphertextLen > 0 && ciphertextLen%aesBlockSize == 0
 }
 
 // shortenNameIfNeeded applies a simple shortening rule for a single name.

@@ -61,6 +61,9 @@ func (r *usageReporter) publishAdditionalModel(ctx context.Context, model string
 		return
 	}
 	detail = normalizeUsageDetailTotal(detail)
+	if !hasNonZeroTokenUsage(detail) {
+		return
+	}
 	usage.PublishRecord(ctx, r.buildRecordForModel(model, detail, false))
 }
 
@@ -93,6 +96,14 @@ func normalizeUsageDetailTotal(detail usage.Detail) usage.Detail {
 		}
 	}
 	return detail
+}
+
+func hasNonZeroTokenUsage(detail usage.Detail) bool {
+	return detail.InputTokens != 0 ||
+		detail.OutputTokens != 0 ||
+		detail.ReasoningTokens != 0 ||
+		detail.CachedTokens != 0 ||
+		detail.TotalTokens != 0
 }
 
 // ensurePublished guarantees that a usage record is emitted exactly once.

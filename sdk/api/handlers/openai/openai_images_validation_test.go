@@ -3,6 +3,7 @@ package openai
 import (
 	"bytes"
 	"encoding/base64"
+	"io"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
@@ -10,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/gin-gonic/gin"
+	"github.com/tidwall/gjson"
 )
 
 type multipartImageSpec struct {
@@ -110,6 +112,115 @@ func TestDecodeImagesGenerationsRequest_AcceptsPrefixedToolModel(t *testing.T) {
 	}
 	if payload.Model != "team-a/gpt-image-2" {
 		t.Fatalf("model = %q, want %q", payload.Model, "team-a/gpt-image-2")
+	}
+}
+
+func TestImagesGenerations_RejectsUnsupportedModelBeforePromptValidation(t *testing.T) {
+	resp := performImagesEndpointRequest(
+		t,
+		imagesGenerationsPath,
+		"application/json",
+		strings.NewReader(`{"model":"gpt-5.4-mini"}`),
+		(&OpenAIAPIHandler{}).ImagesGenerations,
+	)
+	assertUnsupportedImagesEndpointResponse(t, resp, imagesGenerationsPath, "gpt-5.4-mini")
+}
+
+func TestImagesEditsJSON_RejectsUnsupportedModelBeforeImageValidation(t *testing.T) {
+	resp := performImagesEndpointRequest(
+		t,
+		imagesEditsPath,
+		"application/json",
+		strings.NewReader(`{"model":"gpt-5.4-mini","prompt":"edit it"}`),
+		(&OpenAIAPIHandler{}).ImagesEdits,
+	)
+	assertUnsupportedImagesEndpointResponse(t, resp, imagesEditsPath, "gpt-5.4-mini")
+}
+
+func TestImagesEditsMultipart_RejectsUnsupportedModelBeforeUploadValidation(t *testing.T) {
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	if err := writer.WriteField("model", "gpt-5.4-mini"); err != nil {
+		t.Fatalf("WriteField(model): %v", err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("writer.Close(): %v", err)
+	}
+
+	resp := performImagesEndpointRequest(
+		t,
+		imagesEditsPath,
+		writer.FormDataContentType(),
+		&body,
+		(&OpenAIAPIHandler{}).ImagesEdits,
+	)
+	assertUnsupportedImagesEndpointResponse(t, resp, imagesEditsPath, "gpt-5.4-mini")
+}
+
+func TestImagesEditsMultipart_UnsupportedModelDoesNotBypassBodyLimit(t *testing.T) {
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	if err := writer.WriteField("model", "gpt-5.4-mini"); err != nil {
+		t.Fatalf("WriteField(model): %v", err)
+	}
+	part, err := writer.CreateFormFile("image", "huge.png")
+	if err != nil {
+		t.Fatalf("CreateFormFile(image): %v", err)
+	}
+	huge := bytes.Repeat([]byte("a"), int(maxImagesMultipartBodyBytes)+1)
+	if _, err := part.Write(huge); err != nil {
+		t.Fatalf("part.Write(huge): %v", err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("writer.Close(): %v", err)
+	}
+
+	resp := performImagesEndpointRequest(
+		t,
+		imagesEditsPath,
+		writer.FormDataContentType(),
+		&body,
+		(&OpenAIAPIHandler{}).ImagesEdits,
+	)
+	if resp.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d: %s", resp.Code, http.StatusBadRequest, resp.Body.String())
+	}
+	message := gjson.GetBytes(resp.Body.Bytes(), "error.message").String()
+	if strings.Contains(message, "only "+defaultImagesToolModel+" is supported") {
+		t.Fatalf("error.message = %q, want body-size error instead of unsupported-model shortcut", message)
+	}
+	if !strings.Contains(strings.ToLower(message), "too large") {
+		t.Fatalf("error.message = %q, want request body too large style error", message)
+	}
+}
+
+func performImagesEndpointRequest(t *testing.T, path string, contentType string, body io.Reader, handler gin.HandlerFunc) *httptest.ResponseRecorder {
+	t.Helper()
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.POST(path, handler)
+
+	req := httptest.NewRequest(http.MethodPost, path, body)
+	if contentType != "" {
+		req.Header.Set("Content-Type", contentType)
+	}
+	resp := httptest.NewRecorder()
+	router.ServeHTTP(resp, req)
+	return resp
+}
+
+func assertUnsupportedImagesEndpointResponse(t *testing.T, resp *httptest.ResponseRecorder, endpointPath string, model string) {
+	t.Helper()
+	if resp.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d: %s", resp.Code, http.StatusBadRequest, resp.Body.String())
+	}
+	message := gjson.GetBytes(resp.Body.Bytes(), "error.message").String()
+	wantMessage := "Invalid request: model \"" + model + "\" is not supported for " + endpointPath + " (only " + defaultImagesToolModel + " is supported)"
+	if message != wantMessage {
+		t.Fatalf("error.message = %q, want %q", message, wantMessage)
+	}
+	if gotType := gjson.GetBytes(resp.Body.Bytes(), "error.type").String(); gotType != "invalid_request_error" {
+		t.Fatalf("error.type = %q, want %q", gotType, "invalid_request_error")
 	}
 }
 

@@ -3,6 +3,7 @@ package openai
 import (
 	"encoding/json"
 	"fmt"
+	"mime/multipart"
 	"net/http"
 	"strconv"
 	"strings"
@@ -68,6 +69,36 @@ type imagesRequestPayload struct {
 	PartialImages     *int64
 	InputFidelity     string
 	Moderation        string
+}
+
+// imagesMultipartFormWithLimit 确保 multipart 请求在第一次解析前就安装 body 大小限制，
+// 避免 handler 为了读取 `model` 过早触发表单解析，从而绕过 MaxBytesReader。
+func imagesMultipartFormWithLimit(c *gin.Context) (*multipart.Form, error) {
+	if c == nil || c.Request == nil {
+		return nil, fmt.Errorf("Invalid request: request is required")
+	}
+	if c.Request.MultipartForm != nil {
+		return c.Request.MultipartForm, nil
+	}
+	if c.Writer != nil && c.Request.Body != nil {
+		c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxImagesMultipartBodyBytes)
+	}
+	form, err := c.MultipartForm()
+	if err != nil {
+		return nil, fmt.Errorf("Invalid request: %v", err)
+	}
+	return form, nil
+}
+
+func firstMultipartFormValue(form *multipart.Form, key string) string {
+	if form == nil {
+		return ""
+	}
+	values := form.Value[key]
+	if len(values) == 0 {
+		return ""
+	}
+	return strings.TrimSpace(values[0])
 }
 
 // readValidJSONBody 统一读取并校验 JSON 请求体，避免重复散落错误格式。
@@ -149,12 +180,9 @@ func decodeImagesEditsJSONRequest(rawJSON []byte) (imagesRequestPayload, error) 
 
 // decodeImagesEditsMultipartRequest 负责把 multipart 编辑请求转换成统一 payload。
 func decodeImagesEditsMultipartRequest(c *gin.Context) (imagesRequestPayload, error) {
-	if c.Request != nil && c.Writer != nil && c.Request.Body != nil {
-		c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxImagesMultipartBodyBytes)
-	}
-	form, err := c.MultipartForm()
+	form, err := imagesMultipartFormWithLimit(c)
 	if err != nil {
-		return imagesRequestPayload{}, fmt.Errorf("Invalid request: %v", err)
+		return imagesRequestPayload{}, err
 	}
 	images, err := collectMultipartImages(form)
 	if err != nil {

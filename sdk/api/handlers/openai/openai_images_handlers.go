@@ -12,10 +12,37 @@ import (
 	"github.com/tidwall/gjson"
 )
 
+const (
+	imagesGenerationsPath = "/v1/images/generations"
+	imagesEditsPath       = "/v1/images/edits"
+)
+
+// rejectUnsupportedImagesModel 在 handler 入口优先拒绝不支持的图片模型，
+// 保证 `/v1/images/*` 先返回 model 错误，而不是先落到 prompt/image 等字段校验。
+func rejectUnsupportedImagesModel(c *gin.Context, endpointPath string, model string) bool {
+	model = strings.TrimSpace(model)
+	if model == "" {
+		model = defaultImagesToolModel
+	}
+	if isSupportedImagesToolModel(model) {
+		return false
+	}
+	writeInvalidRequestError(c, fmt.Sprintf(
+		"Invalid request: model %q is not supported for %s (only %s is supported)",
+		model,
+		endpointPath,
+		defaultImagesToolModel,
+	))
+	return true
+}
+
 // ImagesGenerations 处理 `/v1/images/generations`，并桥接到 Codex Responses 图片调用链。
 func (h *OpenAIAPIHandler) ImagesGenerations(c *gin.Context) {
 	rawJSON, ok := readValidJSONBody(c)
 	if !ok {
+		return
+	}
+	if rejectUnsupportedImagesModel(c, imagesGenerationsPath, gjson.GetBytes(rawJSON, "model").String()) {
 		return
 	}
 	payload, err := decodeImagesGenerationsRequest(rawJSON)
@@ -45,6 +72,9 @@ func (h *OpenAIAPIHandler) imagesEditsFromJSON(c *gin.Context) {
 	if !ok {
 		return
 	}
+	if rejectUnsupportedImagesModel(c, imagesEditsPath, gjson.GetBytes(rawJSON, "model").String()) {
+		return
+	}
 	payload, err := decodeImagesEditsJSONRequest(rawJSON)
 	if err != nil {
 		writeInvalidRequestError(c, err.Error())
@@ -55,6 +85,14 @@ func (h *OpenAIAPIHandler) imagesEditsFromJSON(c *gin.Context) {
 
 // imagesEditsFromMultipart 负责 multipart 版编辑接口的参数校验与执行。
 func (h *OpenAIAPIHandler) imagesEditsFromMultipart(c *gin.Context) {
+	form, err := imagesMultipartFormWithLimit(c)
+	if err != nil {
+		writeInvalidRequestError(c, err.Error())
+		return
+	}
+	if rejectUnsupportedImagesModel(c, imagesEditsPath, firstMultipartFormValue(form, "model")) {
+		return
+	}
 	payload, err := decodeImagesEditsMultipartRequest(c)
 	if err != nil {
 		writeInvalidRequestError(c, err.Error())

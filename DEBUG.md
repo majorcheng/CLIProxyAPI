@@ -63,3 +63,53 @@
 - 修复：在 `internal/runtime/executor/codex_executor.go::ExecuteStream` 的 `response.completed` 分支末尾补回 `reporter.ensurePublished(ctx)`，保持：
   - 主模型成功请求计数总能保留
   - additional image usage 仍只在真实图片调用时发布
+
+## 2026-04-28 v6.9.41 review follow-up
+
+### Observations
+
+- 本轮 `v6.9.41` selective port 只跟了 OpenAI Images handler 的 unsupported model 早拒绝。
+- review 指出：`sdk/api/handlers/openai/openai_images_handlers.go::imagesEditsFromMultipart` 先用 `c.PostForm("model")` 读取模型，再调用 `decodeImagesEditsMultipartRequest(...)`。
+- 当前 body 大小限制安装点在 `sdk/api/handlers/openai/openai_images_payload.go::decodeImagesEditsMultipartRequest`，即 `http.MaxBytesReader(...)`。
+- Gin 的 `PostForm` 会触发表单解析，因此如果先 `PostForm`、后 `MaxBytesReader`，multipart 解析会在限流安装前发生。
+
+### Hypotheses
+
+#### H1：multipart 路径先 `PostForm` 后装 `MaxBytesReader`，导致超大 body 可以绕过原有限制
+- Supports：review 指向的代码路径成立；Gin `PostForm` 会解析 multipart 表单。
+- Conflicts：还没用本地测试验证超大 body 是否真的会先走 unsupported model 早拒绝。
+- Test：把 multipart model 前置读取改成“先安装 body limit、再统一解析 form”，并补超大 body 回归测试。
+
+#### H2：只要在 handler 里更早调用 `http.MaxBytesReader`，继续保留 `c.PostForm("model")` 就足够
+- Supports：如果 limit 在第一次解析前就装好，理论上不会再绕过。
+- Conflicts：`PostForm` 会吞解析错误；一旦第一次解析因为 body 太大失败，后续 decode 可能只看到已消费的请求体，错误形态不稳定。
+- Test：避免 `PostForm`，统一复用共享 multipart helper 返回 `*multipart.Form` 和错误。
+
+#### H3：review 只是测试空白，不是实际 bug
+- Supports：当前新增测试都通过。
+- Conflicts：代码路径上，限流确实发生在 `PostForm` 之后，属于真实顺序回归。
+- Test：补一条“unsupported model + 超大 multipart body”测试，看当前是否还能稳定报 body-too-large。
+
+### Experiments
+
+#### E1：核对 Gin `PostForm` 与标准库 `ParseMultipartForm` 行为
+- Change：无代码变更，只读查看 Gin 与 `net/http` 源码。
+- Expected：如果 `PostForm` 会在 `PostFormValue` / `ParseMultipartForm` 链路里主动解析 multipart，那么 review 根因成立。
+- Result：Confirmed。Gin `Context.initFormCache()` 会调用 `req.ParseMultipartForm(...)`；标准库 `PostFormValue` 也会在必要时触发 `ParseMultipartForm(...)`。
+
+#### E2：改成共享 `imagesMultipartFormWithLimit(...)`，让 handler 与 decode 复用同一次受限解析
+- Change：新增 `sdk/api/handlers/openai/openai_images_payload.go::imagesMultipartFormWithLimit` 与 `firstMultipartFormValue`，`imagesEditsFromMultipart(...)` 不再调用 `c.PostForm("model")`，而是先通过共享 helper 安装 limit 并拿到已解析 form。
+- Expected：限流会在首次 multipart 解析前生效；超大 body 不会再因为 unsupported model 早拒绝逻辑而绕过 size limit。
+- Result：Confirmed。endpoint 级用例与包级测试通过，且新增超大 body 测试不再落到 unsupported model 错误。
+
+### Root Cause
+
+- 本轮回归的根因是 multipart 路径为了前移 unsupported model 校验，过早调用了 `c.PostForm("model")`，从而让表单在 `http.MaxBytesReader` 安装前就被解析。
+
+### Fix
+
+- 新增 `sdk/api/handlers/openai/openai_images_payload.go::imagesMultipartFormWithLimit(...)`，统一负责：
+  - 在第一次 multipart 解析前安装 `MaxBytesReader`
+  - 解析并缓存 `*multipart.Form`
+- `sdk/api/handlers/openai/openai_images_handlers.go::imagesEditsFromMultipart` 现在先通过共享 helper 取 `form`，再用 `firstMultipartFormValue(form, "model")` 做 unsupported model 早拒绝，不再直接调用 `c.PostForm(...)`。
+- `sdk/api/handlers/openai/openai_images_validation_test.go` 新增 `TestImagesEditsMultipart_UnsupportedModelDoesNotBypassBodyLimit`，锁住“大 body 仍优先命中 size limit，而不是 unsupported model shortcut”的语义。

@@ -40,6 +40,7 @@ func ConvertClaudeRequestToCodex(modelName string, inputRawJSON []byte, _ bool) 
 	template := `{"model":"","instructions":"","input":[]}`
 
 	rootResult := gjson.ParseBytes(rawJSON)
+	toolNameMap := buildReverseMapFromClaudeOriginalToShort(rawJSON)
 	template, _ = sjson.Set(template, "model", modelName)
 
 	// Process system messages and convert them to input content format.
@@ -172,8 +173,7 @@ func ConvertClaudeRequestToCodex(modelName string, inputRawJSON []byte, _ bool) 
 						functionCallMessage, _ = sjson.Set(functionCallMessage, "call_id", messageContentResult.Get("id").String())
 						{
 							name := messageContentResult.Get("name").String()
-							toolMap := buildReverseMapFromClaudeOriginalToShort(rawJSON)
-							if short, ok := toolMap[name]; ok {
+							if short, ok := toolNameMap[name]; ok {
 								name = short
 							} else {
 								name = shortenNameIfNeeded(name)
@@ -247,23 +247,14 @@ func ConvertClaudeRequestToCodex(modelName string, inputRawJSON []byte, _ bool) 
 	toolsResult := rootResult.Get("tools")
 	if toolsResult.IsArray() {
 		template, _ = sjson.SetRaw(template, "tools", `[]`)
-		template, _ = sjson.Set(template, "tool_choice", `auto`)
+		webSearchToolNames := buildClaudeWebSearchToolNameSet(toolsResult)
+		template, _ = sjson.SetRaw(template, "tool_choice", convertClaudeToolChoiceToCodex(rootResult.Get("tool_choice"), toolNameMap, webSearchToolNames))
 		toolResults := toolsResult.Array()
-		// Build short name map from declared tools
-		var names []string
-		for i := 0; i < len(toolResults); i++ {
-			n := toolResults[i].Get("name").String()
-			if n != "" {
-				names = append(names, n)
-			}
-		}
-		shortMap := buildShortNameMap(names)
 		for i := 0; i < len(toolResults); i++ {
 			toolResult := toolResults[i]
 			// Special handling: map Claude web search tool to Codex web_search
-			if toolResult.Get("type").String() == "web_search_20250305" {
-				// Replace the tool content entirely with {"type":"web_search"}
-				template, _ = sjson.SetRaw(template, "tools.-1", `{"type":"web_search"}`)
+			if isClaudeWebSearchToolType(toolResult.Get("type").String()) {
+				template, _ = sjson.SetRaw(template, "tools.-1", convertClaudeWebSearchToolToCodex(toolResult))
 				continue
 			}
 			tool := toolResult.Raw
@@ -271,7 +262,7 @@ func ConvertClaudeRequestToCodex(modelName string, inputRawJSON []byte, _ bool) 
 			// Apply shortened name if needed
 			if v := toolResult.Get("name"); v.Exists() {
 				name := v.String()
-				if short, ok := shortMap[name]; ok {
+				if short, ok := toolNameMap[name]; ok {
 					name = short
 				} else {
 					name = shortenNameIfNeeded(name)
@@ -361,6 +352,87 @@ func isFernetLikeReasoningSignature(signature string) bool {
 	}
 	ciphertextLen := len(decoded) - fernetVersionLen - fernetTimestamp - fernetIV - fernetHMAC
 	return ciphertextLen > 0 && ciphertextLen%aesBlockSize == 0
+}
+
+// isClaudeWebSearchToolType 判断 Claude web_search 工具版本，避免把普通 function 工具误转成内建搜索。
+func isClaudeWebSearchToolType(toolType string) bool {
+	return toolType == "web_search_20250305" || toolType == "web_search_20260209"
+}
+
+// buildClaudeWebSearchToolNameSet 只收集显式声明的 web_search 工具名，保持 specific tool_choice 语义。
+func buildClaudeWebSearchToolNameSet(tools gjson.Result) map[string]struct{} {
+	names := map[string]struct{}{}
+	if !tools.IsArray() {
+		return names
+	}
+
+	tools.ForEach(func(_, tool gjson.Result) bool {
+		if !isClaudeWebSearchToolType(tool.Get("type").String()) {
+			return true
+		}
+		if name := tool.Get("name").String(); name != "" {
+			names[name] = struct{}{}
+		}
+		return true
+	})
+
+	return names
+}
+
+// convertClaudeToolChoiceToCodex 将 Claude 的 tool_choice 语义映射到 Codex，避免默认 auto 覆盖强制选择。
+func convertClaudeToolChoiceToCodex(toolChoice gjson.Result, toolNameMap map[string]string, webSearchToolNames map[string]struct{}) string {
+	if !toolChoice.Exists() || toolChoice.Type == gjson.Null {
+		return `"auto"`
+	}
+
+	choiceType := toolChoice.Get("type").String()
+	if choiceType == "" && toolChoice.Type == gjson.String {
+		choiceType = toolChoice.String()
+	}
+
+	switch choiceType {
+	case "auto", "":
+		return `"auto"`
+	case "any":
+		return `"required"`
+	case "none":
+		return `"none"`
+	case "tool":
+		return convertSpecificClaudeToolChoice(toolChoice.Get("name").String(), toolNameMap, webSearchToolNames)
+	default:
+		return `"auto"`
+	}
+}
+
+// convertSpecificClaudeToolChoice 只在工具名已声明为 web_search 时输出 Codex web_search tool_choice。
+func convertSpecificClaudeToolChoice(name string, toolNameMap map[string]string, webSearchToolNames map[string]struct{}) string {
+	if _, ok := webSearchToolNames[name]; ok {
+		return `{"type":"web_search"}`
+	}
+	if short, ok := toolNameMap[name]; ok {
+		name = short
+	} else {
+		name = shortenNameIfNeeded(name)
+	}
+	if name == "" {
+		return `"auto"`
+	}
+
+	choice := `{"type":"function","name":""}`
+	choice, _ = sjson.Set(choice, "name", name)
+	return choice
+}
+
+// convertClaudeWebSearchToolToCodex 只转明确等价字段，避免把 blocked_domains 误映射成不稳定语义。
+func convertClaudeWebSearchToolToCodex(tool gjson.Result) string {
+	out := `{"type":"web_search"}`
+	if allowedDomains := tool.Get("allowed_domains"); allowedDomains.Exists() && allowedDomains.IsArray() {
+		out, _ = sjson.SetRaw(out, "filters.allowed_domains", allowedDomains.Raw)
+	}
+	if userLocation := tool.Get("user_location"); userLocation.Exists() && userLocation.IsObject() {
+		out, _ = sjson.SetRaw(out, "user_location", userLocation.Raw)
+	}
+	return out
 }
 
 // shortenNameIfNeeded applies a simple shortening rule for a single name.

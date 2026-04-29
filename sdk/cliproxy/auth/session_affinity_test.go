@@ -127,6 +127,72 @@ func TestExtractSessionID_UsesAmpThreadHeader(t *testing.T) {
 	}
 }
 
+func TestExtractSessionID_UsesCodexSessionHeader(t *testing.T) {
+	t.Parallel()
+
+	headers := http.Header{"Session_id": []string{"codex-session-42"}}
+	got := ExtractSessionID(headers, nil, nil)
+	if got != "header:codex-session-42" {
+		t.Fatalf("ExtractSessionID() = %q, want %q", got, "header:codex-session-42")
+	}
+}
+
+func TestExtractSessionID_UsesClientRequestHeader(t *testing.T) {
+	t.Parallel()
+
+	headers := http.Header{"X-Client-Request-Id": []string{"pi-request-42"}}
+	got := ExtractSessionID(headers, nil, nil)
+	if got != "header:pi-request-42" {
+		t.Fatalf("ExtractSessionID() = %q, want %q", got, "header:pi-request-42")
+	}
+}
+
+func TestExtractSessionID_HeaderPriority(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		headers http.Header
+		want    string
+	}{
+		{
+			name: "X-Session-ID 优先于 Codex Session_id",
+			headers: http.Header{
+				"X-Session-ID": []string{"session-primary"},
+				"Session_id":   []string{"codex-secondary"},
+			},
+			want: "header:session-primary",
+		},
+		{
+			name: "Amp thread 优先于 PI client request id",
+			headers: http.Header{
+				"X-Amp-Thread-Id":     []string{"amp-primary"},
+				"X-Client-Request-Id": []string{"pi-secondary"},
+			},
+			want: "header:amp-primary",
+		},
+		{
+			name: "Codex Session_id 优先于 Amp thread",
+			headers: http.Header{
+				"Session_id":      []string{"codex-primary"},
+				"X-Amp-Thread-Id": []string{"amp-secondary"},
+			},
+			want: "header:codex-primary",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			got := ExtractSessionID(tt.headers, nil, nil)
+			if got != tt.want {
+				t.Fatalf("ExtractSessionID() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestEnsureRequestSimHashMetadata_WrappedSimHashSelector(t *testing.T) {
 	t.Parallel()
 

@@ -23,11 +23,12 @@ var (
 
 // ConvertCodexResponseToClaudeParams holds parameters for response conversion.
 type ConvertCodexResponseToClaudeParams struct {
-	HasToolCall               bool
+	HasCompletedToolCall      bool
 	BlockIndex                int
 	HasReceivedArgumentsDelta bool
 	HasTextDelta              bool
 	TextBlockOpen             bool
+	ToolBlockOpen             bool
 	ThinkingBlockOpen         bool
 	ThinkingStopPending       bool
 	ThinkingSignature         string
@@ -62,8 +63,7 @@ func appendClaudeSSEEvent(output *strings.Builder, event, payload string) {
 func ConvertCodexResponseToClaude(_ context.Context, _ string, originalRequestRawJSON, _ []byte, rawJSON []byte, param *any) []string {
 	if *param == nil {
 		*param = &ConvertCodexResponseToClaudeParams{
-			HasToolCall: false,
-			BlockIndex:  0,
+			BlockIndex: 0,
 		}
 	}
 
@@ -78,7 +78,7 @@ func ConvertCodexResponseToClaude(_ context.Context, _ string, originalRequestRa
 
 	if params.ThinkingBlockOpen && params.ThinkingStopPending {
 		switch rootResult.Get("type").String() {
-		case "response.content_part.added", "response.completed":
+		case "response.content_part.added", "response.completed", "response.incomplete":
 			finalizeCodexThinkingBlock(params, &output)
 		}
 	}
@@ -129,17 +129,14 @@ func ConvertCodexResponseToClaude(_ context.Context, _ string, originalRequestRa
 		params.BlockIndex++
 		appendClaudeSSEEvent(&output, "content_block_stop", template)
 
-	case "response.completed":
+	case "response.completed", "response.incomplete":
+		closeOpenClaudeBlocksBeforeStop(params, &output)
 		template = `{"type":"message_delta","delta":{"stop_reason":"tool_use","stop_sequence":null},"usage":{"input_tokens":0,"output_tokens":0}}`
-		stopReason := rootResult.Get("response.stop_reason").String()
-		if params.HasToolCall {
-			template, _ = sjson.Set(template, "delta.stop_reason", "tool_use")
-		} else if stopReason == "max_tokens" || stopReason == "stop" {
-			template, _ = sjson.Set(template, "delta.stop_reason", stopReason)
-		} else {
-			template, _ = sjson.Set(template, "delta.stop_reason", "end_turn")
-		}
-		inputTokens, outputTokens, cachedTokens := extractResponsesUsage(rootResult.Get("response.usage"))
+		responseData := rootResult.Get("response")
+		hasCompletedToolCall := params.HasCompletedToolCall && typeStr == "response.completed"
+		template, _ = sjson.Set(template, "delta.stop_reason", mapCodexStopReasonToClaude(codexStopReason(responseData), hasCompletedToolCall))
+		template = setClaudeStopSequence(template, "delta.stop_sequence", responseData)
+		inputTokens, outputTokens, cachedTokens := extractResponsesUsage(responseData.Get("usage"))
 		template, _ = sjson.Set(template, "usage.input_tokens", inputTokens)
 		template, _ = sjson.Set(template, "usage.output_tokens", outputTokens)
 		if cachedTokens > 0 {
@@ -153,7 +150,7 @@ func ConvertCodexResponseToClaude(_ context.Context, _ string, originalRequestRa
 		switch itemResult.Get("type").String() {
 		case "function_call":
 			finalizeCodexThinkingBlock(params, &output)
-			params.HasToolCall = true
+			params.ToolBlockOpen = true
 			params.HasReceivedArgumentsDelta = false
 			template = `{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"","name":"","input":{}}}`
 			template, _ = sjson.Set(template, "index", params.BlockIndex)
@@ -222,10 +219,8 @@ func ConvertCodexResponseToClaude(_ context.Context, _ string, originalRequestRa
 			params.HasTextDelta = true
 			appendClaudeSSEEvent(&output, "content_block_stop", template)
 		case "function_call":
-			template = `{"type":"content_block_stop","index":0}`
-			template, _ = sjson.Set(template, "index", params.BlockIndex)
-			params.BlockIndex++
-			appendClaudeSSEEvent(&output, "content_block_stop", template)
+			params.HasCompletedToolCall = true
+			closeOpenToolBlock(params, &output)
 		case "reasoning":
 			if signature := itemResult.Get("encrypted_content").String(); signature != "" {
 				params.ThinkingSignature = signature
@@ -266,7 +261,8 @@ func ConvertCodexResponseToClaudeNonStream(_ context.Context, _ string, original
 	revNames := buildReverseMapFromClaudeOriginalShortToOriginal(originalRequestRawJSON)
 
 	rootResult := gjson.ParseBytes(rawJSON)
-	if rootResult.Get("type").String() != "response.completed" {
+	typeStr := rootResult.Get("type").String()
+	if typeStr != "response.completed" && typeStr != "response.incomplete" {
 		return ""
 	}
 
@@ -285,7 +281,7 @@ func ConvertCodexResponseToClaudeNonStream(_ context.Context, _ string, original
 		out, _ = sjson.Set(out, "usage.cache_read_input_tokens", cachedTokens)
 	}
 
-	hasToolCall := false
+	hasCompletedToolCall := false
 
 	if output := responseData.Get("output"); output.Exists() && output.IsArray() {
 		output.ForEach(func(_, item gjson.Result) bool {
@@ -355,7 +351,10 @@ func ConvertCodexResponseToClaudeNonStream(_ context.Context, _ string, original
 					}
 				}
 			case "function_call":
-				hasToolCall = true
+				if !shouldEmitNonStreamToolUse(typeStr, item) {
+					return true
+				}
+				hasCompletedToolCall = true
 				name := item.Get("name").String()
 				if original, ok := revNames[name]; ok {
 					name = original
@@ -378,19 +377,118 @@ func ConvertCodexResponseToClaudeNonStream(_ context.Context, _ string, original
 		})
 	}
 
-	if stopReason := responseData.Get("stop_reason"); stopReason.Exists() && stopReason.String() != "" {
-		out, _ = sjson.Set(out, "stop_reason", stopReason.String())
-	} else if hasToolCall {
-		out, _ = sjson.Set(out, "stop_reason", "tool_use")
-	} else {
-		out, _ = sjson.Set(out, "stop_reason", "end_turn")
-	}
-
-	if stopSequence := responseData.Get("stop_sequence"); stopSequence.Exists() && stopSequence.String() != "" {
-		out, _ = sjson.SetRaw(out, "stop_sequence", stopSequence.Raw)
-	}
+	out, _ = sjson.Set(out, "stop_reason", mapCodexStopReasonToClaude(codexStopReason(responseData), hasCompletedToolCall))
+	out = setClaudeStopSequence(out, "stop_sequence", responseData)
 
 	return out
+}
+
+// shouldEmitNonStreamToolUse 只允许完整响应里的合法工具参数转成 Claude tool_use。
+func shouldEmitNonStreamToolUse(responseType string, item gjson.Result) bool {
+	if responseType != "response.completed" {
+		return false
+	}
+	args := item.Get("arguments").String()
+	if args == "" || !gjson.Valid(args) {
+		return false
+	}
+	return gjson.Parse(args).IsObject()
+}
+
+// codexStopReason 统一提取 Codex 完成原因，优先保留显式 stop_sequence 与 incomplete reason。
+func codexStopReason(responseData gjson.Result) string {
+	if stopReason := responseData.Get("stop_reason"); stopReason.Exists() && stopReason.String() != "" {
+		if stopReason.String() == "stop" && codexStopSequence(responseData).String() != "" {
+			return "stop_sequence"
+		}
+		return stopReason.String()
+	}
+	if reason := responseData.Get("incomplete_details.reason"); reason.Exists() && reason.String() != "" {
+		return reason.String()
+	}
+	if codexStopSequence(responseData).String() != "" {
+		return "stop_sequence"
+	}
+	return ""
+}
+
+// mapCodexStopReasonToClaude 将 Codex/OpenAI finish reason 映射为 Claude 兼容 stop_reason。
+func mapCodexStopReasonToClaude(stopReason string, hasCompletedToolCall bool) string {
+	if hasCompletedToolCall && canReportClaudeToolUse(stopReason) {
+		return "tool_use"
+	}
+
+	switch stopReason {
+	case "", "stop", "completed":
+		return "end_turn"
+	case "max_tokens", "max_output_tokens":
+		return "max_tokens"
+	case "tool_use", "tool_calls", "function_call":
+		return "tool_use"
+	case "end_turn", "stop_sequence", "pause_turn", "refusal", "model_context_window_exceeded":
+		return stopReason
+	case "content_filter":
+		return "refusal"
+	default:
+		return "end_turn"
+	}
+}
+
+// canReportClaudeToolUse 只在完成原因兼容工具完成语义时允许 tool_use 覆盖。
+func canReportClaudeToolUse(stopReason string) bool {
+	switch stopReason {
+	case "", "stop", "completed", "stop_sequence", "tool_use", "tool_calls", "function_call":
+		return true
+	default:
+		return false
+	}
+}
+
+// codexStopSequence 封装 stop_sequence 读取，确保 stream 与 non-stream 走同一字段。
+func codexStopSequence(responseData gjson.Result) gjson.Result {
+	return responseData.Get("stop_sequence")
+}
+
+// setClaudeStopSequence 仅在 Codex 明确返回 stop_sequence 时写入 Claude stop_sequence。
+func setClaudeStopSequence(out string, path string, responseData gjson.Result) string {
+	if stopSequence := codexStopSequence(responseData); stopSequence.Exists() && stopSequence.String() != "" {
+		out, _ = sjson.SetRaw(out, path, stopSequence.Raw)
+	}
+	return out
+}
+
+// closeOpenClaudeBlocksBeforeStop 在最终 message_delta 前补齐未关闭的 Claude content block。
+func closeOpenClaudeBlocksBeforeStop(params *ConvertCodexResponseToClaudeParams, output *strings.Builder) {
+	if params == nil {
+		return
+	}
+	if params.ThinkingBlockOpen {
+		finalizeCodexThinkingBlock(params, output)
+	}
+	closeOpenTextBlock(params, output)
+	closeOpenToolBlock(params, output)
+}
+
+func closeOpenTextBlock(params *ConvertCodexResponseToClaudeParams, output *strings.Builder) {
+	if params == nil || !params.TextBlockOpen {
+		return
+	}
+	template := `{"type":"content_block_stop","index":0}`
+	template, _ = sjson.Set(template, "index", params.BlockIndex)
+	params.TextBlockOpen = false
+	params.BlockIndex++
+	appendClaudeSSEEvent(output, "content_block_stop", template)
+}
+
+func closeOpenToolBlock(params *ConvertCodexResponseToClaudeParams, output *strings.Builder) {
+	if params == nil || !params.ToolBlockOpen {
+		return
+	}
+	template := `{"type":"content_block_stop","index":0}`
+	template, _ = sjson.Set(template, "index", params.BlockIndex)
+	params.ToolBlockOpen = false
+	params.BlockIndex++
+	appendClaudeSSEEvent(output, "content_block_stop", template)
 }
 
 func extractResponsesUsage(usage gjson.Result) (int64, int64, int64) {

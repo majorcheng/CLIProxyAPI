@@ -74,26 +74,33 @@ func extractHeaderSessionID(headers http.Header) string {
 	if headers == nil {
 		return ""
 	}
-	if sessionID := strings.TrimSpace(headers.Get("X-Session-ID")); sessionID != "" {
+	if sessionID := headerValueCaseInsensitive(headers, "X-Session-ID"); sessionID != "" {
 		return sessionID
 	}
-	for key, values := range headers {
-		if !strings.EqualFold(strings.TrimSpace(key), "X-Session-ID") || len(values) == 0 {
-			continue
-		}
-		if sessionID := strings.TrimSpace(values[0]); sessionID != "" {
-			return sessionID
-		}
+	if sessionID := headerValueCaseInsensitive(headers, "Session_id"); sessionID != "" {
+		return sessionID
 	}
-	if threadID := strings.TrimSpace(headers.Get("X-Amp-Thread-Id")); threadID != "" {
+	if threadID := headerValueCaseInsensitive(headers, "X-Amp-Thread-Id"); threadID != "" {
 		return threadID
 	}
+	return headerValueCaseInsensitive(headers, "X-Client-Request-Id")
+}
+
+// headerValueCaseInsensitive 按大小写不敏感方式读取 header，避免非标准客户端写法丢失会话锚点。
+func headerValueCaseInsensitive(headers http.Header, name string) string {
+	if headers == nil || strings.TrimSpace(name) == "" {
+		return ""
+	}
+	// Header.Get 会做规范化查找；保留遍历兜底是为了兼容非标准大小写或下划线写法。
+	if value := strings.TrimSpace(headers.Get(name)); value != "" {
+		return value
+	}
 	for key, values := range headers {
-		if !strings.EqualFold(strings.TrimSpace(key), "X-Amp-Thread-Id") || len(values) == 0 {
+		if !strings.EqualFold(strings.TrimSpace(key), name) || len(values) == 0 {
 			continue
 		}
-		if threadID := strings.TrimSpace(values[0]); threadID != "" {
-			return threadID
+		if value := strings.TrimSpace(values[0]); value != "" {
+			return value
 		}
 	}
 	return ""

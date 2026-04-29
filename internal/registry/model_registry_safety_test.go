@@ -166,7 +166,7 @@ func TestCodexPlanStaticModelsMatchSelectivePortedCatalog(t *testing.T) {
 		models  []*ModelInfo
 		wantIDs []string
 	}{
-		{name: "codex-free", models: GetCodexFreeModels(), wantIDs: []string{"gpt-5.2", "gpt-5.3-codex", "gpt-5.4", "gpt-5.4-mini", "codex-auto-review", "gpt-image-2"}},
+		{name: "codex-free", models: GetCodexFreeModels(), wantIDs: []string{"gpt-5.2", "gpt-5.3-codex", "gpt-5.4", "gpt-5.4-mini", "gpt-5.5", "codex-auto-review", "gpt-image-2"}},
 		{name: "codex-team", models: GetCodexTeamModels(), wantIDs: []string{"gpt-5.2", "gpt-5.3-codex", "gpt-5.4", "gpt-5.4-mini", "gpt-5.5", "codex-auto-review", "gpt-image-2"}},
 		{name: "codex-plus", models: GetCodexPlusModels(), wantIDs: []string{"gpt-5.2", "gpt-5.3-codex", "gpt-5.3-codex-spark", "gpt-5.4", "gpt-5.4-mini", "gpt-5.5", "codex-auto-review", "gpt-image-2"}},
 		{name: "codex-pro", models: GetCodexProModels(), wantIDs: []string{"gpt-5.2", "gpt-5.3-codex", "gpt-5.3-codex-spark", "gpt-5.4", "gpt-5.4-mini", "gpt-5.5", "codex-auto-review", "gpt-image-2"}},

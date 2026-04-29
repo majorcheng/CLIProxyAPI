@@ -21,8 +21,8 @@ const (
 )
 
 var modelsURLs = []string{
-	"https://raw.githubusercontent.com/router-for-me/CLIProxyAPI/main/internal/registry/models/models.json",
-	"https://github.com/router-for-me/CLIProxyAPI/raw/main/internal/registry/models/models.json",
+	"https://raw.githubusercontent.com/majorcheng/CLIProxyAPI/main/internal/registry/models/models.json",
+	"https://github.com/majorcheng/CLIProxyAPI/raw/main/internal/registry/models/models.json",
 }
 
 //go:embed models/models.json

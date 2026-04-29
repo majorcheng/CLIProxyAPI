@@ -71,8 +71,8 @@ func TestModelsURLsPointToCLIProxyAPIRegistryCatalog(t *testing.T) {
 		t.Fatal("modelsURLs is empty")
 	}
 	for _, rawURL := range modelsURLs {
-		if !strings.Contains(rawURL, "router-for-me/CLIProxyAPI") {
-			t.Fatalf("models URL %q does not point to CLIProxyAPI upstream catalog", rawURL)
+		if !strings.Contains(rawURL, "majorcheng/CLIProxyAPI") {
+			t.Fatalf("models URL %q does not point to the configured CLIProxyAPI catalog", rawURL)
 		}
 		if !strings.Contains(rawURL, "/internal/registry/models/models.json") {
 			t.Fatalf("models URL %q is not the registry models.json path", rawURL)

@@ -119,7 +119,8 @@ func (e *CodexExecutor) buildCodexRequestPlan(ctx context.Context, req cliproxye
 	}
 
 	body = applyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", body, originalTranslated, requestedModel)
-	body = normalizeCodexPreparedBody(body, mode, baseModel)
+	disableImageGeneration := e.cfg != nil && e.cfg.DisableImageGeneration
+	body = normalizeCodexPreparedBody(body, mode, baseModel, disableImageGeneration)
 
 	conversationID := codexPromptCacheID(ctx, from, req)
 	if conversationID != "" {
@@ -139,10 +140,10 @@ func codexPreparedRequestTargetFormat(mode codexPreparedRequestPlanMode) sdktran
 	return sdktranslator.FromString("codex")
 }
 
-func normalizeCodexPreparedBody(body []byte, mode codexPreparedRequestPlanMode, baseModel string) []byte {
+func normalizeCodexPreparedBody(body []byte, mode codexPreparedRequestPlanMode, baseModel string, disableImageGeneration bool) []byte {
 	state, ok := inspectCodexPreparedBody(body, baseModel)
 	if !ok {
-		return normalizeCodexPreparedBodyFallback(body, mode, baseModel)
+		return normalizeCodexPreparedBodyFallback(body, mode, baseModel, disableImageGeneration)
 	}
 	switch mode {
 	case codexPreparedRequestPlanExecute:
@@ -201,6 +202,9 @@ func normalizeCodexPreparedBody(body []byte, mode codexPreparedRequestPlanMode, 
 		}
 	}
 	body = normalizeCodexInstructions(body)
+	if disableImageGeneration {
+		return body
+	}
 	return ensureCodexImageGenerationTool(body, baseModel)
 }
 
@@ -245,7 +249,7 @@ func inspectCodexPreparedBody(body []byte, baseModel string) (codexPreparedBodyS
 	return state, true
 }
 
-func normalizeCodexPreparedBodyFallback(body []byte, mode codexPreparedRequestPlanMode, baseModel string) []byte {
+func normalizeCodexPreparedBodyFallback(body []byte, mode codexPreparedRequestPlanMode, baseModel string, disableImageGeneration bool) []byte {
 	switch mode {
 	case codexPreparedRequestPlanExecute:
 		body = setJSONStringFieldIfNeeded(body, "model", baseModel)
@@ -269,6 +273,9 @@ func normalizeCodexPreparedBodyFallback(body []byte, mode codexPreparedRequestPl
 		body = ensureJSONStringField(body, "instructions", "")
 	}
 	body = normalizeCodexInstructions(body)
+	if disableImageGeneration {
+		return body
+	}
 	return ensureCodexImageGenerationTool(body, baseModel)
 }
 

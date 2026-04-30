@@ -279,6 +279,7 @@ func TestBuildConfigChangeDetails_FlagsAndKeys(t *testing.T) {
 			ProxyURL:                   "http://old-proxy",
 			APIKeys:                    []string{"key-1"},
 			ForceModelPrefix:           false,
+			DisableImageGeneration:     false,
 			NonStreamKeepAliveInterval: 0,
 		},
 	}
@@ -320,6 +321,7 @@ func TestBuildConfigChangeDetails_FlagsAndKeys(t *testing.T) {
 			ProxyURL:                   "http://new-proxy",
 			APIKeys:                    []string{"key-1", "key-2"},
 			ForceModelPrefix:           true,
+			DisableImageGeneration:     true,
 			NonStreamKeepAliveInterval: 5,
 		},
 	}
@@ -333,6 +335,7 @@ func TestBuildConfigChangeDetails_FlagsAndKeys(t *testing.T) {
 	expectContains(t, details, "usage-statistics-persist-interval-seconds: 30 -> 10")
 	expectContains(t, details, "usage-statistics-retention-days: 0 -> 30")
 	expectContains(t, details, "disable-cooling: false -> true")
+	expectContains(t, details, "disable-image-generation: false -> true")
 	expectContains(t, details, "request-log: false -> true")
 	expectContains(t, details, "request-retry: 1 -> 2")
 	expectContains(t, details, "max-retry-credentials: 1 -> 3")
@@ -394,9 +397,10 @@ func TestBuildConfigChangeDetails_AllBranches(t *testing.T) {
 			SecretKey:              "old",
 		},
 		SDKConfig: sdkconfig.SDKConfig{
-			RequestLog: false,
-			ProxyURL:   "http://old-proxy",
-			APIKeys:    []string{"keyA"},
+			RequestLog:             false,
+			ProxyURL:               "http://old-proxy",
+			APIKeys:                []string{"keyA"},
+			DisableImageGeneration: false,
 		},
 		OAuthExcludedModels: map[string][]string{"p1": {"a"}},
 		OpenAICompatibility: []config.OpenAICompatibility{
@@ -448,9 +452,10 @@ func TestBuildConfigChangeDetails_AllBranches(t *testing.T) {
 			SecretKey:              "",
 		},
 		SDKConfig: sdkconfig.SDKConfig{
-			RequestLog: true,
-			ProxyURL:   "http://new-proxy",
-			APIKeys:    []string{"keyB"},
+			RequestLog:             true,
+			ProxyURL:               "http://new-proxy",
+			APIKeys:                []string{"keyB"},
+			DisableImageGeneration: true,
 		},
 		OAuthExcludedModels: map[string][]string{"p1": {"b", "c"}, "p2": {"d"}},
 		OpenAICompatibility: []config.OpenAICompatibility{
@@ -478,6 +483,7 @@ func TestBuildConfigChangeDetails_AllBranches(t *testing.T) {
 	expectContains(t, changes, "logging-to-file: false -> true")
 	expectContains(t, changes, "usage-statistics-enabled: false -> true")
 	expectContains(t, changes, "disable-cooling: false -> true")
+	expectContains(t, changes, "disable-image-generation: false -> true")
 	expectContains(t, changes, "request-retry: 1 -> 2")
 	expectContains(t, changes, "max-retry-credentials: 1 -> 3")
 	expectContains(t, changes, "max-retry-interval: 1 -> 3")

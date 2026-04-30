@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/http/httputil"
+	"net/url"
 	"testing"
 
 	"github.com/gin-gonic/gin"
@@ -69,5 +70,47 @@ func TestFallbackHandler_ModelMapping_PreservesThinkingSuffixAndRewritesResponse
 	}
 	if resp.SeenModel != "test/gpt-5.2(xhigh)" {
 		t.Errorf("Expected handler to see test/gpt-5.2(xhigh), got %s", resp.SeenModel)
+	}
+}
+
+func TestFallbackHandler_DisableImageGenerationBlocksAmpImagesProxy(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	proxyCalled := false
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		proxyCalled = true
+		w.WriteHeader(http.StatusTeapot)
+	}))
+	defer upstream.Close()
+	upstreamURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("url.Parse() 失败：%v", err)
+	}
+
+	fallback := NewFallbackHandler(func() *httputil.ReverseProxy {
+		return httputil.NewSingleHostReverseProxy(upstreamURL)
+	})
+	fallback.SetDisableImageGeneration(func() bool { return true })
+
+	handlerCalled := false
+	r := gin.New()
+	r.POST("/api/provider/openai/v1/images/generations", fallback.WrapHandler(func(c *gin.Context) {
+		handlerCalled = true
+		c.Status(http.StatusOK)
+	}))
+
+	req := httptest.NewRequest(http.MethodPost, "/api/provider/openai/v1/images/generations", bytes.NewReader([]byte(`{"model":"no-local-provider"}`)))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("status = %d，期望 %d", w.Code, http.StatusNotFound)
+	}
+	if handlerCalled {
+		t.Fatal("全局禁用图片生成时不应调用 wrapped handler")
+	}
+	if proxyCalled {
+		t.Fatal("全局禁用图片生成时不应调用 amp fallback proxy")
 	}
 }

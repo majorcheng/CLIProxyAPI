@@ -4,6 +4,7 @@ import (
 	"context"
 	"testing"
 
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v6/sdk/translator"
 	"github.com/tidwall/gjson"
@@ -38,6 +39,33 @@ func TestCodexPrepareRequestPlan_InjectsImageGenerationToolForExplicitImageInten
 		if got := tools[0].Get("type").String(); got != "image_generation" {
 			t.Fatalf("prepareCodexRequestPlan(%s) tool type = %q, want %q", mode, got, "image_generation")
 		}
+	}
+}
+
+func TestCodexPrepareRequestPlan_DisableImageGenerationSkipsExplicitImageTool(t *testing.T) {
+	executor := NewCodexExecutor(&config.Config{
+		SDKConfig: config.SDKConfig{DisableImageGeneration: true},
+	})
+	req := cliproxyexecutor.Request{
+		Model:   "gpt-5.4",
+		Payload: []byte(`{"model":"gpt-5.4","input":"hello","tool_choice":{"type":"image_generation"}}`),
+	}
+	opts := cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("openai-response"),
+		Metadata: map[string]any{
+			cliproxyexecutor.RequestedModelMetadataKey: "gpt-5.4",
+		},
+	}
+
+	plan, err := executor.prepareCodexRequestPlan(context.Background(), req, opts, codexPreparedRequestPlanExecute)
+	if err != nil {
+		t.Fatalf("prepareCodexRequestPlan() error = %v", err)
+	}
+	if got := gjson.GetBytes(plan.body, "tools"); got.Exists() {
+		t.Fatalf("tools = %s, want absent when disable-image-generation is true", got.Raw)
+	}
+	if got := gjson.GetBytes(plan.body, "tool_choice.type").String(); got != "image_generation" {
+		t.Fatalf("tool_choice.type = %q, want image_generation unchanged", got)
 	}
 }
 

@@ -11,6 +11,8 @@ import (
 	"testing"
 
 	"github.com/gin-gonic/gin"
+	sdkhandlers "github.com/router-for-me/CLIProxyAPI/v6/sdk/api/handlers"
+	sdkconfig "github.com/router-for-me/CLIProxyAPI/v6/sdk/config"
 	"github.com/tidwall/gjson"
 )
 
@@ -126,6 +128,18 @@ func TestImagesGenerations_RejectsUnsupportedModelBeforePromptValidation(t *test
 	assertUnsupportedImagesEndpointResponse(t, resp, imagesGenerationsPath, "gpt-5.4-mini")
 }
 
+func TestImagesGenerations_DisableImageGenerationReturns404BeforeBodyValidation(t *testing.T) {
+	handler := disabledImageGenerationOpenAIHandler()
+	resp := performImagesEndpointRequest(
+		t,
+		imagesGenerationsPath,
+		"application/json",
+		strings.NewReader(`{`),
+		handler.ImagesGenerations,
+	)
+	assertDisabledImagesEndpointResponse(t, resp)
+}
+
 func TestImagesEditsJSON_RejectsUnsupportedModelBeforeImageValidation(t *testing.T) {
 	resp := performImagesEndpointRequest(
 		t,
@@ -135,6 +149,18 @@ func TestImagesEditsJSON_RejectsUnsupportedModelBeforeImageValidation(t *testing
 		(&OpenAIAPIHandler{}).ImagesEdits,
 	)
 	assertUnsupportedImagesEndpointResponse(t, resp, imagesEditsPath, "gpt-5.4-mini")
+}
+
+func TestImagesEditsJSON_DisableImageGenerationReturns404BeforeBodyValidation(t *testing.T) {
+	handler := disabledImageGenerationOpenAIHandler()
+	resp := performImagesEndpointRequest(
+		t,
+		imagesEditsPath,
+		"application/json",
+		strings.NewReader(`{"model":"gpt-5.4-mini","prompt":"edit it"}`),
+		handler.ImagesEdits,
+	)
+	assertDisabledImagesEndpointResponse(t, resp)
 }
 
 func TestImagesEditsMultipart_RejectsUnsupportedModelBeforeUploadValidation(t *testing.T) {
@@ -155,6 +181,27 @@ func TestImagesEditsMultipart_RejectsUnsupportedModelBeforeUploadValidation(t *t
 		(&OpenAIAPIHandler{}).ImagesEdits,
 	)
 	assertUnsupportedImagesEndpointResponse(t, resp, imagesEditsPath, "gpt-5.4-mini")
+}
+
+func TestImagesEditsMultipart_DisableImageGenerationReturns404BeforeUploadValidation(t *testing.T) {
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	if err := writer.WriteField("model", "gpt-5.4-mini"); err != nil {
+		t.Fatalf("WriteField(model): %v", err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("writer.Close(): %v", err)
+	}
+
+	handler := disabledImageGenerationOpenAIHandler()
+	resp := performImagesEndpointRequest(
+		t,
+		imagesEditsPath,
+		writer.FormDataContentType(),
+		&body,
+		handler.ImagesEdits,
+	)
+	assertDisabledImagesEndpointResponse(t, resp)
 }
 
 func TestImagesEditsMultipart_UnsupportedModelDoesNotBypassBodyLimit(t *testing.T) {
@@ -207,6 +254,23 @@ func performImagesEndpointRequest(t *testing.T, path string, contentType string,
 	resp := httptest.NewRecorder()
 	router.ServeHTTP(resp, req)
 	return resp
+}
+
+// disabledImageGenerationOpenAIHandler 构造启用全局图片禁用开关的 OpenAI handler。
+func disabledImageGenerationOpenAIHandler() *OpenAIAPIHandler {
+	base := sdkhandlers.NewBaseAPIHandlers(&sdkconfig.SDKConfig{DisableImageGeneration: true}, nil)
+	return NewOpenAIAPIHandler(base)
+}
+
+// assertDisabledImagesEndpointResponse 校验禁用图片能力时的隐藏式 404 响应。
+func assertDisabledImagesEndpointResponse(t *testing.T, resp *httptest.ResponseRecorder) {
+	t.Helper()
+	if resp.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want %d: %s", resp.Code, http.StatusNotFound, resp.Body.String())
+	}
+	if resp.Body.Len() != 0 {
+		t.Fatalf("body = %q, want empty 404 body", resp.Body.String())
+	}
 }
 
 func assertUnsupportedImagesEndpointResponse(t *testing.T, resp *httptest.ResponseRecorder, endpointPath string, model string) {

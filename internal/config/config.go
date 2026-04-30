@@ -662,6 +662,7 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	cfg.UsageStatisticsPersistIntervalSeconds = 30
 	cfg.UsageStatisticsRetentionDays = 0
 	cfg.DisableCooling = false
+	cfg.DisableImageGeneration = false
 	cfg.SharedExitPriorityZeroOAuthNetworkJitterFallback = false
 	cfg.AuthMaintenance.ScanIntervalSeconds = 30
 	cfg.AuthMaintenance.DeleteIntervalSeconds = 5

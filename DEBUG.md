@@ -113,3 +113,42 @@
   - 解析并缓存 `*multipart.Form`
 - `sdk/api/handlers/openai/openai_images_handlers.go::imagesEditsFromMultipart` 现在先通过共享 helper 取 `form`，再用 `firstMultipartFormValue(form, "model")` 做 unsupported model 早拒绝，不再直接调用 `c.PostForm(...)`。
 - `sdk/api/handlers/openai/openai_images_validation_test.go` 新增 `TestImagesEditsMultipart_UnsupportedModelDoesNotBypassBodyLimit`，锁住“大 body 仍优先命中 size limit，而不是 unsupported model shortcut”的语义。
+
+## 2026-04-30 disable-image-generation review follow-up
+
+### Observations
+
+- `internal/runtime/executor/payload_helpers.go::removeToolTypeFromToolsArray` 删除 `image_generation` 后原先会写回 `tools: []`；当原数组只有图片工具时会留下空数组。
+- `internal/runtime/executor/iflow_executor.go::ExecuteStream` 已在 `applyPayloadConfigWithRoot(...)` 之前规避空 `tools` 数组，因此 payload helper 后续重新写出空数组会绕过这层兼容处理。
+- `internal/api/modules/amp/fallback_handlers.go::WrapHandler` 会在没有本地 provider 时直接 `proxy.ServeHTTP(...)`，并且发生在 OpenAI Images handler 的 `rejectDisabledImageGeneration(...)` 之前。
+- `internal/api/modules/amp/routes.go::registerProviderAliases` 把 `/api/provider/:provider[/v1]/images/*` 包在 `FallbackHandler.WrapHandler(...)` 里。
+- `internal/translator/codex/openai/responses/codex_openai-responses_request.go` 已支持 `tool_choice.tools` 形状；此前 `payload_helpers.go::removeToolTypeFromPayloadWithRoot` 只清理顶层 `tools`。
+
+### Hypotheses
+
+#### H1: payload helper 只写回空数组导致上游不兼容（ROOT）
+- Supports: review 指向 `removeToolTypeFromToolsArray`，iFlow 兼容逻辑在 payload helper 之前。
+- Conflicts: 混合工具数组不受影响。
+- Test: 新增只含 `image_generation` 的 payload helper 用例，期望 `tools` 字段被删除。
+
+#### H2: AMP fallback 没有读全局禁用开关导致绕过 404（ROOT）
+- Supports: `WrapHandler` 在无 provider 时直接代理，OpenAI Images handler 不会执行。
+- Conflicts: 有本地 provider 时仍会进入 handler，被现有 404 覆盖。
+- Test: 构造 `/api/provider/openai/v1/images/generations` fallback 请求，禁用开关开启时确认不调用 proxy 和 wrapped handler。
+
+#### H3: Responses allowed_tools 的 `tool_choice.tools` 未清理导致禁用语义不完整（ROOT）
+- Supports: translator 支持 `tool_choice.tools`，payload helper 只清理 `tools`。
+- Conflicts: 顶层 `tool_choice.type=image_generation` 按既定方案保持不改。
+- Test: 构造 `tool_choice.type=allowed_tools` 且 tools 内含 `image_generation`，期望清理该引用。
+
+### Root Cause
+
+- 全局图片禁用逻辑只覆盖了主 OpenAI Images handler 和顶层 `tools` 数组，没有覆盖 AMP fallback 的代理前分支、Responses `tool_choice.tools` 形状，以及删除最后一个工具后的空数组兼容问题。
+
+### Fix
+
+- `payload_helpers.go::removeToolTypeFromPayloadWithRoot` 同时清理顶层 `tools` 与 `tool_choice.tools`，并在最后一个工具被移除时删除对应 tools 字段。
+- `payload_helpers.go::removeEmptyAllowedToolsChoiceWithRoot` 只在本轮确实移除了 `tool_choice.tools` 里的图片工具后，删除已经没有 allowed tools 的 `tool_choice`。
+- `fallback_handlers.go::WrapHandler` 在 AMP provider alias 图片路径上先检查全局禁用开关，命中时直接返回 404，不进入 wrapped handler 或 proxy。
+- `routes.go::registerProviderAliases` 将 `BaseAPIHandler.Cfg.DisableImageGeneration` 绑定给 fallback handler，支持热更新后的配置读取。
+- 新增 payload helper、fallback handler 和 provider alias 回归测试。

@@ -189,6 +189,10 @@ max-retry-interval: 30
 # 这主要用于调试、外部调度自行控速，或明确不希望 401/403/404/429 暂停凭证的场景。
 disable-cooling: false
 
+# 为 true 时，全局禁用内建 image_generation 图片生成能力。
+# 启用后 `/v1/images/*` 会返回 404，并会从请求 tools 数组中移除 image_generation。
+disable-image-generation: false
+
 # Core auth 自动刷新 worker 池大小（适用于 OAuth / 文件型 auth 刷新）。
 # 大于 0 时覆盖默认并发数 16；未配置时保持默认值。
 # auth-auto-refresh-workers: 16

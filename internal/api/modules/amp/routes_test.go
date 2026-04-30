@@ -1,12 +1,14 @@
 package amp
 
 import (
+	"bytes"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/api/handlers"
+	sdkconfig "github.com/router-for-me/CLIProxyAPI/v6/sdk/config"
 )
 
 func TestRegisterManagementRoutes(t *testing.T) {
@@ -197,6 +199,41 @@ func TestRegisterProviderAliases_V1Routes(t *testing.T) {
 				t.Fatalf("v1 route %s %s not registered", tc.method, tc.path)
 			}
 		})
+	}
+}
+
+func TestRegisterProviderAliases_DisableImageGenerationBlocksImagesFallback(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+
+	proxyCalled := false
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		proxyCalled = true
+		w.WriteHeader(http.StatusTeapot)
+	}))
+	defer upstream.Close()
+	proxy, err := createReverseProxy(upstream.URL, NewStaticSecretSource(""))
+	if err != nil {
+		t.Fatalf("createReverseProxy() 失败：%v", err)
+	}
+
+	base := &handlers.BaseAPIHandler{
+		Cfg: &sdkconfig.SDKConfig{DisableImageGeneration: true},
+	}
+	m := &AmpModule{}
+	m.setProxy(proxy)
+	m.registerProviderAliases(r, base, nil)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/provider/openai/v1/images/generations", bytes.NewReader([]byte(`{"model":"no-local-provider"}`)))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("status = %d，期望 %d", w.Code, http.StatusNotFound)
+	}
+	if proxyCalled {
+		t.Fatal("禁用图片生成时 AMP provider alias 不应代理 images 请求")
 	}
 }
 

@@ -956,6 +956,10 @@ func (s *Server) UpdateClients(cfg *config.Config) {
 		auth.SetQuotaCooldownDisabled(cfg.DisableCooling)
 	}
 
+	if oldCfg != nil && oldCfg.DisableImageGeneration != cfg.DisableImageGeneration {
+		log.Infof("disable-image-generation updated: %t -> %t", oldCfg.DisableImageGeneration, cfg.DisableImageGeneration)
+	}
+
 	if s.handlers != nil && s.handlers.AuthManager != nil {
 		s.handlers.AuthManager.SetRetryConfig(cfg.RequestRetry, time.Duration(cfg.MaxRetryInterval)*time.Second, cfg.MaxRetryCredentials, cfg.MaxInvalidRequestRetries)
 	}

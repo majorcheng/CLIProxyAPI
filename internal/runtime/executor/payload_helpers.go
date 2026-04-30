@@ -11,43 +11,56 @@ import (
 	"github.com/tidwall/sjson"
 )
 
-// applyPayloadConfigWithRoot behaves like applyPayloadConfig but treats all parameter
-// paths as relative to the provided root path (for example, "request" for Gemini CLI)
-// and restricts matches to the given protocol when supplied. Defaults are checked
-// against the original payload when provided. requestedModel carries the client-visible
-// model name before alias resolution so payload rules can target aliases precisely.
+// applyPayloadConfigWithRoot 按可选 root 应用 payload 规则。
+// root 主要用于 Gemini CLI 这类把真实请求包在 `request` 字段下的协议；
+// requestedModel 保留客户端原始模型名，让 payload 规则能精确匹配 alias。
 func applyPayloadConfigWithRoot(cfg *config.Config, model, protocol, root string, payload, original []byte, requestedModel string) []byte {
 	if cfg == nil || len(payload) == 0 {
 		return payload
 	}
-	rules := cfg.Payload
-	if len(rules.Default) == 0 && len(rules.DefaultRaw) == 0 && len(rules.Override) == 0 && len(rules.OverrideRaw) == 0 && len(rules.Filter) == 0 {
-		return payload
-	}
-	model = strings.TrimSpace(model)
-	requestedModel = strings.TrimSpace(requestedModel)
-	if model == "" && requestedModel == "" {
-		return payload
-	}
-	candidates := payloadModelCandidates(model, requestedModel)
 	out := payload
-	source := original
-	if len(source) == 0 {
-		source = payload
+	rules := cfg.Payload
+	hasPayloadRules := len(rules.Default) != 0 || len(rules.DefaultRaw) != 0 || len(rules.Override) != 0 || len(rules.OverrideRaw) != 0 || len(rules.Filter) != 0
+	if hasPayloadRules {
+		model = strings.TrimSpace(model)
+		requestedModel = strings.TrimSpace(requestedModel)
+		if model != "" || requestedModel != "" {
+			candidates := payloadModelCandidates(model, requestedModel)
+			source := original
+			if len(source) == 0 {
+				source = payload
+			}
+			out = applyPayloadRulesWithRoot(rules, protocol, root, out, source, candidates)
+		}
 	}
+
+	if cfg.DisableImageGeneration {
+		out = removeToolTypeFromPayloadWithRoot(out, root, "image_generation")
+	}
+	return out
+}
+
+// applyPayloadRulesWithRoot 按既有顺序应用 payload 规则，确保 default、override、filter 的优先级不变。
+func applyPayloadRulesWithRoot(rules config.PayloadConfig, protocol, root string, payload, source []byte, candidates []string) []byte {
+	out := payload
 	appliedDefaults := make(map[string]struct{})
-	// Apply default rules: first write wins per field across all matching rules.
-	for i := range rules.Default {
-		rule := &rules.Default[i]
+	out = applyPayloadDefaultRulesWithRoot(out, source, rules.Default, protocol, root, candidates, appliedDefaults)
+	out = applyPayloadDefaultRawRulesWithRoot(out, source, rules.DefaultRaw, protocol, root, candidates, appliedDefaults)
+	out = applyPayloadOverrideRulesWithRoot(out, rules.Override, protocol, root, candidates)
+	out = applyPayloadOverrideRawRulesWithRoot(out, rules.OverrideRaw, protocol, root, candidates)
+	return applyPayloadFilterRulesWithRoot(out, rules.Filter, protocol, root, candidates)
+}
+
+// applyPayloadDefaultRulesWithRoot 只在原始请求缺少字段时写入普通 JSON 值。
+func applyPayloadDefaultRulesWithRoot(out, source []byte, rules []config.PayloadRule, protocol, root string, candidates []string, appliedDefaults map[string]struct{}) []byte {
+	for i := range rules {
+		rule := &rules[i]
 		if !payloadModelRulesMatch(rule.Models, protocol, candidates) {
 			continue
 		}
 		for path, value := range rule.Params {
 			fullPath := buildPayloadPath(root, path)
-			if fullPath == "" {
-				continue
-			}
-			if gjson.GetBytes(source, fullPath).Exists() {
+			if fullPath == "" || gjson.GetBytes(source, fullPath).Exists() {
 				continue
 			}
 			if _, ok := appliedDefaults[fullPath]; ok {
@@ -61,18 +74,19 @@ func applyPayloadConfigWithRoot(cfg *config.Config, model, protocol, root string
 			appliedDefaults[fullPath] = struct{}{}
 		}
 	}
-	// Apply default raw rules: first write wins per field across all matching rules.
-	for i := range rules.DefaultRaw {
-		rule := &rules.DefaultRaw[i]
+	return out
+}
+
+// applyPayloadDefaultRawRulesWithRoot 只在原始请求缺少字段时写入 raw JSON，避免字符串被二次编码。
+func applyPayloadDefaultRawRulesWithRoot(out, source []byte, rules []config.PayloadRule, protocol, root string, candidates []string, appliedDefaults map[string]struct{}) []byte {
+	for i := range rules {
+		rule := &rules[i]
 		if !payloadModelRulesMatch(rule.Models, protocol, candidates) {
 			continue
 		}
 		for path, value := range rule.Params {
 			fullPath := buildPayloadPath(root, path)
-			if fullPath == "" {
-				continue
-			}
-			if gjson.GetBytes(source, fullPath).Exists() {
+			if fullPath == "" || gjson.GetBytes(source, fullPath).Exists() {
 				continue
 			}
 			if _, ok := appliedDefaults[fullPath]; ok {
@@ -90,9 +104,13 @@ func applyPayloadConfigWithRoot(cfg *config.Config, model, protocol, root string
 			appliedDefaults[fullPath] = struct{}{}
 		}
 	}
-	// Apply override rules: last write wins per field across all matching rules.
-	for i := range rules.Override {
-		rule := &rules.Override[i]
+	return out
+}
+
+// applyPayloadOverrideRulesWithRoot 按匹配顺序覆盖普通 JSON 值，后命中的规则自然覆盖前值。
+func applyPayloadOverrideRulesWithRoot(out []byte, rules []config.PayloadRule, protocol, root string, candidates []string) []byte {
+	for i := range rules {
+		rule := &rules[i]
 		if !payloadModelRulesMatch(rule.Models, protocol, candidates) {
 			continue
 		}
@@ -108,9 +126,13 @@ func applyPayloadConfigWithRoot(cfg *config.Config, model, protocol, root string
 			out = updated
 		}
 	}
-	// Apply override raw rules: last write wins per field across all matching rules.
-	for i := range rules.OverrideRaw {
-		rule := &rules.OverrideRaw[i]
+	return out
+}
+
+// applyPayloadOverrideRawRulesWithRoot 按匹配顺序覆盖 raw JSON，保证数组和对象片段保持原始类型。
+func applyPayloadOverrideRawRulesWithRoot(out []byte, rules []config.PayloadRule, protocol, root string, candidates []string) []byte {
+	for i := range rules {
+		rule := &rules[i]
 		if !payloadModelRulesMatch(rule.Models, protocol, candidates) {
 			continue
 		}
@@ -130,9 +152,13 @@ func applyPayloadConfigWithRoot(cfg *config.Config, model, protocol, root string
 			out = updated
 		}
 	}
-	// Apply filter rules: remove matching paths from payload.
-	for i := range rules.Filter {
-		rule := &rules.Filter[i]
+	return out
+}
+
+// applyPayloadFilterRulesWithRoot 删除匹配规则指定的字段，保持 filter 在所有写入规则之后执行。
+func applyPayloadFilterRulesWithRoot(out []byte, rules []config.PayloadFilterRule, protocol, root string, candidates []string) []byte {
+	for i := range rules {
+		rule := &rules[i]
 		if !payloadModelRulesMatch(rule.Models, protocol, candidates) {
 			continue
 		}
@@ -149,6 +175,99 @@ func applyPayloadConfigWithRoot(cfg *config.Config, model, protocol, root string
 		}
 	}
 	return out
+}
+
+// removeToolTypeFromPayloadWithRoot 从 tools 数组移除指定工具类型，供全局能力开关覆盖 payload 规则结果。
+func removeToolTypeFromPayloadWithRoot(payload []byte, root string, toolType string) []byte {
+	toolType = strings.TrimSpace(toolType)
+	if len(payload) == 0 || toolType == "" {
+		return payload
+	}
+	choiceToolsPath := buildPayloadPath(root, "tool_choice.tools")
+	hadChoiceTool := toolsArrayContainsType(payload, choiceToolsPath, toolType)
+	out := removeToolTypeFromToolsArray(payload, buildPayloadPath(root, "tools"), toolType)
+	out = removeToolTypeFromToolsArray(out, choiceToolsPath, toolType)
+	if hadChoiceTool {
+		out = removeEmptyAllowedToolsChoiceWithRoot(out, root)
+	}
+	return out
+}
+
+// removeToolTypeFromToolsArray 过滤数组内被禁用的工具项；若全部移除则删除该 tools 字段。
+func removeToolTypeFromToolsArray(payload []byte, toolsPath string, toolType string) []byte {
+	tools := gjson.GetBytes(payload, toolsPath)
+	if !tools.IsArray() {
+		return payload
+	}
+	items := tools.Array()
+	rawItems := make([]string, 0, len(items))
+	removed := false
+	for _, item := range items {
+		if strings.TrimSpace(item.Get("type").String()) == toolType {
+			removed = true
+			continue
+		}
+		rawItems = append(rawItems, payloadResultRaw(item))
+	}
+	if !removed {
+		return payload
+	}
+	if len(rawItems) == 0 {
+		updated, errDel := sjson.DeleteBytes(payload, toolsPath)
+		if errDel != nil {
+			return payload
+		}
+		return updated
+	}
+	updated, errSet := sjson.SetRawBytes(payload, toolsPath, []byte("["+strings.Join(rawItems, ",")+"]"))
+	if errSet != nil {
+		return payload
+	}
+	return updated
+}
+
+// toolsArrayContainsType 判断指定 tools 数组里是否包含目标工具类型，用于限制后续清理范围。
+func toolsArrayContainsType(payload []byte, toolsPath string, toolType string) bool {
+	tools := gjson.GetBytes(payload, toolsPath)
+	if !tools.IsArray() {
+		return false
+	}
+	for _, item := range tools.Array() {
+		if strings.TrimSpace(item.Get("type").String()) == toolType {
+			return true
+		}
+	}
+	return false
+}
+
+// removeEmptyAllowedToolsChoiceWithRoot 删除已经没有 allowed tools 的限制对象，避免发送无效 tool_choice。
+func removeEmptyAllowedToolsChoiceWithRoot(payload []byte, root string) []byte {
+	choicePath := buildPayloadPath(root, "tool_choice")
+	choice := gjson.GetBytes(payload, choicePath)
+	if !choice.IsObject() || strings.TrimSpace(choice.Get("type").String()) != "allowed_tools" {
+		return payload
+	}
+	tools := choice.Get("tools")
+	if tools.IsArray() && len(tools.Array()) > 0 {
+		return payload
+	}
+	updated, errDel := sjson.DeleteBytes(payload, choicePath)
+	if errDel != nil {
+		return payload
+	}
+	return updated
+}
+
+// payloadResultRaw 返回 gjson 节点的原始 JSON，用于重建数组时避免改变工具对象内容。
+func payloadResultRaw(item gjson.Result) string {
+	if item.Raw != "" {
+		return item.Raw
+	}
+	raw, errMarshal := json.Marshal(item.Value())
+	if errMarshal != nil {
+		return "null"
+	}
+	return string(raw)
 }
 
 func payloadModelRulesMatch(rules []config.PayloadModelRule, protocol string, models []string) bool {

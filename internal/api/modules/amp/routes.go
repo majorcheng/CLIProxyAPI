@@ -275,6 +275,9 @@ func (m *AmpModule) registerProviderAliases(engine *gin.Engine, baseHandler *han
 	fallbackHandler := NewFallbackHandlerWithMapper(func() *httputil.ReverseProxy {
 		return m.getProxy()
 	}, m.modelMapper, m.forceModelMappings)
+	fallbackHandler.SetDisableImageGeneration(func() bool {
+		return baseHandler != nil && baseHandler.Cfg != nil && baseHandler.Cfg.DisableImageGeneration
+	})
 
 	// Provider-specific routes under /api/provider/:provider
 	ampProviders := engine.Group("/api/provider")

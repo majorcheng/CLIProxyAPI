@@ -38,6 +38,9 @@ func rejectUnsupportedImagesModel(c *gin.Context, endpointPath string, model str
 
 // ImagesGenerations 处理 `/v1/images/generations`，并桥接到 Codex Responses 图片调用链。
 func (h *OpenAIAPIHandler) ImagesGenerations(c *gin.Context) {
+	if h.rejectDisabledImageGeneration(c) {
+		return
+	}
 	rawJSON, ok := readValidJSONBody(c)
 	if !ok {
 		return
@@ -55,6 +58,9 @@ func (h *OpenAIAPIHandler) ImagesGenerations(c *gin.Context) {
 
 // ImagesEdits 处理 `/v1/images/edits`，同时兼容 JSON 与 multipart/form-data。
 func (h *OpenAIAPIHandler) ImagesEdits(c *gin.Context) {
+	if h.rejectDisabledImageGeneration(c) {
+		return
+	}
 	contentType := strings.ToLower(strings.TrimSpace(c.GetHeader("Content-Type")))
 	switch {
 	case strings.HasPrefix(contentType, "application/json"):
@@ -64,6 +70,18 @@ func (h *OpenAIAPIHandler) ImagesEdits(c *gin.Context) {
 	default:
 		writeInvalidRequestError(c, fmt.Sprintf("Invalid request: unsupported Content-Type %q", contentType))
 	}
+}
+
+// rejectDisabledImageGeneration 在全局禁用图片能力时让图片入口表现为不存在，避免继续解析请求体。
+func (h *OpenAIAPIHandler) rejectDisabledImageGeneration(c *gin.Context) bool {
+	if h == nil || h.BaseAPIHandler == nil || h.BaseAPIHandler.Cfg == nil {
+		return false
+	}
+	if !h.BaseAPIHandler.Cfg.DisableImageGeneration {
+		return false
+	}
+	c.AbortWithStatus(http.StatusNotFound)
+	return true
 }
 
 // imagesEditsFromJSON 负责 JSON 版编辑接口的参数校验与执行。

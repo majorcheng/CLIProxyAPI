@@ -3,6 +3,7 @@ package amp
 import (
 	"bytes"
 	"io"
+	"net/http"
 	"net/http/httputil"
 	"strings"
 	"time"
@@ -81,6 +82,7 @@ type FallbackHandler struct {
 	getProxy           func() *httputil.ReverseProxy
 	modelMapper        ModelMapper
 	forceModelMappings func() bool
+	disableImages      func() bool
 }
 
 // NewFallbackHandler creates a new fallback handler wrapper
@@ -109,11 +111,20 @@ func (fh *FallbackHandler) SetModelMapper(mapper ModelMapper) {
 	fh.modelMapper = mapper
 }
 
+// SetDisableImageGeneration 绑定全局图片禁用开关，保证 fallback 代理前也能拦截图片入口。
+func (fh *FallbackHandler) SetDisableImageGeneration(disabled func() bool) {
+	fh.disableImages = disabled
+}
+
 // WrapHandler wraps a gin.HandlerFunc with fallback logic
 // If the model's provider is not configured in CLIProxyAPI, it forwards to ampcode.com
 func (fh *FallbackHandler) WrapHandler(handler gin.HandlerFunc) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		requestPath := c.Request.URL.Path
+		if fh.imageGenerationDisabled() && isAmpImagesRequestPath(requestPath) {
+			c.AbortWithStatus(http.StatusNotFound)
+			return
+		}
 
 		// Read the request body to extract the model name
 		bodyBytes, err := io.ReadAll(c.Request.Body)
@@ -279,6 +290,17 @@ func (fh *FallbackHandler) WrapHandler(handler gin.HandlerFunc) gin.HandlerFunc 
 			handler(c)
 		}
 	}
+}
+
+// imageGenerationDisabled 返回当前全局图片禁用状态，默认保持关闭以兼容旧构造方式。
+func (fh *FallbackHandler) imageGenerationDisabled() bool {
+	return fh != nil && fh.disableImages != nil && fh.disableImages()
+}
+
+// isAmpImagesRequestPath 识别 AMP provider alias 下的 OpenAI Images 入口。
+func isAmpImagesRequestPath(path string) bool {
+	path = strings.TrimSpace(path)
+	return strings.HasSuffix(path, "/images/generations") || strings.HasSuffix(path, "/images/edits")
 }
 
 // filterAntropicBetaHeader filters Anthropic-Beta header to remove features requiring special subscription

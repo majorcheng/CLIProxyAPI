@@ -131,7 +131,7 @@ func (e *GeminiExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 
 	body = fixGeminiImageAspectRatio(baseModel, body)
 	requestedModel := payloadRequestedModel(opts, req.Model)
-	body = applyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", body, originalTranslated, requestedModel)
+	body = applyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", body, originalTranslated, requestedModel, payloadRequestPath(opts))
 	body, _ = sjson.SetBytes(body, "model", baseModel)
 
 	action := "generateContent"
@@ -238,7 +238,7 @@ func (e *GeminiExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 
 	body = fixGeminiImageAspectRatio(baseModel, body)
 	requestedModel := payloadRequestedModel(opts, req.Model)
-	body = applyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", body, originalTranslated, requestedModel)
+	body = applyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", body, originalTranslated, requestedModel, payloadRequestPath(opts))
 	body, _ = sjson.SetBytes(body, "model", baseModel)
 
 	baseURL := resolveGeminiBaseURL(auth)

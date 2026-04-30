@@ -31,6 +31,25 @@ func TestRequestExecutionMetadataIncludesDisallowFreeAuth(t *testing.T) {
 	}
 }
 
+func TestRequestExecutionMetadataIncludesGinRequestPath(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.POST("/api/provider/:provider/v1/images/generations", func(c *gin.Context) {
+		ctx := context.WithValue(context.Background(), "gin", c)
+		meta := requestExecutionMetadata(ctx)
+		if got := meta[coreexecutor.RequestPathMetadataKey]; got != "/api/provider/:provider/v1/images/generations" {
+			t.Fatalf("RequestPathMetadataKey = %#v, want route full path", got)
+		}
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/api/provider/openai/v1/images/generations", nil)
+	resp := httptest.NewRecorder()
+	router.ServeHTTP(resp, req)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d: %s", resp.Code, http.StatusOK, resp.Body.String())
+	}
+}
+
 func TestHeadersFromContextClonesGinRequestHeaders(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	recorder := httptest.NewRecorder()

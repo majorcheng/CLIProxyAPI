@@ -3,6 +3,7 @@ package amp
 import (
 	"bytes"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/http/httputil"
@@ -12,6 +13,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
+	"github.com/tidwall/gjson"
 )
 
 func TestFallbackHandler_ModelMapping_PreservesThinkingSuffixAndRewritesResponse(t *testing.T) {
@@ -112,5 +114,69 @@ func TestFallbackHandler_DisableImageGenerationBlocksAmpImagesProxy(t *testing.T
 	}
 	if proxyCalled {
 		t.Fatal("全局禁用图片生成时不应调用 amp fallback proxy")
+	}
+}
+
+func TestFallbackHandler_DisableImageGenerationChatModeStripsNonImagesProxyBody(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	var upstreamBody []byte
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var err error
+		upstreamBody, err = io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("ReadAll(upstream body) 失败：%v", err)
+		}
+		w.WriteHeader(http.StatusTeapot)
+	}))
+	defer upstream.Close()
+	upstreamURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("url.Parse() 失败：%v", err)
+	}
+
+	fallback := NewFallbackHandler(func() *httputil.ReverseProxy {
+		return httputil.NewSingleHostReverseProxy(upstreamURL)
+	})
+	fallback.SetDisableImageGenerationMode(func() config.DisableImageGenerationMode {
+		return config.DisableImageGenerationChat
+	})
+
+	handlerCalled := false
+	router := gin.New()
+	router.POST("/api/provider/openai/v1/chat/completions", fallback.WrapHandler(func(c *gin.Context) {
+		handlerCalled = true
+		c.Status(http.StatusOK)
+	}))
+	server := httptest.NewServer(router)
+	defer server.Close()
+
+	reqBody := []byte(`{"model":"no-local-provider","tools":[{"type":"image_generation"},{"type":"function","name":"demo"}],"tool_choice":{"type":"image_generation"}}`)
+	resp, err := http.Post(server.URL+"/api/provider/openai/v1/chat/completions", "application/json", bytes.NewReader(reqBody))
+	if err != nil {
+		t.Fatalf("http.Post() 失败：%v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusTeapot {
+		t.Fatalf("status = %d，期望 %d", resp.StatusCode, http.StatusTeapot)
+	}
+	if handlerCalled {
+		t.Fatal("无本地 provider 时不应调用 wrapped handler")
+	}
+	assertAmpFallbackBodyWithoutImageGeneration(t, upstreamBody)
+}
+
+// assertAmpFallbackBodyWithoutImageGeneration 校验 fallback 上游请求不会携带已禁用的图片工具。
+func assertAmpFallbackBodyWithoutImageGeneration(t *testing.T, body []byte) {
+	t.Helper()
+	if got := gjson.GetBytes(body, "tools.#(type==\"image_generation\")"); got.Exists() {
+		t.Fatalf("upstream body tools 仍包含 image_generation：%s", string(body))
+	}
+	if got := gjson.GetBytes(body, "tools.#(type==\"function\").name").String(); got != "demo" {
+		t.Fatalf("function tool name = %q，期望 demo：%s", got, string(body))
+	}
+	if choice := gjson.GetBytes(body, "tool_choice"); choice.Exists() {
+		t.Fatalf("upstream body tool_choice = %s，期望删除 image_generation 选择", choice.Raw)
 	}
 }

@@ -140,6 +140,18 @@ func TestImagesGenerations_DisableImageGenerationReturns404BeforeBodyValidation(
 	assertDisabledImagesEndpointResponse(t, resp)
 }
 
+func TestImagesGenerations_DisableImageGenerationChatModeDoesNotReturn404(t *testing.T) {
+	handler := imageGenerationOpenAIHandler(sdkconfig.DisableImageGenerationChat)
+	resp := performImagesEndpointRequest(
+		t,
+		imagesGenerationsPath,
+		"application/json",
+		strings.NewReader(`{"model":"gpt-5.4-mini"}`),
+		handler.ImagesGenerations,
+	)
+	assertUnsupportedImagesEndpointResponse(t, resp, imagesGenerationsPath, "gpt-5.4-mini")
+}
+
 func TestImagesEditsJSON_RejectsUnsupportedModelBeforeImageValidation(t *testing.T) {
 	resp := performImagesEndpointRequest(
 		t,
@@ -258,7 +270,12 @@ func performImagesEndpointRequest(t *testing.T, path string, contentType string,
 
 // disabledImageGenerationOpenAIHandler 构造启用全局图片禁用开关的 OpenAI handler。
 func disabledImageGenerationOpenAIHandler() *OpenAIAPIHandler {
-	base := sdkhandlers.NewBaseAPIHandlers(&sdkconfig.SDKConfig{DisableImageGeneration: true}, nil)
+	return imageGenerationOpenAIHandler(sdkconfig.DisableImageGenerationAll)
+}
+
+// imageGenerationOpenAIHandler 构造指定图片禁用模式的 OpenAI handler。
+func imageGenerationOpenAIHandler(mode sdkconfig.DisableImageGenerationMode) *OpenAIAPIHandler {
+	base := sdkhandlers.NewBaseAPIHandlers(&sdkconfig.SDKConfig{DisableImageGeneration: mode}, nil)
 	return NewOpenAIAPIHandler(base)
 }
 

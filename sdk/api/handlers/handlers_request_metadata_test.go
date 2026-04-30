@@ -112,7 +112,7 @@ func TestApplyClientRoutingPolicyMetadata_ReadsBearerKeyDirectlyFromRequest(t *t
 	}
 }
 
-func TestApplyClientRoutingPolicyMetadata_AllowsEmptyMetadataFromRequestExecutionMetadata(t *testing.T) {
+func TestApplyClientRoutingPolicyMetadata_AllowsRequestPathOnlyMetadata(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	recorder := httptest.NewRecorder()
 	ginCtx, _ := gin.CreateTestContext(recorder)
@@ -122,8 +122,11 @@ func TestApplyClientRoutingPolicyMetadata_AllowsEmptyMetadataFromRequestExecutio
 
 	ctx := context.WithValue(context.Background(), "gin", ginCtx)
 	meta := requestExecutionMetadata(ctx)
-	if len(meta) != 0 {
-		t.Fatalf("requestExecutionMetadata() = %#v, want empty metadata map", meta)
+	if got := meta[coreexecutor.RequestPathMetadataKey]; got != "/v1/chat/completions" {
+		t.Fatalf("request path metadata = %#v, want /v1/chat/completions", got)
+	}
+	if _, ok := meta[idempotencyKeyMetadataKey]; ok {
+		t.Fatalf("metadata should not fabricate %q before routing policy: %#v", idempotencyKeyMetadataKey, meta)
 	}
 
 	cfg := &sdkconfig.SDKConfig{APIKeys: []string{"key-direct"}}

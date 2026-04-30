@@ -218,7 +218,7 @@ func TestRegisterProviderAliases_DisableImageGenerationBlocksImagesFallback(t *t
 	}
 
 	base := &handlers.BaseAPIHandler{
-		Cfg: &sdkconfig.SDKConfig{DisableImageGeneration: true},
+		Cfg: &sdkconfig.SDKConfig{DisableImageGeneration: sdkconfig.DisableImageGenerationAll},
 	}
 	m := &AmpModule{}
 	m.setProxy(proxy)
@@ -234,6 +234,48 @@ func TestRegisterProviderAliases_DisableImageGenerationBlocksImagesFallback(t *t
 	}
 	if proxyCalled {
 		t.Fatal("禁用图片生成时 AMP provider alias 不应代理 images 请求")
+	}
+}
+
+func TestRegisterProviderAliases_DisableImageGenerationChatModeAllowsImagesFallback(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+
+	proxyCalled := false
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		proxyCalled = true
+		w.WriteHeader(http.StatusTeapot)
+	}))
+	defer upstream.Close()
+	proxy, err := createReverseProxy(upstream.URL, NewStaticSecretSource(""))
+	if err != nil {
+		t.Fatalf("createReverseProxy() 失败：%v", err)
+	}
+
+	base := &handlers.BaseAPIHandler{
+		Cfg: &sdkconfig.SDKConfig{DisableImageGeneration: sdkconfig.DisableImageGenerationChat},
+	}
+	m := &AmpModule{modelMapper: NewModelMapper(nil)}
+	m.setProxy(proxy)
+	m.registerProviderAliases(r, base, nil)
+
+	server := httptest.NewServer(r)
+	defer server.Close()
+	resp, err := http.Post(
+		server.URL+"/api/provider/openai/v1/images/generations",
+		"application/json",
+		bytes.NewReader([]byte(`{"model":"no-local-provider"}`)),
+	)
+	if err != nil {
+		t.Fatalf("http.Post() 失败：%v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusTeapot {
+		t.Fatalf("status = %d，期望 %d", resp.StatusCode, http.StatusTeapot)
+	}
+	if !proxyCalled {
+		t.Fatal("chat 模式不应阻断 AMP provider alias images fallback")
 	}
 }
 

@@ -405,7 +405,7 @@ func (e *AIStudioExecutor) translateRequest(req cliproxyexecutor.Request, opts c
 	}
 	payload = fixGeminiImageAspectRatio(baseModel, payload)
 	requestedModel := payloadRequestedModel(opts, req.Model)
-	payload = applyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", payload, originalTranslated, requestedModel)
+	payload = applyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", payload, originalTranslated, requestedModel, payloadRequestPath(opts))
 	payload, _ = sjson.DeleteBytes(payload, "generationConfig.maxOutputTokens")
 	payload, _ = sjson.DeleteBytes(payload, "generationConfig.responseMimeType")
 	payload, _ = sjson.DeleteBytes(payload, "generationConfig.responseJsonSchema")

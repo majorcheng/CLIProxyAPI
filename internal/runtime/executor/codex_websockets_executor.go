@@ -173,7 +173,7 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 	}
 
 	requestedModel := payloadRequestedModel(opts, req.Model)
-	body = applyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", body, originalTranslated, requestedModel)
+	body = applyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", body, originalTranslated, requestedModel, payloadRequestPath(opts))
 	body, err = sjson.SetBytes(body, "model", baseModel)
 	if err != nil {
 		return resp, fmt.Errorf("codex websockets executor: set base model in request body: %w", err)
@@ -379,7 +379,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 	}
 
 	requestedModel := payloadRequestedModel(opts, req.Model)
-	body = applyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", body, body, requestedModel)
+	body = applyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", body, body, requestedModel, payloadRequestPath(opts))
 	body, err = sjson.SetBytes(body, "model", baseModel)
 	if err != nil {
 		return nil, fmt.Errorf("codex websockets executor: set base model in request body: %w", err)

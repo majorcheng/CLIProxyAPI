@@ -44,7 +44,7 @@ func TestCodexPrepareRequestPlan_InjectsImageGenerationToolForExplicitImageInten
 
 func TestCodexPrepareRequestPlan_DisableImageGenerationSkipsExplicitImageTool(t *testing.T) {
 	executor := NewCodexExecutor(&config.Config{
-		SDKConfig: config.SDKConfig{DisableImageGeneration: true},
+		SDKConfig: config.SDKConfig{DisableImageGeneration: config.DisableImageGenerationAll},
 	})
 	req := cliproxyexecutor.Request{
 		Model:   "gpt-5.4",
@@ -64,8 +64,65 @@ func TestCodexPrepareRequestPlan_DisableImageGenerationSkipsExplicitImageTool(t 
 	if got := gjson.GetBytes(plan.body, "tools"); got.Exists() {
 		t.Fatalf("tools = %s, want absent when disable-image-generation is true", got.Raw)
 	}
+	if got := gjson.GetBytes(plan.body, "tool_choice"); got.Exists() {
+		t.Fatalf("tool_choice = %s, want absent when disable-image-generation is true", got.Raw)
+	}
+}
+
+func TestCodexPrepareRequestPlan_DisableImageGenerationChatModeSkipsNonImagesPath(t *testing.T) {
+	executor := NewCodexExecutor(&config.Config{
+		SDKConfig: config.SDKConfig{DisableImageGeneration: config.DisableImageGenerationChat},
+	})
+	req := cliproxyexecutor.Request{
+		Model:   "gpt-5.4",
+		Payload: []byte(`{"model":"gpt-5.4","input":"hello","tool_choice":{"type":"image_generation"}}`),
+	}
+	opts := cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("openai-response"),
+		Metadata: map[string]any{
+			cliproxyexecutor.RequestedModelMetadataKey: "gpt-5.4",
+			cliproxyexecutor.RequestPathMetadataKey:    "/v1/responses",
+		},
+	}
+
+	plan, err := executor.prepareCodexRequestPlan(context.Background(), req, opts, codexPreparedRequestPlanExecute)
+	if err != nil {
+		t.Fatalf("prepareCodexRequestPlan() error = %v", err)
+	}
+	if got := gjson.GetBytes(plan.body, "tools"); got.Exists() {
+		t.Fatalf("tools = %s, want absent for chat-mode non-images path", got.Raw)
+	}
+	if got := gjson.GetBytes(plan.body, "tool_choice"); got.Exists() {
+		t.Fatalf("tool_choice = %s, want absent for chat-mode non-images path", got.Raw)
+	}
+}
+
+func TestCodexPrepareRequestPlan_DisableImageGenerationChatModeAllowsImagesPath(t *testing.T) {
+	executor := NewCodexExecutor(&config.Config{
+		SDKConfig: config.SDKConfig{DisableImageGeneration: config.DisableImageGenerationChat},
+	})
+	req := cliproxyexecutor.Request{
+		Model:   "gpt-5.4",
+		Payload: []byte(`{"model":"gpt-5.4","input":"hello","tool_choice":{"type":"image_generation"}}`),
+	}
+	opts := cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("openai-response"),
+		Metadata: map[string]any{
+			cliproxyexecutor.RequestedModelMetadataKey: "gpt-5.4",
+			cliproxyexecutor.RequestPathMetadataKey:    "/v1/images/generations",
+		},
+	}
+
+	plan, err := executor.prepareCodexRequestPlan(context.Background(), req, opts, codexPreparedRequestPlanExecute)
+	if err != nil {
+		t.Fatalf("prepareCodexRequestPlan() error = %v", err)
+	}
+	tools := gjson.GetBytes(plan.body, "tools").Array()
+	if len(tools) != 1 || tools[0].Get("type").String() != "image_generation" {
+		t.Fatalf("tools = %s, want one image_generation tool", gjson.GetBytes(plan.body, "tools").Raw)
+	}
 	if got := gjson.GetBytes(plan.body, "tool_choice.type").String(); got != "image_generation" {
-		t.Fatalf("tool_choice.type = %q, want image_generation unchanged", got)
+		t.Fatalf("tool_choice.type = %q, want image_generation", got)
 	}
 }
 

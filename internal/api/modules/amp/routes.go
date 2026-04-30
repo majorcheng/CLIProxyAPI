@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/gin-gonic/gin"
+	internalconfig "github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/api/handlers"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/api/handlers/claude"
@@ -275,8 +276,11 @@ func (m *AmpModule) registerProviderAliases(engine *gin.Engine, baseHandler *han
 	fallbackHandler := NewFallbackHandlerWithMapper(func() *httputil.ReverseProxy {
 		return m.getProxy()
 	}, m.modelMapper, m.forceModelMappings)
-	fallbackHandler.SetDisableImageGeneration(func() bool {
-		return baseHandler != nil && baseHandler.Cfg != nil && baseHandler.Cfg.DisableImageGeneration
+	fallbackHandler.SetDisableImageGenerationMode(func() internalconfig.DisableImageGenerationMode {
+		if baseHandler == nil || baseHandler.Cfg == nil {
+			return internalconfig.DisableImageGenerationOff
+		}
+		return baseHandler.Cfg.DisableImageGeneration
 	})
 
 	// Provider-specific routes under /api/provider/:provider

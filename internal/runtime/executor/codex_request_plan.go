@@ -118,8 +118,9 @@ func (e *CodexExecutor) buildCodexRequestPlan(ctx context.Context, req cliproxye
 		return codexPreparedRequestPlan{}, err
 	}
 
-	body = applyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", body, originalTranslated, requestedModel)
-	disableImageGeneration := e.cfg != nil && e.cfg.DisableImageGeneration
+	requestPath := payloadRequestPath(opts)
+	body = applyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", body, originalTranslated, requestedModel, requestPath)
+	disableImageGeneration := imageGenerationDisabledForRequest(e.cfg, requestPath)
 	body = normalizeCodexPreparedBody(body, mode, baseModel, disableImageGeneration)
 
 	conversationID := codexPromptCacheID(ctx, from, req)

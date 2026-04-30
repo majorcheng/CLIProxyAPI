@@ -10,6 +10,10 @@ import (
 // RequestedModelMetadataKey stores the client-requested model name in Options.Metadata.
 const RequestedModelMetadataKey = "requested_model"
 
+// RequestPathMetadataKey 记录下游 HTTP 请求路径，供 executor 区分 Images 与普通聊天入口。
+// 非 HTTP 调用可不携带该 metadata。
+const RequestPathMetadataKey = "request_path"
+
 // DisallowFreeAuthMetadataKey instructs auth selection to skip known free-tier credentials.
 const DisallowFreeAuthMetadataKey = "disallow_free_auth"
 

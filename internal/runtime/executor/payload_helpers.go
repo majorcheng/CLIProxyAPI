@@ -14,7 +14,7 @@ import (
 // applyPayloadConfigWithRoot 按可选 root 应用 payload 规则。
 // root 主要用于 Gemini CLI 这类把真实请求包在 `request` 字段下的协议；
 // requestedModel 保留客户端原始模型名，让 payload 规则能精确匹配 alias。
-func applyPayloadConfigWithRoot(cfg *config.Config, model, protocol, root string, payload, original []byte, requestedModel string) []byte {
+func applyPayloadConfigWithRoot(cfg *config.Config, model, protocol, root string, payload, original []byte, requestedModel string, requestPath string) []byte {
 	if cfg == nil || len(payload) == 0 {
 		return payload
 	}
@@ -34,10 +34,41 @@ func applyPayloadConfigWithRoot(cfg *config.Config, model, protocol, root string
 		}
 	}
 
-	if cfg.DisableImageGeneration {
+	if imageGenerationDisabledForRequest(cfg, requestPath) {
 		out = removeToolTypeFromPayloadWithRoot(out, root, "image_generation")
+		out = removeToolChoiceFromPayloadWithRoot(out, root, "image_generation")
 	}
 	return out
+}
+
+// imageGenerationDisabledForRequest 判断当前请求是否需要剥离 image_generation 能力。
+func imageGenerationDisabledForRequest(cfg *config.Config, requestPath string) bool {
+	if cfg == nil {
+		return false
+	}
+	switch cfg.DisableImageGeneration {
+	case config.DisableImageGenerationAll:
+		return true
+	case config.DisableImageGenerationChat:
+		return !isImagesEndpointRequestPath(requestPath)
+	default:
+		return false
+	}
+}
+
+// isImagesEndpointRequestPath 识别 OpenAI Images 入口，兼容 provider alias 的前缀路由。
+func isImagesEndpointRequestPath(path string) bool {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return false
+	}
+	if path == "/v1/images/generations" || path == "/v1/images/edits" {
+		return true
+	}
+	if strings.HasSuffix(path, "/v1/images/generations") || strings.HasSuffix(path, "/v1/images/edits") {
+		return true
+	}
+	return strings.HasSuffix(path, "/images/generations") || strings.HasSuffix(path, "/images/edits")
 }
 
 // applyPayloadRulesWithRoot 按既有顺序应用 payload 规则，确保 default、override、filter 的优先级不变。
@@ -191,6 +222,60 @@ func removeToolTypeFromPayloadWithRoot(payload []byte, root string, toolType str
 		out = removeEmptyAllowedToolsChoiceWithRoot(out, root)
 	}
 	return out
+}
+
+// removeToolChoiceFromPayloadWithRoot 删除直接指向被禁用工具的 tool_choice。
+func removeToolChoiceFromPayloadWithRoot(payload []byte, root string, toolType string) []byte {
+	toolType = strings.TrimSpace(toolType)
+	if len(payload) == 0 || toolType == "" {
+		return payload
+	}
+	return removeToolChoiceFromPayload(payload, buildPayloadPath(root, "tool_choice"), toolType)
+}
+
+// removeToolChoiceFromPayload 只删除明确选择 image_generation 的 tool_choice。
+func removeToolChoiceFromPayload(payload []byte, toolChoicePath string, toolType string) []byte {
+	choice := gjson.GetBytes(payload, toolChoicePath)
+	if !choice.Exists() {
+		return payload
+	}
+	if choice.Type == gjson.String {
+		return deleteMatchingStringToolChoice(payload, toolChoicePath, choice, toolType)
+	}
+	if !choice.IsObject() {
+		return payload
+	}
+	return deleteMatchingObjectToolChoice(payload, toolChoicePath, choice, toolType)
+}
+
+func deleteMatchingStringToolChoice(payload []byte, path string, choice gjson.Result, toolType string) []byte {
+	if !strings.EqualFold(strings.TrimSpace(choice.String()), toolType) {
+		return payload
+	}
+	updated, errDel := sjson.DeleteBytes(payload, path)
+	if errDel != nil {
+		return payload
+	}
+	return updated
+}
+
+func deleteMatchingObjectToolChoice(payload []byte, path string, choice gjson.Result, toolType string) []byte {
+	choiceType := strings.TrimSpace(choice.Get("type").String())
+	if strings.EqualFold(choiceType, toolType) || toolChoiceToolNameMatches(choice, choiceType, toolType) {
+		updated, errDel := sjson.DeleteBytes(payload, path)
+		if errDel == nil {
+			return updated
+		}
+	}
+	return payload
+}
+
+func toolChoiceToolNameMatches(choice gjson.Result, choiceType string, toolType string) bool {
+	if !strings.EqualFold(choiceType, "tool") {
+		return false
+	}
+	name := strings.TrimSpace(choice.Get("name").String())
+	return strings.EqualFold(name, toolType)
 }
 
 // removeToolTypeFromToolsArray 过滤数组内被禁用的工具项；若全部移除则删除该 tools 字段。
@@ -389,6 +474,25 @@ func payloadRequestedModel(opts cliproxyexecutor.Options, fallback string) strin
 		return trimmed
 	default:
 		return fallback
+	}
+}
+
+// payloadRequestPath 从 executor metadata 读取下游请求路径，用于区分 Images 专用入口。
+func payloadRequestPath(opts cliproxyexecutor.Options) string {
+	if len(opts.Metadata) == 0 {
+		return ""
+	}
+	raw, ok := opts.Metadata[cliproxyexecutor.RequestPathMetadataKey]
+	if !ok || raw == nil {
+		return ""
+	}
+	switch v := raw.(type) {
+	case string:
+		return strings.TrimSpace(v)
+	case []byte:
+		return strings.TrimSpace(string(v))
+	default:
+		return ""
 	}
 }
 

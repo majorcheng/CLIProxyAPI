@@ -2,6 +2,7 @@ package amp
 
 import (
 	"bytes"
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httputil"
@@ -9,6 +10,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	internalconfig "github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	log "github.com/sirupsen/logrus"
@@ -83,6 +85,7 @@ type FallbackHandler struct {
 	modelMapper        ModelMapper
 	forceModelMappings func() bool
 	disableImages      func() bool
+	disableImageMode   func() internalconfig.DisableImageGenerationMode
 }
 
 // NewFallbackHandler creates a new fallback handler wrapper
@@ -116,12 +119,18 @@ func (fh *FallbackHandler) SetDisableImageGeneration(disabled func() bool) {
 	fh.disableImages = disabled
 }
 
+// SetDisableImageGenerationMode 绑定图片禁用三态配置，保证 fallback 代理语义与本地 executor 一致。
+func (fh *FallbackHandler) SetDisableImageGenerationMode(mode func() internalconfig.DisableImageGenerationMode) {
+	fh.disableImageMode = mode
+}
+
 // WrapHandler wraps a gin.HandlerFunc with fallback logic
 // If the model's provider is not configured in CLIProxyAPI, it forwards to ampcode.com
 func (fh *FallbackHandler) WrapHandler(handler gin.HandlerFunc) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		requestPath := c.Request.URL.Path
-		if fh.imageGenerationDisabled() && isAmpImagesRequestPath(requestPath) {
+		disableMode := fh.imageGenerationMode()
+		if disableMode == internalconfig.DisableImageGenerationAll && isAmpImagesRequestPath(requestPath) {
 			c.AbortWithStatus(http.StatusNotFound)
 			return
 		}
@@ -242,7 +251,9 @@ func (fh *FallbackHandler) WrapHandler(handler gin.HandlerFunc) gin.HandlerFunc 
 				logAmpRouting(RouteTypeAmpCredits, modelName, "", "", requestPath)
 
 				// Restore body again for the proxy
-				c.Request.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+				proxyBody := applyAmpImageGenerationFallbackPolicy(bodyBytes, requestPath, disableMode)
+				c.Request.Body = io.NopCloser(bytes.NewReader(proxyBody))
+				c.Request.ContentLength = int64(len(proxyBody))
 
 				// Forward to ampcode.com
 				proxy.ServeHTTP(c.Writer, c.Request)
@@ -292,15 +303,150 @@ func (fh *FallbackHandler) WrapHandler(handler gin.HandlerFunc) gin.HandlerFunc 
 	}
 }
 
-// imageGenerationDisabled 返回当前全局图片禁用状态，默认保持关闭以兼容旧构造方式。
-func (fh *FallbackHandler) imageGenerationDisabled() bool {
-	return fh != nil && fh.disableImages != nil && fh.disableImages()
+// imageGenerationMode 返回当前图片禁用模式，兼容旧 bool 回调构造方式。
+func (fh *FallbackHandler) imageGenerationMode() internalconfig.DisableImageGenerationMode {
+	if fh == nil {
+		return internalconfig.DisableImageGenerationOff
+	}
+	if fh.disableImageMode != nil {
+		return fh.disableImageMode()
+	}
+	if fh.disableImages != nil && fh.disableImages() {
+		return internalconfig.DisableImageGenerationAll
+	}
+	return internalconfig.DisableImageGenerationOff
 }
 
 // isAmpImagesRequestPath 识别 AMP provider alias 下的 OpenAI Images 入口。
 func isAmpImagesRequestPath(path string) bool {
 	path = strings.TrimSpace(path)
 	return strings.HasSuffix(path, "/images/generations") || strings.HasSuffix(path, "/images/edits")
+}
+
+// applyAmpImageGenerationFallbackPolicy 在 upstream fallback 前执行图片禁用策略，避免绕过本地 executor。
+func applyAmpImageGenerationFallbackPolicy(body []byte, path string, mode internalconfig.DisableImageGenerationMode) []byte {
+	switch mode {
+	case internalconfig.DisableImageGenerationAll:
+		return removeAmpImageGenerationTools(body)
+	case internalconfig.DisableImageGenerationChat:
+		if isAmpImagesRequestPath(path) {
+			return body
+		}
+		return removeAmpImageGenerationTools(body)
+	default:
+		return body
+	}
+}
+
+// removeAmpImageGenerationTools 清理 OpenAI 兼容请求中的 image_generation 工具与 tool_choice。
+func removeAmpImageGenerationTools(body []byte) []byte {
+	out := removeAmpImageGenerationToolsArray(body, "tools")
+	out = removeAmpImageGenerationToolsArray(out, "tool_choice.tools")
+	out = removeAmpEmptyAllowedToolsChoice(out)
+	return removeAmpImageGenerationToolChoice(out)
+}
+
+// removeAmpImageGenerationToolsArray 删除指定 tools 数组里的 image_generation 条目。
+func removeAmpImageGenerationToolsArray(body []byte, path string) []byte {
+	tools := gjson.GetBytes(body, path)
+	if !tools.IsArray() {
+		return body
+	}
+	rawItems := make([]string, 0, len(tools.Array()))
+	removed := false
+	for _, tool := range tools.Array() {
+		if strings.TrimSpace(tool.Get("type").String()) == "image_generation" {
+			removed = true
+			continue
+		}
+		rawItems = append(rawItems, ampJSONRaw(tool))
+	}
+	if !removed {
+		return body
+	}
+	if len(rawItems) == 0 {
+		updated, errDel := sjson.DeleteBytes(body, path)
+		if errDel == nil {
+			return updated
+		}
+		return body
+	}
+	updated, errSet := sjson.SetRawBytes(body, path, []byte("["+strings.Join(rawItems, ",")+"]"))
+	if errSet != nil {
+		return body
+	}
+	return updated
+}
+
+// removeAmpEmptyAllowedToolsChoice 删除已被清空的 allowed_tools 限制对象，避免上游收到无效请求形状。
+func removeAmpEmptyAllowedToolsChoice(body []byte) []byte {
+	choice := gjson.GetBytes(body, "tool_choice")
+	if !choice.IsObject() || strings.TrimSpace(choice.Get("type").String()) != "allowed_tools" {
+		return body
+	}
+	tools := choice.Get("tools")
+	if tools.IsArray() && len(tools.Array()) > 0 {
+		return body
+	}
+	updated, errDel := sjson.DeleteBytes(body, "tool_choice")
+	if errDel != nil {
+		return body
+	}
+	return updated
+}
+
+// removeAmpImageGenerationToolChoice 删除直接要求使用 image_generation 的 tool_choice。
+func removeAmpImageGenerationToolChoice(body []byte) []byte {
+	choice := gjson.GetBytes(body, "tool_choice")
+	if !choice.Exists() {
+		return body
+	}
+	if choice.Type == gjson.String {
+		return deleteAmpImageGenerationStringChoice(body, choice)
+	}
+	if !choice.IsObject() {
+		return body
+	}
+	return deleteAmpImageGenerationObjectChoice(body, choice)
+}
+
+// deleteAmpImageGenerationStringChoice 处理字符串形式的 tool_choice。
+func deleteAmpImageGenerationStringChoice(body []byte, choice gjson.Result) []byte {
+	if !strings.EqualFold(strings.TrimSpace(choice.String()), "image_generation") {
+		return body
+	}
+	updated, errDel := sjson.DeleteBytes(body, "tool_choice")
+	if errDel != nil {
+		return body
+	}
+	return updated
+}
+
+// deleteAmpImageGenerationObjectChoice 处理对象形式的 tool_choice。
+func deleteAmpImageGenerationObjectChoice(body []byte, choice gjson.Result) []byte {
+	choiceType := strings.TrimSpace(choice.Get("type").String())
+	name := strings.TrimSpace(choice.Get("name").String())
+	matchesTool := strings.EqualFold(choiceType, "tool") && strings.EqualFold(name, "image_generation")
+	if !strings.EqualFold(choiceType, "image_generation") && !matchesTool {
+		return body
+	}
+	updated, errDel := sjson.DeleteBytes(body, "tool_choice")
+	if errDel != nil {
+		return body
+	}
+	return updated
+}
+
+// ampJSONRaw 返回 gjson 节点原始 JSON，用于重建 tools 数组时保持原字段不变。
+func ampJSONRaw(result gjson.Result) string {
+	if result.Raw != "" {
+		return result.Raw
+	}
+	raw, err := json.Marshal(result.Value())
+	if err != nil {
+		return "null"
+	}
+	return string(raw)
 }
 
 // filterAntropicBetaHeader filters Anthropic-Beta header to remove features requiring special subscription

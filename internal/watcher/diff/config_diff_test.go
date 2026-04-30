@@ -279,7 +279,7 @@ func TestBuildConfigChangeDetails_FlagsAndKeys(t *testing.T) {
 			ProxyURL:                   "http://old-proxy",
 			APIKeys:                    []string{"key-1"},
 			ForceModelPrefix:           false,
-			DisableImageGeneration:     false,
+			DisableImageGeneration:     sdkconfig.DisableImageGenerationOff,
 			NonStreamKeepAliveInterval: 0,
 		},
 	}
@@ -321,7 +321,7 @@ func TestBuildConfigChangeDetails_FlagsAndKeys(t *testing.T) {
 			ProxyURL:                   "http://new-proxy",
 			APIKeys:                    []string{"key-1", "key-2"},
 			ForceModelPrefix:           true,
-			DisableImageGeneration:     true,
+			DisableImageGeneration:     sdkconfig.DisableImageGenerationAll,
 			NonStreamKeepAliveInterval: 5,
 		},
 	}
@@ -400,7 +400,7 @@ func TestBuildConfigChangeDetails_AllBranches(t *testing.T) {
 			RequestLog:             false,
 			ProxyURL:               "http://old-proxy",
 			APIKeys:                []string{"keyA"},
-			DisableImageGeneration: false,
+			DisableImageGeneration: config.DisableImageGenerationOff,
 		},
 		OAuthExcludedModels: map[string][]string{"p1": {"a"}},
 		OpenAICompatibility: []config.OpenAICompatibility{
@@ -455,7 +455,7 @@ func TestBuildConfigChangeDetails_AllBranches(t *testing.T) {
 			RequestLog:             true,
 			ProxyURL:               "http://new-proxy",
 			APIKeys:                []string{"keyB"},
-			DisableImageGeneration: true,
+			DisableImageGeneration: sdkconfig.DisableImageGenerationAll,
 		},
 		OAuthExcludedModels: map[string][]string{"p1": {"b", "c"}, "p2": {"d"}},
 		OpenAICompatibility: []config.OpenAICompatibility{

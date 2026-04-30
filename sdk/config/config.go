@@ -22,6 +22,7 @@ type PayloadConfig = internalconfig.PayloadConfig
 type PayloadRule = internalconfig.PayloadRule
 type PayloadFilterRule = internalconfig.PayloadFilterRule
 type PayloadModelRule = internalconfig.PayloadModelRule
+type DisableImageGenerationMode = internalconfig.DisableImageGenerationMode
 
 type GeminiKey = internalconfig.GeminiKey
 type CodexKey = internalconfig.CodexKey
@@ -36,6 +37,12 @@ type TLS = internalconfig.TLSConfig
 
 const (
 	DefaultPanelGitHubRepository = internalconfig.DefaultPanelGitHubRepository
+	// DisableImageGenerationOff 表示允许所有图片生成能力。
+	DisableImageGenerationOff = internalconfig.DisableImageGenerationOff
+	// DisableImageGenerationAll 表示全局禁用图片生成能力。
+	DisableImageGenerationAll = internalconfig.DisableImageGenerationAll
+	// DisableImageGenerationChat 表示仅在非 Images 入口禁用图片生成能力。
+	DisableImageGenerationChat = internalconfig.DisableImageGenerationChat
 )
 
 func LoadConfig(configFile string) (*Config, error) { return internalconfig.LoadConfig(configFile) }

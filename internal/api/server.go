@@ -957,7 +957,7 @@ func (s *Server) UpdateClients(cfg *config.Config) {
 	}
 
 	if oldCfg != nil && oldCfg.DisableImageGeneration != cfg.DisableImageGeneration {
-		log.Infof("disable-image-generation updated: %t -> %t", oldCfg.DisableImageGeneration, cfg.DisableImageGeneration)
+		log.Infof("disable-image-generation updated: %s -> %s", oldCfg.DisableImageGeneration, cfg.DisableImageGeneration)
 	}
 
 	if s.handlers != nil && s.handlers.AuthManager != nil {

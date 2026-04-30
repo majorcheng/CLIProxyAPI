@@ -212,15 +212,23 @@ func requestExecutionMetadata(ctx context.Context) map[string]any {
 	// Idempotency-Key 是可选的客户端重试关联键。
 	// 缺失时不再伪造 UUID，避免把“无幂等键请求”误写成伪 idempotency metadata。
 	key := ""
+	requestPath := ""
 	if ctx != nil {
 		if ginCtx, ok := ctx.Value("gin").(*gin.Context); ok && ginCtx != nil && ginCtx.Request != nil {
 			key = strings.TrimSpace(ginCtx.GetHeader("Idempotency-Key"))
+			requestPath = strings.TrimSpace(ginCtx.FullPath())
+			if requestPath == "" && ginCtx.Request.URL != nil {
+				requestPath = strings.TrimSpace(ginCtx.Request.URL.Path)
+			}
 		}
 	}
 
 	meta := make(map[string]any)
 	if key != "" {
 		meta[idempotencyKeyMetadataKey] = key
+	}
+	if requestPath != "" {
+		meta[coreexecutor.RequestPathMetadataKey] = requestPath
 	}
 	if pinnedAuthID := pinnedAuthIDFromContext(ctx); pinnedAuthID != "" {
 		meta[coreexecutor.PinnedAuthMetadataKey] = pinnedAuthID

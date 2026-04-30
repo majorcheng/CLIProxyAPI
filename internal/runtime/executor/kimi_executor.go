@@ -101,7 +101,7 @@ func (e *KimiExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req
 	}
 
 	requestedModel := payloadRequestedModel(opts, req.Model)
-	body = applyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", body, originalTranslated, requestedModel)
+	body = applyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", body, originalTranslated, requestedModel, payloadRequestPath(opts))
 	body, err = normalizeKimiToolMessageLinks(body)
 	if err != nil {
 		return resp, err
@@ -205,7 +205,7 @@ func (e *KimiExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 		return nil, fmt.Errorf("kimi executor: failed to set stream_options in payload: %w", err)
 	}
 	requestedModel := payloadRequestedModel(opts, req.Model)
-	body = applyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", body, originalTranslated, requestedModel)
+	body = applyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", body, originalTranslated, requestedModel, payloadRequestPath(opts))
 	body, err = normalizeKimiToolMessageLinks(body)
 	if err != nil {
 		return nil, err

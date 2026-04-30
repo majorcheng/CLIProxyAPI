@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/gin-gonic/gin"
+	internalconfig "github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/api/handlers"
 	"github.com/tidwall/gjson"
@@ -77,7 +78,7 @@ func (h *OpenAIAPIHandler) rejectDisabledImageGeneration(c *gin.Context) bool {
 	if h == nil || h.BaseAPIHandler == nil || h.BaseAPIHandler.Cfg == nil {
 		return false
 	}
-	if !h.BaseAPIHandler.Cfg.DisableImageGeneration {
+	if h.BaseAPIHandler.Cfg.DisableImageGeneration != internalconfig.DisableImageGenerationAll {
 		return false
 	}
 	c.AbortWithStatus(http.StatusNotFound)

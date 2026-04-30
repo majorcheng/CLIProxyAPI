@@ -9,9 +9,9 @@ type SDKConfig struct {
 	// ProxyURL is the URL of an optional proxy server to use for outbound requests.
 	ProxyURL string `yaml:"proxy-url" json:"proxy-url"`
 
-	// DisableImageGeneration 为 true 时，全局禁用内建 image_generation 图片生成能力。
-	// 启用后 `/v1/images/*` 会返回 404，并会从请求 tools 数组中移除 image_generation。
-	DisableImageGeneration bool `yaml:"disable-image-generation" json:"disable-image-generation"`
+	// DisableImageGeneration 控制内建 image_generation 图片生成能力。
+	// false 保持默认行为；true 全局禁用并让图片入口返回 404；chat 仅禁用非 Images 入口。
+	DisableImageGeneration DisableImageGenerationMode `yaml:"disable-image-generation" json:"disable-image-generation"`
 
 	// EnableGeminiCLIEndpoint 控制 Gemini CLI 内部端点（/v1internal:*）是否可用。
 	// 默认 false，避免未预期地暴露仅供本机 CLI 使用的内部入口。

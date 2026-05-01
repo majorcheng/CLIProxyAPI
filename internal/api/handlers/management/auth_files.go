@@ -969,7 +969,7 @@ func (h *Handler) DeleteAuthFile(c *gin.Context) {
 				return
 			}
 			deleted++
-			h.disableAuth(ctx, full)
+			h.disableAuthsForDeletedPath(ctx, full, "")
 		}
 		c.JSON(200, gin.H{"status": "ok", "deleted": deleted})
 		return
@@ -1209,17 +1209,16 @@ func (h *Handler) deleteAuthFileByName(ctx context.Context, name string) (string
 	if errDeleteRecord := h.deleteTokenRecord(ctx, targetPath); errDeleteRecord != nil {
 		return filepath.Base(name), alreadyMissing, http.StatusInternalServerError, errDeleteRecord
 	}
-	if targetID != "" {
-		h.disableAuth(ctx, targetID)
-	} else {
-		h.disableAuth(ctx, targetPath)
-	}
+	h.disableAuthsForDeletedPath(ctx, targetPath, targetID)
 	return filepath.Base(name), alreadyMissing, http.StatusOK, nil
 }
 
 func (h *Handler) findAuthForDelete(name string) *coreauth.Auth {
+	if h == nil {
+		return nil
+	}
 	manager := h.currentAuthManager()
-	if h == nil || manager == nil {
+	if manager == nil {
 		return nil
 	}
 	name = strings.TrimSpace(name)
@@ -1538,8 +1537,11 @@ func (h *Handler) PatchAuthFileFields(c *gin.Context) {
 }
 
 func (h *Handler) disableAuth(ctx context.Context, id string) {
+	if h == nil {
+		return
+	}
 	manager := h.currentAuthManager()
-	if h == nil || manager == nil {
+	if manager == nil {
 		return
 	}
 	id = strings.TrimSpace(id)
@@ -1552,6 +1554,7 @@ func (h *Handler) disableAuth(ctx context.Context, id string) {
 		auth.StatusMessage = "removed via management API"
 		auth.UpdatedAt = time.Now()
 		_, _ = manager.Update(ctx, auth)
+		registry.GetGlobalRegistry().UnregisterClient(auth.ID)
 		return
 	}
 	authID := h.authIDForPath(id)
@@ -1564,6 +1567,7 @@ func (h *Handler) disableAuth(ctx context.Context, id string) {
 		auth.StatusMessage = "removed via management API"
 		auth.UpdatedAt = time.Now()
 		_, _ = manager.Update(ctx, auth)
+		registry.GetGlobalRegistry().UnregisterClient(auth.ID)
 	}
 }
 

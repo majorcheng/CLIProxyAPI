@@ -152,3 +152,95 @@
 - `fallback_handlers.go::WrapHandler` 在 AMP provider alias 图片路径上先检查全局禁用开关，命中时直接返回 404，不进入 wrapped handler 或 proxy。
 - `routes.go::registerProviderAliases` 将 `BaseAPIHandler.Cfg.DisableImageGeneration` 绑定给 fallback handler，支持热更新后的配置读取。
 - 新增 payload helper、fallback handler 和 provider alias 回归测试。
+
+## 2026-05-01 fill-first 删除后仍命中候选确认
+
+### Observations
+
+- 用户反馈：401 已经被删除的 token 没有从 fill-first 候选列表里移除，后续仍可能被请求并失败。
+- 当前 HEAD 已拉到 `origin/main` 最新，`git pull --ff-only` 返回 `Already up to date.`。
+- `sdk/cliproxy/auth/fill_first_selection.go::scanFillFirstCandidates` 本身只扫描传入 auth 切片；是否还会选到已删 token，取决于上游 manager/scheduler 是否同步禁用或移除对应 auth。
+- `sdk/cliproxy/service.go::deleteAuthMaintenanceCandidate` 的 401 自动维护删除路径会对 candidate 内所有 ID 发 delete update；既有测试覆盖“后台维护删除后不再请求坏 token”。
+- 管理端 `internal/api/handlers/management/auth_files.go::deleteAuthFileByName` 先用 `findAuthForDelete` 找单个 auth，再调用 `disableAuth` 禁用单个 ID；如果同一 token 文件派生多个 auth ID，兄弟 ID 会继续保持 active。
+
+### Hypotheses
+
+#### H1：401 自动维护删除没有刷新 scheduler，导致 fill-first 继续选到已删除 auth
+- Supports：用户现象直接指向 fill-first 候选未删。
+- Conflicts：`applyCoreAuthRemovalWithReason -> coreManager.Update -> scheduler.upsertAuth(disabled)` 会触发 `removeAuthLocked`；既有后台维护压力测试也覆盖删除后不再请求坏 auth。
+- Test：跑现有 scheduler/maintenance 删除测试，并写临时 fill-first 诊断测试验证 401 维护删除后的下一次请求。
+
+#### H2：管理端/单文件删除只禁用一个 auth ID，同源兄弟 ID 留在 fill-first 候选里（ROOT）
+- Supports：`findAuthForDelete` 只返回一个 auth；`disableAuth` 只禁用一个 ID；同一 Codex token 文件可派生 primary/project 等多个 auth ID。
+- Conflicts：维护删除路径有 `authMaintenanceIDsForPath`，不走这个单 ID 删除边界。
+- Test：临时构造两个 auth 共用一个 token 文件，管理端删除该文件后立刻执行 fill-first 请求，观察剩余兄弟 ID 是否仍被调用。
+
+#### H3：session affinity 缓存绑定了已删 auth，绕过 fill-first 正常候选过滤
+- Supports：sticky 包装层有独立缓存。
+- Conflicts：`collectAffinityCandidates` 会过滤 disabled 和 registry 不支持模型的 auth；401/429 shared block 也会触发 affinity invalidation。
+- Test：静态核对 `collectAffinityCandidates` 与 `SessionAffinitySelector.pickBoundAuth` 的可用性过滤。
+
+### Experiments
+
+#### E1：跑现有删除与 scheduler 定向测试
+- Change：无生产代码变更。
+- Command：`timeout 180s go test ./sdk/cliproxy/auth ./sdk/cliproxy -run 'TestManager_SchedulerTracksRegisterAndUpdate|TestDeleteAuthMaintenanceCandidate_RemovesFileAndDisablesAllAuths|TestAuthMaintenanceBackgroundQueue_MixedLoadGraduallyRemoves401And429' -count=1`
+- Result：Confirmed pass。`sdk/cliproxy/auth` 与 `sdk/cliproxy` 均通过，说明现有覆盖下“disabled/update 后 scheduler 移除”和“维护后台删除后不再请求坏 auth”成立。
+
+#### E2：临时验证 fill-first + 401 维护删除主链
+- Change：临时新增 `sdk/cliproxy/service_auth_maintenance_fill_first_diag_test.go`，跑完自动删除。
+- Expected：首轮 fill-first 命中 `bad-old` 401 后可切到 `good-new`，后续请求不再调用 `bad-old`。
+- Result：Confirmed pass。最终调用计数保持 `bad-old=1`，后续只增加 `good-new`。
+
+#### E3：临时验证管理端删除同源多 auth 文件
+- Change：临时新增 `internal/api/handlers/management/auth_files_delete_fillfirst_diag_test.go`，跑完自动删除。
+- Expected：如果管理端只禁用一个 ID，则删除文件后仍会有一个同源兄弟 auth active，并被 fill-first 选中。
+- Result：Confirmed。诊断测试通过：删除同一个 `shared-token.json` 后，两个同源 auth 中只剩一个被禁用，另一个仍 active；随后 fill-first 请求命中了这个剩余 active 兄弟 ID。
+
+### Root Cause
+
+- 当前确认的根因不是 `scanFillFirstCandidates` 自身漏删，而是管理端/单文件删除路径只按 `findAuthForDelete` 命中的单个 auth ID 调用 `disableAuth`；当同一 token 文件派生多个 auth ID 时，兄弟 ID 没有同步禁用、没有从 scheduler/fill-first 候选中移除。
+
+### Fix Direction
+
+- 修复入口应收口在管理端删除路径：按实际 backing path 找出同源所有 auth ID，并统一禁用、注销 registry、刷新 scheduler，而不是只禁用 `FindByFileName` 返回的第一个 auth。
+- 自动维护删除路径已有 `authMaintenanceIDsForPath` 这类按 path 聚合的逻辑，可复用或抽出共享 helper，避免管理端和维护端删除语义分叉。
+
+### Fix Implemented
+
+- `internal/api/handlers/management/auth_files.go::deleteAuthFileByName` 不再只禁用 `findAuthForDelete(...)` 返回的单个 ID，而是调用 `disableAuthsForDeletedPath(...)` 按实际 backing path 禁用同源 auth。
+- 新增 `internal/api/handlers/management/auth_files_delete_scope.go`，集中实现 path 归一化、同源 auth ID 枚举和去重禁用。
+- `disableAuth(...)` 在管理端删除语义下同步 `registry.GetGlobalRegistry().UnregisterClient(auth.ID)`，避免已删除 token 继续留在模型 registry 候选面。
+- 新增 `internal/api/handlers/management/auth_files_delete_fill_first_test.go::TestDeleteAuthFile_DisablesAllAuthsForSharedBackingPath`，覆盖同一 token 文件派生多个 auth ID 时，删除后 fill-first 只能命中健康 token，不能再请求已删 token 的兄弟 auth。
+- 验证命令：
+  - `timeout 180s go test ./internal/api/handlers/management -count=1`
+  - `timeout 180s go test ./sdk/cliproxy/auth ./sdk/cliproxy -run 'TestManager_SchedulerTracksRegisterAndUpdate|TestDeleteAuthMaintenanceCandidate_RemovesFileAndDisablesAllAuths|TestAuthMaintenanceBackgroundQueue_MixedLoadGraduallyRemoves401And429' -count=1`
+
+### Review Follow-up: management 删除同源 auth 的剩余闭环
+
+#### Observations
+- `DELETE /v0/management/auth-files?name=...` 已改为 `disableAuthsForDeletedPath(...)`，但 `all=true` 分支仍在逐文件归档后调用 `disableAuth(ctx, full)`，只能命中路径派生 ID，无法清理同一文件派生出的自定义兄弟 auth ID。
+- 新增的 `normalizeAuthDeletePath(...)` 只做 `Abs/Clean`，没有复用 `authIDForPath(...)` 的 Windows 小写归一化；大小写不敏感文件系统上同一路径可能因大小写差异被拆成两个分组。
+
+#### Hypotheses
+- H1: `all=true` 分支仍使用旧禁用入口导致批量删除漏禁同源 auth。Supports: 源码仍为 `disableAuth(ctx, full)`；Conflicts: 按名删除路径已经修复。Test: 构造 shared primary/project 后调用 `?all=true`，断言两个 shared auth 都 disabled 且 registry 清空。
+- H2: Windows 路径归一化缺少大小写折叠导致同源 auth 分组分裂。Supports: `authIDForPath` 已有 `runtime.GOOS == "windows"` 小写逻辑，新增 helper 没有；Conflicts: Linux 本机大小写敏感，无法直接复现真实 Windows FS。Test: 把大小写折叠抽成可测 helper，用 Windows 风格路径验证大小写差异归一到同一个 key。
+- H3: registry 残留而非 manager disabled 是唯一问题。Supports: registry 会影响模型候选可见性；Conflicts: `all=true` 下 manager 本身也不会禁用自定义兄弟 auth。Test: 同时断言 manager disabled 和 registry cleared。
+
+#### Root Cause
+批量删除和路径归一化没有复用按名删除的新语义：`all=true` 仍只禁用单个路径 ID，且删除路径匹配 key 未按大小写不敏感平台折叠。
+
+#### Fix Plan
+- `all=true` 分支改为调用 `disableAuthsForDeletedPath(ctx, full, "")`。
+- 删除路径归一化补上与 `authIDForPath` 一致的平台折叠，并拆成可测的 path key helper。
+- 增加 `all=true` 同源 auth 回归测试和 Windows 风格路径大小写归一化测试。
+
+#### Experiments
+- 新增 `TestDeleteAuthFileAll_DisablesAllAuthsForSharedBackingPath`：批量删除 shared/good token 后，断言 shared primary/project/good 全部 disabled、registry 清空，且后续 fill-first 不会调用任何已删除 auth。
+- 新增 `TestNormalizeAuthDeletePathForCase_CaseInsensitiveKey`：大小写不敏感 key 下，同一路径的大小写差异归一到同一个删除匹配 key。
+
+#### Fix Implemented
+- `DeleteAuthFile` 的 `all=true` 分支从 `disableAuth(ctx, full)` 改为 `disableAuthsForDeletedPath(ctx, full, "")`，与按名删除复用同源 auth 禁用语义。
+- `normalizeAuthDeletePath(...)` 改为通过 `normalizeAuthDeletePathForCase(...)` 生成匹配 key，并在 Windows 平台按现有 `authIDForPath(...)` 语义折叠为小写。
+- 验证通过：`timeout 180s go test ./internal/api/handlers/management -count=1`、`timeout 180s go test ./sdk/cliproxy/auth ./sdk/cliproxy -run 'TestManager_SchedulerTracksRegisterAndUpdate|TestDeleteAuthMaintenanceCandidate_RemovesFileAndDisablesAllAuths|TestAuthMaintenanceBackgroundQueue_MixedLoadGraduallyRemoves401And429' -count=1`、`git diff --check`。
+- 复核补充：相对路径且无配置快照时也通过 `foldAuthDeletePathCase(...)` 折叠大小写，避免早返回绕过大小写不敏感 key 规则。

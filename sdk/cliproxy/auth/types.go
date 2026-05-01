@@ -180,7 +180,7 @@ func recentRequestBucketIndex(bucketID int64) int {
 // formatRecentRequestBucketLabel 生成管理端直接展示的本地时间区间标签。
 func formatRecentRequestBucketLabel(bucketID int64) string {
 	start := time.Unix(bucketID*recentRequestBucketSeconds, 0).In(time.Local)
-	end := start.Add(10 * time.Minute)
+	end := start.Add(time.Duration(recentRequestBucketSeconds) * time.Second)
 	return start.Format("15:04") + "-" + end.Format("15:04")
 }
 

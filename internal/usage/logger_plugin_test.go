@@ -37,6 +37,64 @@ func TestRequestStatisticsRecordIncludesLatency(t *testing.T) {
 	}
 }
 
+func TestRequestStatisticsRecordUsesStableMetadataAfterGinMutation(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	stats := NewRequestStatistics()
+	recorder := httptest.NewRecorder()
+	ginCtx, _ := gin.CreateTestContext(recorder)
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	req.RemoteAddr = "203.0.113.10:54321"
+	req.Header.Set("User-Agent", "codex-cli/0.1")
+	ginCtx.Request = req
+	requestedAt := time.Date(2026, 3, 20, 12, 0, 0, 0, time.UTC)
+	SetRequestType(ginCtx, RequestTypeStream)
+	SetReasoningEffort(ginCtx, "xhigh")
+	SetAPIResponseTimestamp(ginCtx, requestedAt.Add(120*time.Millisecond))
+
+	ctx := logging.WithEndpoint(context.Background(), "POST /v1/chat/completions")
+	ctx = logging.WithResponseStatusHolder(ctx)
+	ctx = WithRequestMetadataFromGin(ctx, ginCtx)
+	ctx = context.WithValue(ctx, "gin", ginCtx)
+	logging.SetResponseStatus(ctx, http.StatusInternalServerError)
+
+	ginCtx.Request = httptest.NewRequest(http.MethodGet, "/mutated", nil)
+	ginCtx.Status(http.StatusOK)
+	ginCtx.Set(RequestTypeContextKey, RequestTypeSync)
+	ginCtx.Set(RequestReasoningEffortContextKey, "low")
+	ginCtx.Set(APIResponseTimestampContextKey, requestedAt.Add(900*time.Millisecond))
+
+	stats.Record(ctx, coreusage.Record{
+		Model:       "gpt-5.4",
+		RequestedAt: requestedAt,
+		Detail:      coreusage.Detail{TotalTokens: 30},
+	})
+
+	details := stats.Snapshot().APIs["POST /v1/chat/completions"].Models["gpt-5.4"].Details
+	if len(details) != 1 {
+		t.Fatalf("details len = %d, want 1", len(details))
+	}
+	detail := details[0]
+	if !detail.Failed {
+		t.Fatalf("failed = false, want true from stable response status")
+	}
+	if detail.ClientIP != "203.0.113.10" {
+		t.Fatalf("client_ip = %q, want stable original IP", detail.ClientIP)
+	}
+	if detail.UserAgent != "codex-cli/0.1" {
+		t.Fatalf("user_agent = %q, want stable original UA", detail.UserAgent)
+	}
+	if detail.RequestType != RequestTypeStream {
+		t.Fatalf("request_type = %q, want %q", detail.RequestType, RequestTypeStream)
+	}
+	if detail.FirstTokenMs != 120 {
+		t.Fatalf("first_token_ms = %d, want 120", detail.FirstTokenMs)
+	}
+	if detail.ReasoningEffort != "xhigh" {
+		t.Fatalf("reasoning_effort = %q, want xhigh", detail.ReasoningEffort)
+	}
+}
+
 func TestRequestStatisticsRecordIncludesClientIP(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 

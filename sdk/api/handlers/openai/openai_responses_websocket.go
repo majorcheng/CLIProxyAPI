@@ -16,6 +16,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
+	internalusage "github.com/router-for-me/CLIProxyAPI/v6/internal/usage"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/api/handlers"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
@@ -1048,8 +1049,5 @@ func markAPIResponseTimestamp(c *gin.Context) {
 	if c == nil {
 		return
 	}
-	if _, exists := c.Get("API_RESPONSE_TIMESTAMP"); exists {
-		return
-	}
-	c.Set("API_RESPONSE_TIMESTAMP", time.Now())
+	internalusage.SetAPIResponseTimestamp(c, time.Now())
 }

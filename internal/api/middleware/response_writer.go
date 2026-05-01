@@ -200,7 +200,7 @@ func (w *ResponseWriterWrapper) markStreamRequestType() {
 			return
 		}
 	}
-	w.ginCtx.Set(internalusage.RequestTypeContextKey, internalusage.RequestTypeStream)
+	internalusage.SetRequestType(w.ginCtx, internalusage.RequestTypeStream)
 }
 
 // ensureHeadersCaptured is a helper function to make sure response headers are captured.
@@ -373,7 +373,7 @@ func (w *ResponseWriterWrapper) extractAPIResponse(c *gin.Context) []byte {
 }
 
 func (w *ResponseWriterWrapper) extractAPIResponseTimestamp(c *gin.Context) time.Time {
-	ts, isExist := c.Get("API_RESPONSE_TIMESTAMP")
+	ts, isExist := c.Get(internalusage.APIResponseTimestampContextKey)
 	if !isExist {
 		return time.Time{}
 	}

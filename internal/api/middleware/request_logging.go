@@ -50,7 +50,7 @@ func RequestLoggingMiddleware(logger logging.RequestLogger) gin.HandlerFunc {
 			c.Next()
 			return
 		}
-		c.Set(internalusage.RequestTypeContextKey, internalusage.ClassifyRequestType(c.Request, requestInfo.Body, nil))
+		internalusage.SetRequestType(c, internalusage.ClassifyRequestType(c.Request, requestInfo.Body, nil))
 
 		// Create response writer wrapper
 		wrapper := NewResponseWriterWrapper(c.Writer, logger, requestInfo, c)

@@ -100,7 +100,30 @@ type Auth struct {
 	// HasLastRequestSimHash reports whether LastRequestSimHash is initialized.
 	HasLastRequestSimHash bool `json:"-"`
 
-	indexAssigned bool `json:"-"`
+	recentRequests recentRequestRing `json:"-"`
+	indexAssigned  bool              `json:"-"`
+}
+
+const (
+	recentRequestBucketSeconds int64 = 10 * 60
+	recentRequestBucketCount         = 20
+)
+
+type recentRequestBucket struct {
+	bucketID int64
+	success  int64
+	failed   int64
+}
+
+type recentRequestRing struct {
+	buckets [recentRequestBucketCount]recentRequestBucket
+}
+
+// RecentRequestBucket 是管理端展示用的最近请求时间桶。
+type RecentRequestBucket struct {
+	Time    string `json:"time"`
+	Success int64  `json:"success"`
+	Failed  int64  `json:"failed"`
 }
 
 // QuotaState contains limiter tracking data for a credential.
@@ -135,6 +158,71 @@ type ModelState struct {
 	Quota QuotaState `json:"quota"`
 	// UpdatedAt tracks the last update timestamp for this model state.
 	UpdatedAt time.Time `json:"updated_at"`
+}
+
+// recentRequestBucketID 将时间归并到 10 分钟粒度，保证前后端桶宽一致。
+func recentRequestBucketID(now time.Time) int64 {
+	if now.IsZero() {
+		return 0
+	}
+	return now.Unix() / recentRequestBucketSeconds
+}
+
+// recentRequestBucketIndex 把逻辑桶号映射到固定大小环形数组下标。
+func recentRequestBucketIndex(bucketID int64) int {
+	mod := bucketID % int64(recentRequestBucketCount)
+	if mod < 0 {
+		mod += int64(recentRequestBucketCount)
+	}
+	return int(mod)
+}
+
+// formatRecentRequestBucketLabel 生成管理端直接展示的本地时间区间标签。
+func formatRecentRequestBucketLabel(bucketID int64) string {
+	start := time.Unix(bucketID*recentRequestBucketSeconds, 0).In(time.Local)
+	end := start.Add(10 * time.Minute)
+	return start.Format("15:04") + "-" + end.Format("15:04")
+}
+
+// recordRecentRequest 在 MarkResult 的锁内记录一次成功或失败请求。
+func (a *Auth) recordRecentRequest(now time.Time, success bool) {
+	if a == nil {
+		return
+	}
+	bucketID := recentRequestBucketID(now)
+	idx := recentRequestBucketIndex(bucketID)
+	bucket := &a.recentRequests.buckets[idx]
+	if bucket.bucketID != bucketID {
+		bucket.bucketID = bucketID
+		bucket.success = 0
+		bucket.failed = 0
+	}
+	if success {
+		bucket.success++
+		return
+	}
+	bucket.failed++
+}
+
+// RecentRequestsSnapshot 返回最近 20 个 10 分钟桶，供管理端直接渲染趋势。
+func (a *Auth) RecentRequestsSnapshot(now time.Time) []RecentRequestBucket {
+	out := make([]RecentRequestBucket, 0, recentRequestBucketCount)
+	if a == nil {
+		return out
+	}
+	currentBucketID := recentRequestBucketID(now)
+	for i := recentRequestBucketCount - 1; i >= 0; i-- {
+		bucketID := currentBucketID - int64(i)
+		idx := recentRequestBucketIndex(bucketID)
+		bucket := a.recentRequests.buckets[idx]
+		entry := RecentRequestBucket{Time: formatRecentRequestBucketLabel(bucketID)}
+		if bucket.bucketID == bucketID {
+			entry.Success = bucket.success
+			entry.Failed = bucket.failed
+		}
+		out = append(out, entry)
+	}
+	return out
 }
 
 // Clone shallow copies the Auth structure, duplicating maps to avoid accidental mutation.

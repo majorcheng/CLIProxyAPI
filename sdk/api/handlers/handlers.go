@@ -18,6 +18,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
 	chatcompletions "github.com/router-for-me/CLIProxyAPI/v6/internal/translator/codex/openai/chat-completions"
+	internalusage "github.com/router-for-me/CLIProxyAPI/v6/internal/usage"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	sdkaccess "github.com/router-for-me/CLIProxyAPI/v6/sdk/access"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
@@ -542,6 +543,9 @@ func (h *BaseAPIHandler) GetContextWithCancel(handler interfaces.APIHandler, c *
 		}
 	}
 	baseCtx, cancel := context.WithCancel(parentCtx)
+	baseCtx = logging.WithEndpoint(baseCtx, requestEndpointFromGin(c))
+	baseCtx = logging.WithResponseStatusHolder(baseCtx)
+	baseCtx = internalusage.WithRequestMetadataFromGin(baseCtx, c)
 	if requestCtx != nil && requestCtx != parentCtx {
 		cancelCtx := baseCtx
 		go func() {
@@ -554,7 +558,11 @@ func (h *BaseAPIHandler) GetContextWithCancel(handler interfaces.APIHandler, c *
 	}
 	newCtx := context.WithValue(baseCtx, "gin", c)
 	newCtx = context.WithValue(newCtx, "handler", handler)
+	cancelCtx := baseCtx
 	return newCtx, func(params ...interface{}) {
+		if c != nil {
+			logging.SetResponseStatus(cancelCtx, c.Writer.Status())
+		}
 		if h.Cfg.RequestLog && len(params) == 1 {
 			if existing, exists := c.Get("API_RESPONSE"); exists {
 				if existingBytes, ok := existing.([]byte); ok && len(bytes.TrimSpace(existingBytes)) > 0 {
@@ -593,6 +601,25 @@ func (h *BaseAPIHandler) GetContextWithCancel(handler interfaces.APIHandler, c *
 
 		cancel()
 	}
+}
+
+// requestEndpointFromGin 固化请求入口，避免异步 usage 插件读取到 Gin 复用后的路由。
+func requestEndpointFromGin(c *gin.Context) string {
+	if c == nil || c.Request == nil {
+		return ""
+	}
+	path := strings.TrimSpace(c.FullPath())
+	if path == "" && c.Request.URL != nil {
+		path = strings.TrimSpace(c.Request.URL.Path)
+	}
+	if path == "" {
+		return ""
+	}
+	method := strings.TrimSpace(c.Request.Method)
+	if method == "" {
+		return path
+	}
+	return method + " " + path
 }
 
 // StartNonStreamingKeepAlive emits blank lines every 5 seconds while waiting for a non-streaming response.
@@ -672,10 +699,7 @@ func markAPIResponseTimestamp(c *gin.Context) {
 	if c == nil {
 		return
 	}
-	if _, exists := c.Get(apiResponseTimestampKey); exists {
-		return
-	}
-	c.Set(apiResponseTimestampKey, time.Now())
+	internalusage.SetAPIResponseTimestamp(c, time.Now())
 }
 
 // ExecuteWithAuthManager executes a non-streaming request via the core auth manager.

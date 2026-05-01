@@ -17,6 +17,7 @@ import (
 	"github.com/gin-gonic/gin"
 	. "github.com/router-for-me/CLIProxyAPI/v6/internal/constant"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/interfaces"
+	internalusage "github.com/router-for-me/CLIProxyAPI/v6/internal/usage"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/api/handlers"
 	log "github.com/sirupsen/logrus"
@@ -141,7 +142,7 @@ func (h *GeminiCLIAPIHandler) CLIHandler(c *gin.Context) {
 			log.Errorf("Failed to read response body: %v", err)
 			return
 		}
-		c.Set("API_RESPONSE_TIMESTAMP", time.Now())
+		internalusage.SetAPIResponseTimestamp(c, time.Now())
 		_, _ = c.Writer.Write(output)
 		c.Set("API_RESPONSE", output)
 	}

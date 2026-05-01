@@ -763,6 +763,9 @@ func dedupKey(apiName, modelName string, detail RequestDetail) string {
 }
 
 func resolveAPIIdentifier(ctx context.Context, record coreusage.Record) string {
+	if endpoint := strings.TrimSpace(logging.GetEndpoint(ctx)); endpoint != "" {
+		return endpoint
+	}
 	if ctx != nil {
 		if ginCtx, ok := ctx.Value("gin").(*gin.Context); ok && ginCtx != nil {
 			path := ginCtx.FullPath()
@@ -790,6 +793,9 @@ func resolveAPIIdentifier(ctx context.Context, record coreusage.Record) string {
 // resolveClientIP 与主 HTTP 日志共用同一套 IP 解析逻辑，
 // 确保 usage 统计里的 client_ip 与日志中展示的客户端 IP 一致。
 func resolveClientIP(ctx context.Context) string {
+	if clientIP := requestMetadataClientIP(ctx); clientIP != "" {
+		return clientIP
+	}
 	if ctx == nil {
 		return ""
 	}
@@ -801,23 +807,19 @@ func resolveClientIP(ctx context.Context) string {
 }
 
 func resolveSuccess(ctx context.Context) bool {
-	if ctx == nil {
-		return true
-	}
-	ginCtx, ok := ctx.Value("gin").(*gin.Context)
-	if !ok || ginCtx == nil {
-		return true
-	}
-	status := ginCtx.Writer.Status()
+	status := logging.GetResponseStatus(ctx)
 	if status == 0 {
-		return true
+		status = responseStatusFromGin(ctx)
 	}
-	return status < httpStatusBadRequest
+	return status == 0 || status < httpStatusBadRequest
 }
 
 const httpStatusBadRequest = 400
 
 func resolveReasoningEffort(ctx context.Context) string {
+	if effort := requestMetadataReasoningEffort(ctx); effort != "" {
+		return effort
+	}
 	if ctx == nil {
 		return ""
 	}
@@ -856,6 +858,9 @@ func ClassifyRequestType(req *http.Request, requestBody []byte, responseHeaders 
 }
 
 func resolveRequestType(ctx context.Context) string {
+	if requestType := requestMetadataRequestType(ctx); requestType != "" {
+		return requestType
+	}
 	if ctx == nil {
 		return ""
 	}
@@ -882,11 +887,14 @@ func resolveFirstTokenMs(ctx context.Context, requestedAt time.Time, requestType
 	if ctx == nil || requestedAt.IsZero() {
 		return 0
 	}
+	if timestamp := requestMetadataFirstTokenTime(ctx); !timestamp.IsZero() {
+		return firstTokenLatencyMs(requestedAt, timestamp)
+	}
 	ginCtx, ok := ctx.Value("gin").(*gin.Context)
 	if !ok || ginCtx == nil {
 		return 0
 	}
-	value, exists := ginCtx.Get("API_RESPONSE_TIMESTAMP")
+	value, exists := ginCtx.Get(APIResponseTimestampContextKey)
 	if !exists {
 		return 0
 	}
@@ -894,14 +902,13 @@ func resolveFirstTokenMs(ctx context.Context, requestedAt time.Time, requestType
 	if !ok || timestamp.IsZero() {
 		return 0
 	}
-	latency := timestamp.Sub(requestedAt)
-	if latency <= 0 {
-		return 0
-	}
-	return latency.Milliseconds()
+	return firstTokenLatencyMs(requestedAt, timestamp)
 }
 
 func resolveUserAgent(ctx context.Context) string {
+	if userAgent := requestMetadataUserAgent(ctx); userAgent != "" {
+		return userAgent
+	}
 	if ctx == nil {
 		return ""
 	}
@@ -910,6 +917,30 @@ func resolveUserAgent(ctx context.Context) string {
 		return ""
 	}
 	return logging.NormalizeUserAgent(ginCtx.Request.UserAgent())
+}
+
+// responseStatusFromGin 是兼容兜底；新链路优先使用 logging 的稳定 status holder。
+func responseStatusFromGin(ctx context.Context) int {
+	if ctx == nil {
+		return 0
+	}
+	ginCtx, ok := ctx.Value("gin").(*gin.Context)
+	if !ok || ginCtx == nil {
+		return 0
+	}
+	return ginCtx.Writer.Status()
+}
+
+// firstTokenLatencyMs 将首次响应时间转换成非负毫秒延迟。
+func firstTokenLatencyMs(requestedAt time.Time, firstTokenAt time.Time) int64 {
+	if requestedAt.IsZero() || firstTokenAt.IsZero() {
+		return 0
+	}
+	latency := firstTokenAt.Sub(requestedAt)
+	if latency <= 0 {
+		return 0
+	}
+	return latency.Milliseconds()
 }
 
 func normalizeRequestType(requestType string) string {

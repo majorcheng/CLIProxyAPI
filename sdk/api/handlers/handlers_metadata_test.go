@@ -6,7 +6,9 @@ import (
 	"testing"
 
 	"github.com/gin-gonic/gin"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/logging"
 	coreexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
+	sdkconfig "github.com/router-for-me/CLIProxyAPI/v6/sdk/config"
 	"golang.org/x/net/context"
 )
 
@@ -47,6 +49,31 @@ func TestRequestExecutionMetadataIncludesGinRequestPath(t *testing.T) {
 	router.ServeHTTP(resp, req)
 	if resp.Code != http.StatusOK {
 		t.Fatalf("status = %d, want %d: %s", resp.Code, http.StatusOK, resp.Body.String())
+	}
+}
+
+func TestGetContextWithCancelAttachesStableRequestMetadata(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	handler := &BaseAPIHandler{Cfg: &sdkconfig.SDKConfig{}}
+	router.POST("/v1/chat/completions", func(c *gin.Context) {
+		ctx, cancel := handler.GetContextWithCancel(nil, c, context.Background())
+		c.Status(http.StatusBadGateway)
+		cancel()
+
+		if got := logging.GetEndpoint(ctx); got != "POST /v1/chat/completions" {
+			t.Fatalf("endpoint = %q, want stable route endpoint", got)
+		}
+		if got := logging.GetResponseStatus(ctx); got != http.StatusBadGateway {
+			t.Fatalf("response status = %d, want %d", got, http.StatusBadGateway)
+		}
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	resp := httptest.NewRecorder()
+	router.ServeHTTP(resp, req)
+	if resp.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want %d: %s", resp.Code, http.StatusBadGateway, resp.Body.String())
 	}
 }
 

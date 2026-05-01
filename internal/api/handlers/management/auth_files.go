@@ -469,6 +469,7 @@ func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
 		"size":              int64(0),
 		"has_refresh_token": authMetadataHasRefreshToken(auth.Metadata),
 	}
+	entry["recent_requests"] = auth.RecentRequestsSnapshot(time.Now())
 	if statusCode := authFileHTTPStatus(auth); statusCode > 0 {
 		entry["http_status"] = statusCode
 	}

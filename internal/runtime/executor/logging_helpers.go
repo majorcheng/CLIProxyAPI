@@ -57,7 +57,7 @@ func recordAPIRequest(ctx context.Context, cfg *config.Config, info upstreamRequ
 	if ginCtx == nil {
 		return
 	}
-	ginCtx.Set(internalusage.RequestReasoningEffortContextKey, thinking.ExtractReasoningEffort(info.Body, info.Provider))
+	internalusage.SetReasoningEffort(ginCtx, thinking.ExtractReasoningEffort(info.Body, info.Provider))
 	if cfg == nil || !cfg.RequestLog {
 		return
 	}

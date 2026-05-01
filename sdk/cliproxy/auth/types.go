@@ -95,6 +95,13 @@ type Auth struct {
 	// Runtime carries non-serialisable data used during execution (in-memory only).
 	Runtime any `json:"-"`
 
+	// Success 记录进程内累计成功请求总数。
+	// 它不写入认证文件，管理端若要和 recent_requests 同窗口展示，应自行按时间桶汇总。
+	Success int64 `json:"-"`
+	// Failed 记录进程内累计失败请求总数。
+	// 它不写入认证文件，管理端若要和 recent_requests 同窗口展示，应自行按时间桶汇总。
+	Failed int64 `json:"-"`
+
 	// LastRequestSimHash stores the latest routed request SimHash for simhash routing.
 	LastRequestSimHash uint64 `json:"-"`
 	// HasLastRequestSimHash reports whether LastRequestSimHash is initialized.

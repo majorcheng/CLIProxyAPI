@@ -1280,7 +1280,9 @@ func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
 	}
 	m.mu.Lock()
 	if existing, ok := m.auths[auth.ID]; ok && existing != nil {
-		// recent_requests 是纯运行态趋势数据；同 ID 配置更新不能把它清零。
+		// 请求统计是纯运行态数据；同 ID 配置更新不能把它清零。
+		auth.Success = existing.Success
+		auth.Failed = existing.Failed
 		auth.recentRequests = existing.recentRequests
 		if !auth.indexAssigned && auth.Index == "" {
 			auth.Index = existing.Index
@@ -2503,6 +2505,11 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	m.mu.Lock()
 	if auth, ok := m.auths[result.AuthID]; ok && auth != nil {
 		auth.recordRecentRequest(now, result.Success)
+		if result.Success {
+			auth.Success++
+		} else {
+			auth.Failed++
+		}
 		if result.HasRequestSimHash {
 			auth.LastRequestSimHash = result.RequestSimHash
 			auth.HasLastRequestSimHash = true

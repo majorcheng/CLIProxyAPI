@@ -453,6 +453,8 @@ func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
 	if name == "" {
 		name = auth.ID
 	}
+	recentRequests := auth.RecentRequestsSnapshot(time.Now())
+	success, failed := recentRequestBucketTotals(recentRequests)
 	entry := gin.H{
 		"id":                auth.ID,
 		"auth_index":        auth.Index,
@@ -468,8 +470,10 @@ func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
 		"source":            "memory",
 		"size":              int64(0),
 		"has_refresh_token": authMetadataHasRefreshToken(auth.Metadata),
+		"success":           success,
+		"failed":            failed,
 	}
-	entry["recent_requests"] = auth.RecentRequestsSnapshot(time.Now())
+	entry["recent_requests"] = recentRequests
 	if statusCode := authFileHTTPStatus(auth); statusCode > 0 {
 		entry["http_status"] = statusCode
 	}

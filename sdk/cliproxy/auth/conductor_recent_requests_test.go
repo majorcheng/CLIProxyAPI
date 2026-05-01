@@ -31,6 +31,9 @@ func TestManagerMarkResultRecordsRecentRequests(t *testing.T) {
 	if !ok || gotAuth == nil {
 		t.Fatalf("GetByID returned ok=%v auth=%v", ok, gotAuth)
 	}
+	if gotAuth.Success != 1 || gotAuth.Failed != 1 {
+		t.Fatalf("request totals = success=%d failed=%d, want 1/1", gotAuth.Success, gotAuth.Failed)
+	}
 
 	snapshot := gotAuth.RecentRequestsSnapshot(time.Now())
 	var successTotal int64
@@ -72,6 +75,9 @@ func TestManagerUpdatePreservesRecentRequests(t *testing.T) {
 	}
 	if gotAuth.Label != "updated label" {
 		t.Fatalf("label = %q, want updated label", gotAuth.Label)
+	}
+	if gotAuth.Success != 1 || gotAuth.Failed != 0 {
+		t.Fatalf("request totals after Update = success=%d failed=%d, want 1/0", gotAuth.Success, gotAuth.Failed)
 	}
 	if totalRecentSuccesses(gotAuth.RecentRequestsSnapshot(time.Now())) != 1 {
 		t.Fatalf("recent success total was not preserved after Update")

@@ -244,3 +244,36 @@
 - `normalizeAuthDeletePath(...)` 改为通过 `normalizeAuthDeletePathForCase(...)` 生成匹配 key，并在 Windows 平台按现有 `authIDForPath(...)` 语义折叠为小写。
 - 验证通过：`timeout 180s go test ./internal/api/handlers/management -count=1`、`timeout 180s go test ./sdk/cliproxy/auth ./sdk/cliproxy -run 'TestManager_SchedulerTracksRegisterAndUpdate|TestDeleteAuthMaintenanceCandidate_RemovesFileAndDisablesAllAuths|TestAuthMaintenanceBackgroundQueue_MixedLoadGraduallyRemoves401And429' -count=1`、`git diff --check`。
 - 复核补充：相对路径且无配置快照时也通过 `foldAuthDeletePathCase(...)` 折叠大小写，避免早返回绕过大小写不敏感 key 规则。
+
+### Review Follow-up: v6.10.0 统计口径窗口错位
+
+#### Observations
+- 当前 `sdk/cliproxy/auth/types.go::Success/Failed` 是进程内累计总数，`sdk/cliproxy/auth/types.go::RecentRequestsSnapshot` 只返回最近 20 个 10 分钟桶。
+- `internal/api/handlers/management/api_key_usage.go::addAPIKeyUsageAuth` 之前直接把 `auth.Success/auth.Failed` 和 `recent_requests` 并排返回；`internal/api/handlers/management/auth_files.go::buildAuthFileEntry` 也直接返回累计总数。
+- 这会导致 management API 同一响应对象里同时出现“累计总数”和“窗口趋势”，服务运行足够久后两者必然不一致。
+
+#### Hypotheses
+- H1：应该把 `Auth.Success/Failed` 本身改成窗口总数。Supports：可以和 `recent_requests` 自然对齐。Conflicts：字段已在 `MarkResult` 里定义为累计统计，改内部语义会扩大影响面。 Test：检查是否存在只依赖累计字段而不看窗口的内部调用。
+- H2：应该保留 `Auth.Success/Failed` 的累计语义，只修 management 对外暴露，让 `success/failed` 从 `recent_requests` 汇总得出。（ROOT）Supports：review 指向的是同一响应对象口径错位；当前没有其他仓内消费者读取 `/api-key-usage`。 Conflicts：上游新增字段原意更接近累计展示。 Test：把 auth 的累计值手工改成 42/24，验证 management 仍返回窗口 1/1。
+- H3：应该删除 management 响应里的 `success/failed` 字段，仅保留 `recent_requests`。Supports：最彻底避免歧义。 Conflicts：会偏离本轮要跟的上游小增强。 Test：比对本轮 selective port 范围，确认这会丢功能而不是修语义。
+
+#### Experiments
+- E1：静态检索 `internal/api/handlers/management`、`internal/tui`、`sdk/api`，确认仓内没有其他消费者依赖 `/v0/management/api-key-usage` 的旧数组值或累计总数字段。结果：Confirmed，当前仅有路由、handler 与测试，没有前端/TUI 直连此接口。
+- E2：在 `api_key_usage` 和 `auth_files` 测试里把同一 auth 的 `Success/Failed` 人工改成 `42/24`，同时保留 `recent_requests` 为 `1/1`。结果：Confirmed，旧实现会把 42/24 直接透出，证明 review 指出的错位真实存在。
+
+#### Root Cause
+- 根因不是 `Success/Failed` 字段本身有问题，而是 management 端把“累计总数”直接和“最近 20 个 10 分钟桶”放进同一响应对象，导致对外统计口径错位。
+
+#### Fix Implemented
+- `internal/api/handlers/management/api_key_usage.go` 新增 `recentRequestBucketTotals(...)`，`success/failed` 改为由 `RecentRequestsSnapshot(...)` 的 20 桶窗口汇总得出，不再直接暴露 `auth.Success/auth.Failed`。
+- `internal/api/handlers/management/auth_files.go::buildAuthFileEntry` 同样改成先取 `recentRequests := auth.RecentRequestsSnapshot(time.Now())`，再从窗口桶汇总 `success/failed`，确保同一响应对象口径一致。
+- `sdk/cliproxy/auth/types.go` 注释补充说明：`Success/Failed` 是进程内累计计数，若 management 要和 `recent_requests` 同窗口展示，必须自行按时间桶汇总。
+- 新增回归测试：
+  - `internal/api/handlers/management/api_key_usage_test.go::TestGetAPIKeyUsage_UsesRecentWindowTotalsInsteadOfCumulativeAuthTotals`
+  - `internal/api/handlers/management/auth_files_recent_requests_test.go::TestListAuthFiles_UsesRecentWindowTotalsInsteadOfCumulativeAuthTotals`
+- 验证通过：
+  - `timeout 60s go test ./internal/api/handlers/management -run 'Test(GetAPIKeyUsage|ListAuthFiles).*' -count=1`
+  - `timeout 60s go test ./sdk/cliproxy/auth -run 'Test.*RecentRequests|TestManager.*RecentRequests|TestManagerUpdatePreservesRecentRequests' -count=1`
+  - `timeout 60s go test ./internal/api/handlers/management ./sdk/cliproxy/auth -count=1`
+  - `timeout 60s go test ./... -run '^$'`
+  - `timeout 60s git diff --check`

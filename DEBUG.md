@@ -277,3 +277,29 @@
   - `timeout 60s go test ./internal/api/handlers/management ./sdk/cliproxy/auth -count=1`
   - `timeout 60s go test ./... -run '^$'`
   - `timeout 60s git diff --check`
+
+### Review Follow-up: Claude Responses tool_result 非字符串回归
+
+#### Observations
+- `internal/translator/claude/openai/responses/claude_openai-responses_request.go::convertResponsesToolResultContent` 当前会把数组里的可识别 part 转成 Claude content blocks，但未识别 part 会被直接跳过。
+- 同文件 `convertResponsesContentPartToClaudePart` 在处理 `type=file` 时，直接把 `file.file_data` 写进 `document.source.data`，没有剥离 `data:...;base64,` 前缀。
+- 当前新增测试只覆盖 `text + image_url` 的 happy path，没有覆盖“混合数组含未知 part”以及 `file_data` 为 data URL 的场景。
+
+#### Hypotheses
+- H1：数组 tool_result 只要命中部分可识别项，函数就会返回部分转换后的 `claudeContent`，从而静默丢掉未识别项。（ROOT）Supports：当前 `partCount > 0` 即返回转换结果；Conflicts：当数组全都不可识别时会 fallback 原始 JSON。Test：加入 `text + unknown object` 混合数组，断言第二项仍保留。
+- H2：`file.file_data` 若是 data URL，当前会把完整前缀写进 Claude `source.data`，导致非法 base64。Supports：代码直接 `Set(source.data, fileData)`；Conflicts：若输入本来就是裸 base64，则不会暴露问题。Test：加入 `data:text/plain;base64,...` 用例，断言 `source.data` 只剩裸 base64。
+- H3：问题来自测试断言而不是实现。Supports：无。Conflicts：静态审查已经能直接看出实现路径丢字段与未剥头。Test：补针对性测试。
+
+#### Experiments
+- E1：新增混合数组回归测试 `TestConvertOpenAIResponsesRequestToClaude_PreservesRawToolResultArrayWhenPartIsUnsupported`，使用 `text + {"foo":"bar"}` 输入验证未知项是否被保留。
+- E2：新增 data URL 文件回归测试 `TestConvertOpenAIResponsesRequestToClaude_StripsFileDataURLPrefix`，验证 `document.source.data` 只保留裸 base64，`media_type` 正确提取为 `text/plain`。
+
+#### Root Cause
+- 根因是 translator 在“部分可识别”的 tool result 数组上错误地选择了部分转换结果，而不是在遇到未知 part 时整体 fallback 原始 JSON；同时 `file_data` 缺少 data URL 剥头逻辑。
+
+#### Fix Implemented
+- `convertResponsesToolResultContent(...)` 新增 `hasUnsupportedPart` 路径：数组里一旦出现未知 part，就整体 fallback 为原始 JSON，避免选择性丢字段。
+- `convertResponsesContentPartToClaudePart(...)` 改为通过 `decodeResponsesToolResultFileData(...)` 解析 `file.file_data`，正确剥离 `data:...;base64,` 前缀并回填 `media_type`。
+- 新增回归测试：
+  - `internal/translator/claude/openai/responses/claude_openai-responses_request_test.go::TestConvertOpenAIResponsesRequestToClaude_PreservesRawToolResultArrayWhenPartIsUnsupported`
+  - `internal/translator/claude/openai/responses/claude_openai-responses_request_test.go::TestConvertOpenAIResponsesRequestToClaude_StripsFileDataURLPrefix`

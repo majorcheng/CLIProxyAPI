@@ -303,7 +303,17 @@ func normalizeKimiToolMessageLinks(body []byte) ([]byte, error) {
 		return body, nil
 	}
 
-	out := body
+	msgs := messages.Array()
+	out, dropped, err := filterKimiEmptyAssistantMessages(body, msgs)
+	if err != nil {
+		return body, err
+	}
+	if dropped > 0 {
+		log.WithField("dropped_assistant_messages", dropped).Debug("kimi executor: dropped empty assistant messages")
+	}
+
+	messages = gjson.GetBytes(out, "messages")
+	msgs = messages.Array()
 	pending := make([]string, 0)
 	patched := 0
 	patchedReasoning := 0
@@ -321,7 +331,6 @@ func normalizeKimiToolMessageLinks(body []byte) ([]byte, error) {
 		}
 	}
 
-	msgs := messages.Array()
 	for msgIdx := range msgs {
 		msg := msgs[msgIdx]
 		role := strings.TrimSpace(msg.Get("role").String())
@@ -407,6 +416,89 @@ func normalizeKimiToolMessageLinks(body []byte) ([]byte, error) {
 	}
 
 	return out, nil
+}
+
+// filterKimiEmptyAssistantMessages 只移除真正没有内容、没有工具调用、也没有 reasoning 的 assistant 空壳消息。
+func filterKimiEmptyAssistantMessages(body []byte, msgs []gjson.Result) ([]byte, int, error) {
+	if len(msgs) == 0 {
+		return body, 0, nil
+	}
+
+	filtered := make([]string, 0, len(msgs))
+	dropped := 0
+	for _, msg := range msgs {
+		if shouldDropKimiAssistantMessage(msg) {
+			dropped++
+			continue
+		}
+		filtered = append(filtered, msg.Raw)
+	}
+	if dropped == 0 {
+		return body, 0, nil
+	}
+
+	next, err := sjson.SetRawBytes(body, "messages", []byte("["+strings.Join(filtered, ",")+"]"))
+	if err != nil {
+		return body, 0, fmt.Errorf("kimi executor: failed to rewrite filtered messages: %w", err)
+	}
+	return next, dropped, nil
+}
+
+// shouldDropKimiAssistantMessage 只识别 Kimi 上游不接受的 assistant 空消息，不影响其他合法 assistant 形态。
+func shouldDropKimiAssistantMessage(msg gjson.Result) bool {
+	if strings.TrimSpace(msg.Get("role").String()) != "assistant" {
+		return false
+	}
+	if hasKimiToolCalls(msg) || hasKimiLegacyFunctionCall(msg) || hasKimiAssistantReasoning(msg) {
+		return false
+	}
+	return isKimiAssistantContentEmpty(msg.Get("content"))
+}
+
+func hasKimiToolCalls(msg gjson.Result) bool {
+	toolCalls := msg.Get("tool_calls")
+	return toolCalls.Exists() && toolCalls.IsArray() && len(toolCalls.Array()) > 0
+}
+
+func hasKimiLegacyFunctionCall(msg gjson.Result) bool {
+	functionCall := msg.Get("function_call")
+	return functionCall.Exists() && functionCall.IsObject()
+}
+
+func hasKimiAssistantReasoning(msg gjson.Result) bool {
+	reasoning := strings.TrimSpace(msg.Get("reasoning_content").String())
+	return reasoning != ""
+}
+
+func isKimiAssistantContentEmpty(content gjson.Result) bool {
+	if !content.Exists() || content.Type == gjson.Null {
+		return true
+	}
+	if content.Type == gjson.String {
+		return strings.TrimSpace(content.String()) == ""
+	}
+	if content.IsArray() {
+		if len(content.Array()) == 0 {
+			return true
+		}
+		for _, part := range content.Array() {
+			if !isKimiAssistantContentPartEmpty(part) {
+				return false
+			}
+		}
+		return true
+	}
+	return strings.TrimSpace(content.Raw) == ""
+}
+
+func isKimiAssistantContentPartEmpty(part gjson.Result) bool {
+	partType := strings.TrimSpace(part.Get("type").String())
+	switch partType {
+	case "", "text":
+		return strings.TrimSpace(part.Get("text").String()) == ""
+	default:
+		return false
+	}
 }
 
 func fallbackAssistantReasoning(msg gjson.Result, hasLatest bool, latest string) string {

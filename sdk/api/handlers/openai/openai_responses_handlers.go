@@ -45,7 +45,8 @@ func writeResponsesSSEChunk(w io.Writer, chunk []byte) {
 }
 
 type responsesSSEFramer struct {
-	pending []byte
+	pending     []byte
+	outputItems [][]byte
 }
 
 func (f *responsesSSEFramer) WriteChunk(w io.Writer, chunk []byte) {
@@ -61,7 +62,7 @@ func (f *responsesSSEFramer) WriteChunk(w io.Writer, chunk []byte) {
 		if frameLen == 0 {
 			break
 		}
-		writeResponsesSSEChunk(w, f.pending[:frameLen])
+		f.writeFrame(w, f.pending[:frameLen])
 		copy(f.pending, f.pending[frameLen:])
 		f.pending = f.pending[:len(f.pending)-frameLen]
 	}
@@ -72,7 +73,7 @@ func (f *responsesSSEFramer) WriteChunk(w io.Writer, chunk []byte) {
 	if len(f.pending) == 0 || !responsesSSECanEmitWithoutDelimiter(f.pending) {
 		return
 	}
-	writeResponsesSSEChunk(w, f.pending)
+	f.writeFrame(w, f.pending)
 	f.pending = f.pending[:0]
 }
 
@@ -88,8 +89,113 @@ func (f *responsesSSEFramer) Flush(w io.Writer) {
 		f.pending = f.pending[:0]
 		return
 	}
-	writeResponsesSSEChunk(w, f.pending)
+	f.writeFrame(w, f.pending)
 	f.pending = f.pending[:0]
+}
+
+// writeFrame 在真正输出前统一执行 Responses SSE 帧修复。
+func (f *responsesSSEFramer) writeFrame(w io.Writer, frame []byte) {
+	writeResponsesSSEChunk(w, f.repairFrame(frame))
+}
+
+// repairFrame 只修复合法 JSON data payload，裸 [DONE] 与非 JSON 帧保持原样。
+func (f *responsesSSEFramer) repairFrame(frame []byte) []byte {
+	payload, ok := responsesSSEDataPayload(frame)
+	if !ok || len(payload) == 0 || bytes.Equal(payload, []byte("[DONE]")) || !json.Valid(payload) {
+		return frame
+	}
+
+	switch gjson.GetBytes(payload, "type").String() {
+	case "response.output_item.done":
+		f.recordOutputItem(payload)
+	case "response.completed":
+		repaired := f.repairCompletedPayload(payload)
+		if !bytes.Equal(repaired, payload) {
+			return responsesSSEFrameWithData(frame, repaired)
+		}
+	}
+	return frame
+}
+
+// responsesSSEDataPayload 提取单个 SSE frame 里的 data payload。
+// 多行 data 需要用换行拼回原始 JSON，避免破坏兼容端输出的 multiline payload。
+func responsesSSEDataPayload(frame []byte) ([]byte, bool) {
+	var payload []byte
+	found := false
+	for _, line := range bytes.Split(frame, []byte("\n")) {
+		line = bytes.TrimRight(line, "\r")
+		trimmed := bytes.TrimSpace(line)
+		if !bytes.HasPrefix(trimmed, []byte("data:")) {
+			continue
+		}
+		data := bytes.TrimSpace(trimmed[len("data:"):])
+		if found {
+			payload = append(payload, '\n')
+		}
+		payload = append(payload, data...)
+		found = true
+	}
+	return payload, found
+}
+
+// responsesSSEFrameWithData 用修复后的 payload 重建 SSE frame。
+// 非 data 行保留在前面，payload 的每一行重新写成合法 data 行。
+func responsesSSEFrameWithData(frame, payload []byte) []byte {
+	var out bytes.Buffer
+	for _, line := range bytes.Split(frame, []byte("\n")) {
+		line = bytes.TrimRight(line, "\r")
+		trimmed := bytes.TrimSpace(line)
+		if len(trimmed) == 0 || bytes.HasPrefix(trimmed, []byte("data:")) {
+			continue
+		}
+		out.Write(line)
+		out.WriteByte('\n')
+	}
+	for _, line := range bytes.Split(payload, []byte("\n")) {
+		out.WriteString("data: ")
+		out.Write(line)
+		out.WriteByte('\n')
+	}
+	out.WriteByte('\n')
+	return out.Bytes()
+}
+
+// recordOutputItem 按 SSE 到达顺序记录 completed 之前已经完成的 output item。
+func (f *responsesSSEFramer) recordOutputItem(payload []byte) {
+	item := gjson.GetBytes(payload, "item")
+	if !item.Exists() || !item.IsObject() || item.Get("type").String() == "" {
+		return
+	}
+
+	f.outputItems = append(f.outputItems, append([]byte(nil), item.Raw...))
+}
+
+// repairCompletedPayload 在 completed.output 为空时回填此前记录的 output item。
+// 已有非空 output 时不覆盖，避免把上游明确给出的最终结果替换掉。
+func (f *responsesSSEFramer) repairCompletedPayload(payload []byte) []byte {
+	if len(f.outputItems) == 0 {
+		return payload
+	}
+	output := gjson.GetBytes(payload, "response.output")
+	if output.Exists() && (!output.IsArray() || len(output.Array()) > 0) {
+		return payload
+	}
+
+	var outputJSON bytes.Buffer
+	outputJSON.WriteByte('[')
+	for index, item := range f.outputItems {
+		if index > 0 {
+			outputJSON.WriteByte(',')
+		}
+		outputJSON.Write(item)
+	}
+	outputJSON.WriteByte(']')
+
+	repaired, err := sjson.SetRawBytes(payload, "response.output", outputJSON.Bytes())
+	if err != nil {
+		return payload
+	}
+	return repaired
 }
 
 func responsesSSEFrameLen(chunk []byte) int {

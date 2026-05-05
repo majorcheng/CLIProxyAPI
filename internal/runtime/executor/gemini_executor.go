@@ -321,17 +321,23 @@ func (e *GeminiExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 			}
 			lines := sdktranslator.TranslateStream(ctx, to, from, req.Model, opts.OriginalRequest, body, bytes.Clone(payload), &param)
 			for i := range lines {
-				out <- cliproxyexecutor.StreamChunk{Payload: []byte(lines[i])}
+				if !sendStreamChunk(ctx, out, cliproxyexecutor.StreamChunk{Payload: []byte(lines[i])}) {
+					return
+				}
 			}
 		}
 		lines := sdktranslator.TranslateStream(ctx, to, from, req.Model, opts.OriginalRequest, body, []byte("[DONE]"), &param)
 		for i := range lines {
-			out <- cliproxyexecutor.StreamChunk{Payload: []byte(lines[i])}
+			if !sendStreamChunk(ctx, out, cliproxyexecutor.StreamChunk{Payload: []byte(lines[i])}) {
+				return
+			}
 		}
 		if errScan := scanner.Err(); errScan != nil {
 			recordAPIResponseError(ctx, e.cfg, errScan)
 			reporter.publishFailure(ctx)
-			out <- cliproxyexecutor.StreamChunk{Err: errScan}
+			if !sendStreamChunk(ctx, out, cliproxyexecutor.StreamChunk{Err: errScan}) {
+				return
+			}
 		}
 	}()
 	return &cliproxyexecutor.StreamResult{Headers: httpResp.Header.Clone(), Chunks: out}, nil

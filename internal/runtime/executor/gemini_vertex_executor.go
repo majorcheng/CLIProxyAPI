@@ -335,6 +335,7 @@ func (e *GeminiVertexExecutor) executeWithServiceAccount(ctx context.Context, au
 		requestedModel := payloadRequestedModel(opts, req.Model)
 		body = applyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", body, originalTranslated, requestedModel, payloadRequestPath(opts))
 		body, _ = sjson.SetBytes(body, "model", baseModel)
+		body = stripVertexOpenAIResponsesToolCallIDs(body, from.String())
 	}
 
 	action := getVertexAction(baseModel, false)
@@ -450,6 +451,7 @@ func (e *GeminiVertexExecutor) executeWithAPIKey(ctx context.Context, auth *clip
 	requestedModel := payloadRequestedModel(opts, req.Model)
 	body = applyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", body, originalTranslated, requestedModel, payloadRequestPath(opts))
 	body, _ = sjson.SetBytes(body, "model", baseModel)
+	body = stripVertexOpenAIResponsesToolCallIDs(body, from.String())
 
 	action := getVertexAction(baseModel, false)
 	if req.Metadata != nil {
@@ -555,6 +557,7 @@ func (e *GeminiVertexExecutor) executeStreamWithServiceAccount(ctx context.Conte
 	requestedModel := payloadRequestedModel(opts, req.Model)
 	body = applyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", body, originalTranslated, requestedModel, payloadRequestPath(opts))
 	body, _ = sjson.SetBytes(body, "model", baseModel)
+	body = stripVertexOpenAIResponsesToolCallIDs(body, from.String())
 
 	action := getVertexAction(baseModel, true)
 	baseURL := vertexBaseURL(location)
@@ -636,17 +639,23 @@ func (e *GeminiVertexExecutor) executeStreamWithServiceAccount(ctx context.Conte
 			}
 			lines := sdktranslator.TranslateStream(ctx, to, from, req.Model, opts.OriginalRequest, body, bytes.Clone(line), &param)
 			for i := range lines {
-				out <- cliproxyexecutor.StreamChunk{Payload: []byte(lines[i])}
+				if !sendStreamChunk(ctx, out, cliproxyexecutor.StreamChunk{Payload: []byte(lines[i])}) {
+					return
+				}
 			}
 		}
 		lines := sdktranslator.TranslateStream(ctx, to, from, req.Model, opts.OriginalRequest, body, []byte("[DONE]"), &param)
 		for i := range lines {
-			out <- cliproxyexecutor.StreamChunk{Payload: []byte(lines[i])}
+			if !sendStreamChunk(ctx, out, cliproxyexecutor.StreamChunk{Payload: []byte(lines[i])}) {
+				return
+			}
 		}
 		if errScan := scanner.Err(); errScan != nil {
 			recordAPIResponseError(ctx, e.cfg, errScan)
 			reporter.publishFailure(ctx)
-			out <- cliproxyexecutor.StreamChunk{Err: errScan}
+			if !sendStreamChunk(ctx, out, cliproxyexecutor.StreamChunk{Err: errScan}) {
+				return
+			}
 		}
 	}()
 	return &cliproxyexecutor.StreamResult{Headers: httpResp.Header.Clone(), Chunks: out}, nil
@@ -679,6 +688,7 @@ func (e *GeminiVertexExecutor) executeStreamWithAPIKey(ctx context.Context, auth
 	requestedModel := payloadRequestedModel(opts, req.Model)
 	body = applyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", body, originalTranslated, requestedModel, payloadRequestPath(opts))
 	body, _ = sjson.SetBytes(body, "model", baseModel)
+	body = stripVertexOpenAIResponsesToolCallIDs(body, from.String())
 
 	action := getVertexAction(baseModel, true)
 	// For API key auth, use simpler URL format without project/location
@@ -760,17 +770,23 @@ func (e *GeminiVertexExecutor) executeStreamWithAPIKey(ctx context.Context, auth
 			}
 			lines := sdktranslator.TranslateStream(ctx, to, from, req.Model, opts.OriginalRequest, body, bytes.Clone(line), &param)
 			for i := range lines {
-				out <- cliproxyexecutor.StreamChunk{Payload: []byte(lines[i])}
+				if !sendStreamChunk(ctx, out, cliproxyexecutor.StreamChunk{Payload: []byte(lines[i])}) {
+					return
+				}
 			}
 		}
 		lines := sdktranslator.TranslateStream(ctx, to, from, req.Model, opts.OriginalRequest, body, []byte("[DONE]"), &param)
 		for i := range lines {
-			out <- cliproxyexecutor.StreamChunk{Payload: []byte(lines[i])}
+			if !sendStreamChunk(ctx, out, cliproxyexecutor.StreamChunk{Payload: []byte(lines[i])}) {
+				return
+			}
 		}
 		if errScan := scanner.Err(); errScan != nil {
 			recordAPIResponseError(ctx, e.cfg, errScan)
 			reporter.publishFailure(ctx)
-			out <- cliproxyexecutor.StreamChunk{Err: errScan}
+			if !sendStreamChunk(ctx, out, cliproxyexecutor.StreamChunk{Err: errScan}) {
+				return
+			}
 		}
 	}()
 	return &cliproxyexecutor.StreamResult{Headers: httpResp.Header.Clone(), Chunks: out}, nil
@@ -792,6 +808,7 @@ func (e *GeminiVertexExecutor) countTokensWithServiceAccount(ctx context.Context
 
 	translatedReq = fixGeminiImageAspectRatio(baseModel, translatedReq)
 	translatedReq, _ = sjson.SetBytes(translatedReq, "model", baseModel)
+	translatedReq = stripVertexOpenAIResponsesToolCallIDs(translatedReq, from.String())
 	respCtx := context.WithValue(ctx, "alt", opts.Alt)
 	translatedReq, _ = sjson.DeleteBytes(translatedReq, "tools")
 	translatedReq, _ = sjson.DeleteBytes(translatedReq, "generationConfig")
@@ -876,6 +893,7 @@ func (e *GeminiVertexExecutor) countTokensWithAPIKey(ctx context.Context, auth *
 
 	translatedReq = fixGeminiImageAspectRatio(baseModel, translatedReq)
 	translatedReq, _ = sjson.SetBytes(translatedReq, "model", baseModel)
+	translatedReq = stripVertexOpenAIResponsesToolCallIDs(translatedReq, from.String())
 	respCtx := context.WithValue(ctx, "alt", opts.Alt)
 	translatedReq, _ = sjson.DeleteBytes(translatedReq, "tools")
 	translatedReq, _ = sjson.DeleteBytes(translatedReq, "generationConfig")

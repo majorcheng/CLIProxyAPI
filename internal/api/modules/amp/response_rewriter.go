@@ -123,6 +123,51 @@ func (rw *ResponseRewriter) Flush() {
 
 var modelFieldPaths = []string{"message.model", "model", "modelVersion", "response.model", "response.modelVersion"}
 
+// ampCanonicalToolNames 记录 Amp 模式白名单期望的精确工具名大小写。
+// Amp 的工具白名单是大小写敏感匹配，glob 需要保持上游约定的小写形态。
+var ampCanonicalToolNames = map[string]string{
+	"bash":  "Bash",
+	"read":  "Read",
+	"grep":  "Grep",
+	"glob":  "glob",
+	"task":  "Task",
+	"check": "Check",
+}
+
+// normalizeAmpToolNames 把 tool_use 工具名修正为 Amp 白名单认可的规范大小写。
+// 部分上游模型会返回小写工具名，若不修正会被 Amp 的大小写敏感白名单拒绝。
+func normalizeAmpToolNames(data []byte) []byte {
+	// 非流式响应：修正 content[] 中 tool_use block 的 name。
+	for index, block := range gjson.GetBytes(data, "content").Array() {
+		if block.Get("type").String() != "tool_use" {
+			continue
+		}
+		name := block.Get("name").String()
+		if canonical, ok := ampCanonicalToolNames[strings.ToLower(name)]; ok && name != canonical {
+			path := fmt.Sprintf("content.%d.name", index)
+			var err error
+			data, err = sjson.SetBytes(data, path, canonical)
+			if err != nil {
+				log.Warnf("Amp ResponseRewriter: failed to normalize tool name %q to %q: %v", name, canonical, err)
+			}
+		}
+	}
+
+	// 流式响应：修正 content_block_start 事件里的 content_block.name。
+	if gjson.GetBytes(data, "content_block.type").String() == "tool_use" {
+		name := gjson.GetBytes(data, "content_block.name").String()
+		if canonical, ok := ampCanonicalToolNames[strings.ToLower(name)]; ok && name != canonical {
+			var err error
+			data, err = sjson.SetBytes(data, "content_block.name", canonical)
+			if err != nil {
+				log.Warnf("Amp ResponseRewriter: failed to normalize streaming tool name %q to %q: %v", name, canonical, err)
+			}
+		}
+	}
+
+	return data
+}
+
 // ensureAmpSignature injects empty signature fields into tool_use/thinking blocks
 // in API responses so that the Amp TUI does not crash on P.signature.length.
 func ensureAmpSignature(data []byte) []byte {
@@ -180,6 +225,7 @@ func (rw *ResponseRewriter) suppressAmpThinking(data []byte) []byte {
 
 func (rw *ResponseRewriter) rewriteModelInResponse(data []byte) []byte {
 	data = ensureAmpSignature(data)
+	data = normalizeAmpToolNames(data)
 	data = rw.suppressAmpThinking(data)
 	if len(data) == 0 {
 		return data
@@ -276,6 +322,9 @@ func (rw *ResponseRewriter) rewriteStreamChunk(chunk []byte) []byte {
 func (rw *ResponseRewriter) rewriteStreamEvent(data []byte) []byte {
 	// Inject empty signature where needed
 	data = ensureAmpSignature(data)
+
+	// 修正工具名大小写，避免 Amp 白名单按大小写敏感规则拒绝。
+	data = normalizeAmpToolNames(data)
 
 	// Rewrite model name
 	if rw.originalModel != "" {

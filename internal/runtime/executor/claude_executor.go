@@ -64,14 +64,8 @@ var oauthToolRenameMap = map[string]string{
 	"notebookedit": "NotebookEdit",
 }
 
-var oauthToolRenameReverseMap = func() map[string]string {
-	reverse := make(map[string]string, len(oauthToolRenameMap))
-	for from, to := range oauthToolRenameMap {
-		reverse[to] = from
-	}
-	return reverse
-}()
-
+// 响应侧 reverse map 必须按请求生成，只回滚本次实际 forward-renamed 的工具名。
+// 全局反向表会把客户端原本就发送的 TitleCase 工具名误改回 lowercase。
 // 当前不再删除 question/skill，而是统一改名为 Claude Code 风格。
 var oauthToolsToRemove = map[string]bool{}
 
@@ -188,12 +182,9 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	bodyForTranslation := body
 	bodyForUpstream := body
 	oauthToken := isClaudeOAuthToken(apiKey)
-	oauthToolNamesRemapped := false
-	if oauthToken && !auth.ToolPrefixDisabled() {
-		bodyForUpstream = applyClaudeToolPrefix(body, claudeToolPrefix)
-	}
+	var oauthToolNamesReverseMap map[string]string
 	if oauthToken {
-		bodyForUpstream, oauthToolNamesRemapped = remapOAuthToolNames(bodyForUpstream)
+		bodyForUpstream, oauthToolNamesReverseMap = prepareClaudeOAuthToolNamesForUpstream(bodyForUpstream, claudeToolPrefix, auth.ToolPrefixDisabled())
 		bodyForUpstream = signAnthropicMessagesBody(bodyForUpstream)
 	}
 
@@ -287,11 +278,8 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	} else {
 		reporter.publish(ctx, parseClaudeUsage(data))
 	}
-	if isClaudeOAuthToken(apiKey) && !auth.ToolPrefixDisabled() {
-		data = stripClaudeToolPrefixFromResponse(data, claudeToolPrefix)
-	}
-	if oauthToken && oauthToolNamesRemapped {
-		data = reverseRemapOAuthToolNames(data)
+	if oauthToken {
+		data = restoreClaudeOAuthToolNamesFromResponse(data, claudeToolPrefix, auth.ToolPrefixDisabled(), oauthToolNamesReverseMap)
 	}
 	var param any
 	out := sdktranslator.TranslateNonStream(
@@ -366,12 +354,9 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	bodyForTranslation := body
 	bodyForUpstream := body
 	oauthToken := isClaudeOAuthToken(apiKey)
-	oauthToolNamesRemapped := false
-	if oauthToken && !auth.ToolPrefixDisabled() {
-		bodyForUpstream = applyClaudeToolPrefix(body, claudeToolPrefix)
-	}
+	var oauthToolNamesReverseMap map[string]string
 	if oauthToken {
-		bodyForUpstream, oauthToolNamesRemapped = remapOAuthToolNames(bodyForUpstream)
+		bodyForUpstream, oauthToolNamesReverseMap = prepareClaudeOAuthToolNamesForUpstream(bodyForUpstream, claudeToolPrefix, auth.ToolPrefixDisabled())
 		bodyForUpstream = signAnthropicMessagesBody(bodyForUpstream)
 	}
 
@@ -459,22 +444,23 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 				if detail, ok := parseClaudeStreamUsage(line); ok {
 					reporter.publish(ctx, detail)
 				}
-				if oauthToken && !auth.ToolPrefixDisabled() {
-					line = stripClaudeToolPrefixFromStreamLine(line, claudeToolPrefix)
-				}
-				if oauthToken && oauthToolNamesRemapped {
-					line = reverseRemapOAuthToolNamesFromStreamLine(line)
+				if oauthToken {
+					line = restoreClaudeOAuthToolNamesFromStreamLine(line, claudeToolPrefix, auth.ToolPrefixDisabled(), oauthToolNamesReverseMap)
 				}
 				// Forward the line as-is to preserve SSE format
 				cloned := make([]byte, len(line)+1)
 				copy(cloned, line)
 				cloned[len(line)] = '\n'
-				out <- cliproxyexecutor.StreamChunk{Payload: cloned}
+				if !sendStreamChunk(ctx, out, cliproxyexecutor.StreamChunk{Payload: cloned}) {
+					return
+				}
 			}
 			if errScan := scanner.Err(); errScan != nil {
 				recordAPIResponseError(ctx, e.cfg, errScan)
 				reporter.publishFailure(ctx)
-				out <- cliproxyexecutor.StreamChunk{Err: errScan}
+				if !sendStreamChunk(ctx, out, cliproxyexecutor.StreamChunk{Err: errScan}) {
+					return
+				}
 			}
 			return
 		}
@@ -489,11 +475,8 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 			if detail, ok := parseClaudeStreamUsage(line); ok {
 				reporter.publish(ctx, detail)
 			}
-			if oauthToken && !auth.ToolPrefixDisabled() {
-				line = stripClaudeToolPrefixFromStreamLine(line, claudeToolPrefix)
-			}
-			if oauthToken && oauthToolNamesRemapped {
-				line = reverseRemapOAuthToolNamesFromStreamLine(line)
+			if oauthToken {
+				line = restoreClaudeOAuthToolNamesFromStreamLine(line, claudeToolPrefix, auth.ToolPrefixDisabled(), oauthToolNamesReverseMap)
 			}
 			chunks := sdktranslator.TranslateStream(
 				ctx,
@@ -506,13 +489,17 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 				&param,
 			)
 			for i := range chunks {
-				out <- cliproxyexecutor.StreamChunk{Payload: []byte(chunks[i])}
+				if !sendStreamChunk(ctx, out, cliproxyexecutor.StreamChunk{Payload: []byte(chunks[i])}) {
+					return
+				}
 			}
 		}
 		if errScan := scanner.Err(); errScan != nil {
 			recordAPIResponseError(ctx, e.cfg, errScan)
 			reporter.publishFailure(ctx)
-			out <- cliproxyexecutor.StreamChunk{Err: errScan}
+			if !sendStreamChunk(ctx, out, cliproxyexecutor.StreamChunk{Err: errScan}) {
+				return
+			}
 		}
 	}()
 	return &cliproxyexecutor.StreamResult{Headers: httpResp.Header.Clone(), Chunks: out}, nil
@@ -604,11 +591,8 @@ func (e *ClaudeExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Aut
 	// Extract betas from body and convert to header (for count_tokens too)
 	var extraBetas []string
 	extraBetas, body = extractAndRemoveBetas(body)
-	if isClaudeOAuthToken(apiKey) && !auth.ToolPrefixDisabled() {
-		body = applyClaudeToolPrefix(body, claudeToolPrefix)
-	}
 	if isClaudeOAuthToken(apiKey) {
-		body, _ = remapOAuthToolNames(body)
+		body, _ = prepareClaudeOAuthToolNamesForUpstream(body, claudeToolPrefix, auth.ToolPrefixDisabled())
 	}
 
 	url := fmt.Sprintf("%s/v1/messages/count_tokens?beta=true", baseURL)
@@ -706,7 +690,7 @@ func (e *ClaudeExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (
 	}
 	// refresh 必须优先复用 auth 自身 proxy_url，避免 OAuth 交换流量跑偏出口。
 	svc := claudeauth.NewClaudeAuthWithProxyURL(e.cfg, auth.ProxyURL)
-	td, err := svc.RefreshTokens(ctx, refreshToken)
+	td, err := svc.RefreshTokensWithRetry(ctx, refreshToken, 3)
 	if err != nil {
 		return nil, err
 	}
@@ -1084,11 +1068,42 @@ func isClaudeOAuthToken(apiKey string) bool {
 	return strings.Contains(apiKey, "sk-ant-oat")
 }
 
+// prepareClaudeOAuthToolNamesForUpstream 统一 OAuth 请求侧工具名变换顺序。
+// 先做 Claude Code 风格改名，再按需加 prefix，保证响应侧可以精确逆变换。
+func prepareClaudeOAuthToolNamesForUpstream(body []byte, prefix string, prefixDisabled bool) ([]byte, map[string]string) {
+	body, reverseMap := remapOAuthToolNames(body)
+	if !prefixDisabled {
+		body = applyClaudeToolPrefix(body, prefix)
+	}
+	return body, reverseMap
+}
+
+// restoreClaudeOAuthToolNamesFromResponse 按请求级 reverse map 还原非流式响应工具名。
+func restoreClaudeOAuthToolNamesFromResponse(body []byte, prefix string, prefixDisabled bool, reverseMap map[string]string) []byte {
+	if !prefixDisabled {
+		body = stripClaudeToolPrefixFromResponse(body, prefix)
+	}
+	return reverseRemapOAuthToolNames(body, reverseMap)
+}
+
+// restoreClaudeOAuthToolNamesFromStreamLine 按请求级 reverse map 还原 SSE 行里的工具名。
+func restoreClaudeOAuthToolNamesFromStreamLine(line []byte, prefix string, prefixDisabled bool, reverseMap map[string]string) []byte {
+	if !prefixDisabled {
+		line = stripClaudeToolPrefixFromStreamLine(line, prefix)
+	}
+	return reverseRemapOAuthToolNamesFromStreamLine(line, reverseMap)
+}
+
 // remapOAuthToolNames 会把常见第三方工具名改写成 Claude Code 风格，
 // 并同步修正 tool_choice 与消息历史里的工具引用，尽量降低 OAuth 请求的第三方指纹。
-// 返回值中的 renamed 用于告诉调用方这次是否真的发生过改名，避免响应侧无条件 reverse。
-func remapOAuthToolNames(body []byte) ([]byte, bool) {
-	renamed := false
+// 返回的 reverseMap 只记录本次实际发生的改名，响应侧只能回滚这些工具名。
+func remapOAuthToolNames(body []byte) ([]byte, map[string]string) {
+	reverseMap := make(map[string]string, len(oauthToolRenameMap))
+	recordRename := func(original, renamed string) {
+		if _, exists := reverseMap[renamed]; !exists {
+			reverseMap[renamed] = original
+		}
+	}
 	tools := gjson.GetBytes(body, "tools")
 	if tools.Exists() && tools.IsArray() {
 		var toolsJSON strings.Builder
@@ -1115,7 +1130,7 @@ func remapOAuthToolNames(body []byte) ([]byte, bool) {
 				updatedTool, err := sjson.Set(toolJSON, "name", newName)
 				if err == nil {
 					toolJSON = updatedTool
-					renamed = true
+					recordRename(name, newName)
 				}
 			}
 
@@ -1136,13 +1151,13 @@ func remapOAuthToolNames(body []byte) ([]byte, bool) {
 			body, _ = sjson.DeleteBytes(body, "tool_choice")
 		} else if newName, ok := oauthToolRenameMap[toolName]; ok && newName != toolName {
 			body, _ = sjson.SetBytes(body, "tool_choice.name", newName)
-			renamed = true
+			recordRename(toolName, newName)
 		}
 	}
 
 	messages := gjson.GetBytes(body, "messages")
 	if !messages.Exists() || !messages.IsArray() {
-		return body, renamed
+		return body, reverseMap
 	}
 
 	messages.ForEach(func(msgIndex, msg gjson.Result) bool {
@@ -1157,14 +1172,14 @@ func remapOAuthToolNames(body []byte) ([]byte, bool) {
 				if newName, ok := oauthToolRenameMap[name]; ok && newName != name {
 					path := fmt.Sprintf("messages.%d.content.%d.name", msgIndex.Int(), contentIndex.Int())
 					body, _ = sjson.SetBytes(body, path, newName)
-					renamed = true
+					recordRename(name, newName)
 				}
 			case "tool_reference":
 				toolName := part.Get("tool_name").String()
 				if newName, ok := oauthToolRenameMap[toolName]; ok && newName != toolName {
 					path := fmt.Sprintf("messages.%d.content.%d.tool_name", msgIndex.Int(), contentIndex.Int())
 					body, _ = sjson.SetBytes(body, path, newName)
-					renamed = true
+					recordRename(toolName, newName)
 				}
 			case "tool_result":
 				nestedContent := part.Get("content")
@@ -1175,7 +1190,7 @@ func remapOAuthToolNames(body []byte) ([]byte, bool) {
 							if newName, ok := oauthToolRenameMap[nestedToolName]; ok && newName != nestedToolName {
 								nestedPath := fmt.Sprintf("messages.%d.content.%d.content.%d.tool_name", msgIndex.Int(), contentIndex.Int(), nestedIndex.Int())
 								body, _ = sjson.SetBytes(body, nestedPath, newName)
-								renamed = true
+								recordRename(nestedToolName, newName)
 							}
 						}
 						return true
@@ -1187,12 +1202,14 @@ func remapOAuthToolNames(body []byte) ([]byte, bool) {
 		return true
 	})
 
-	return body, renamed
+	return body, reverseMap
 }
 
-// reverseRemapOAuthToolNames 会把上游返回的 Claude Code 工具名再改回下游原来的风格，
-// 避免代理外部调用方看到陌生的 TitleCase 名称。
-func reverseRemapOAuthToolNames(body []byte) []byte {
+// reverseRemapOAuthToolNames 会按请求级 reverse map 还原上游返回的工具名。
+func reverseRemapOAuthToolNames(body []byte, reverseMap map[string]string) []byte {
+	if len(reverseMap) == 0 {
+		return body
+	}
 	content := gjson.GetBytes(body, "content")
 	if !content.Exists() || !content.IsArray() {
 		return body
@@ -1201,13 +1218,13 @@ func reverseRemapOAuthToolNames(body []byte) []byte {
 		switch part.Get("type").String() {
 		case "tool_use":
 			name := part.Get("name").String()
-			if originalName, ok := oauthToolRenameReverseMap[name]; ok {
+			if originalName, ok := reverseMap[name]; ok {
 				path := fmt.Sprintf("content.%d.name", index.Int())
 				body, _ = sjson.SetBytes(body, path, originalName)
 			}
 		case "tool_reference":
 			toolName := part.Get("tool_name").String()
-			if originalName, ok := oauthToolRenameReverseMap[toolName]; ok {
+			if originalName, ok := reverseMap[toolName]; ok {
 				path := fmt.Sprintf("content.%d.tool_name", index.Int())
 				body, _ = sjson.SetBytes(body, path, originalName)
 			}
@@ -1217,7 +1234,11 @@ func reverseRemapOAuthToolNames(body []byte) []byte {
 	return body
 }
 
-func reverseRemapOAuthToolNamesFromStreamLine(line []byte) []byte {
+// reverseRemapOAuthToolNamesFromStreamLine 会按请求级 reverse map 还原 SSE 行里的工具名。
+func reverseRemapOAuthToolNamesFromStreamLine(line []byte, reverseMap map[string]string) []byte {
+	if len(reverseMap) == 0 {
+		return line
+	}
 	payload := jsonPayload(line)
 	if len(payload) == 0 || !gjson.ValidBytes(payload) {
 		return line
@@ -1234,14 +1255,14 @@ func reverseRemapOAuthToolNamesFromStreamLine(line []byte) []byte {
 	switch contentBlock.Get("type").String() {
 	case "tool_use":
 		name := contentBlock.Get("name").String()
-		originalName, ok := oauthToolRenameReverseMap[name]
+		originalName, ok := reverseMap[name]
 		if !ok {
 			return line
 		}
 		updated, err = sjson.SetBytes(payload, "content_block.name", originalName)
 	case "tool_reference":
 		toolName := contentBlock.Get("tool_name").String()
-		originalName, ok := oauthToolRenameReverseMap[toolName]
+		originalName, ok := reverseMap[toolName]
 		if !ok {
 			return line
 		}

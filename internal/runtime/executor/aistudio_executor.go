@@ -262,7 +262,9 @@ func (e *AIStudioExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth
 			if event.Err != nil {
 				recordAPIResponseError(ctx, e.cfg, event.Err)
 				reporter.publishFailure(ctx)
-				out <- cliproxyexecutor.StreamChunk{Err: fmt.Errorf("wsrelay: %v", event.Err)}
+				if !sendStreamChunk(ctx, out, cliproxyexecutor.StreamChunk{Err: fmt.Errorf("wsrelay: %v", event.Err)}) {
+					return false
+				}
 				return false
 			}
 			switch event.Type {
@@ -280,7 +282,9 @@ func (e *AIStudioExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth
 					}
 					lines := sdktranslator.TranslateStream(ctx, body.toFormat, opts.SourceFormat, req.Model, opts.OriginalRequest, translatedReq, filtered, &param)
 					for i := range lines {
-						out <- cliproxyexecutor.StreamChunk{Payload: ensureColonSpacedJSON([]byte(lines[i]))}
+						if !sendStreamChunk(ctx, out, cliproxyexecutor.StreamChunk{Payload: ensureColonSpacedJSON([]byte(lines[i]))}) {
+							return false
+						}
 					}
 					break
 				}
@@ -296,14 +300,18 @@ func (e *AIStudioExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth
 				}
 				lines := sdktranslator.TranslateStream(ctx, body.toFormat, opts.SourceFormat, req.Model, opts.OriginalRequest, translatedReq, event.Payload, &param)
 				for i := range lines {
-					out <- cliproxyexecutor.StreamChunk{Payload: ensureColonSpacedJSON([]byte(lines[i]))}
+					if !sendStreamChunk(ctx, out, cliproxyexecutor.StreamChunk{Payload: ensureColonSpacedJSON([]byte(lines[i]))}) {
+						return false
+					}
 				}
 				reporter.publish(ctx, parseGeminiUsage(event.Payload))
 				return false
 			case wsrelay.MessageTypeError:
 				recordAPIResponseError(ctx, e.cfg, event.Err)
 				reporter.publishFailure(ctx)
-				out <- cliproxyexecutor.StreamChunk{Err: fmt.Errorf("wsrelay: %v", event.Err)}
+				if !sendStreamChunk(ctx, out, cliproxyexecutor.StreamChunk{Err: fmt.Errorf("wsrelay: %v", event.Err)}) {
+					return false
+				}
 				return false
 			}
 			return true

@@ -25,6 +25,7 @@ type ConvertAnthropicResponseToOpenAIParams struct {
 	CreatedAt    int64
 	ResponseID   string
 	FinishReason string
+	Usage        claudeUsageTokens
 	// Tool calls accumulator for streaming
 	ToolCallsAccumulator map[int]*ToolCallAccumulator
 }
@@ -36,16 +37,45 @@ type ToolCallAccumulator struct {
 	Arguments strings.Builder
 }
 
-func calculateClaudeUsageTokens(usage gjson.Result) (promptTokens, completionTokens, totalTokens, cachedTokens int64) {
-	inputTokens := usage.Get("input_tokens").Int()
-	completionTokens = usage.Get("output_tokens").Int()
-	cachedTokens = usage.Get("cache_read_input_tokens").Int()
-	cacheCreationInputTokens := usage.Get("cache_creation_input_tokens").Int()
+type claudeUsageTokens struct {
+	InputTokens              int64
+	OutputTokens             int64
+	CacheReadInputTokens     int64
+	CacheCreationInputTokens int64
+	HasUsage                 bool
+}
 
-	promptTokens = inputTokens + cacheCreationInputTokens + cachedTokens
+func (u *claudeUsageTokens) Merge(usage gjson.Result) {
+	if !usage.Exists() || usage.Type == gjson.Null {
+		return
+	}
+	u.HasUsage = true
+	if inputTokens := usage.Get("input_tokens"); inputTokens.Exists() {
+		u.InputTokens = inputTokens.Int()
+	}
+	if outputTokens := usage.Get("output_tokens"); outputTokens.Exists() {
+		u.OutputTokens = outputTokens.Int()
+	}
+	if cachedTokens := usage.Get("cache_read_input_tokens"); cachedTokens.Exists() {
+		u.CacheReadInputTokens = cachedTokens.Int()
+	}
+	if createdTokens := usage.Get("cache_creation_input_tokens"); createdTokens.Exists() {
+		u.CacheCreationInputTokens = createdTokens.Int()
+	}
+}
+
+func (u claudeUsageTokens) OpenAIUsage() (promptTokens, completionTokens, totalTokens, cachedTokens int64) {
+	promptTokens = u.InputTokens + u.CacheCreationInputTokens + u.CacheReadInputTokens
+	completionTokens = u.OutputTokens
 	totalTokens = promptTokens + completionTokens
-
+	cachedTokens = u.CacheReadInputTokens
 	return promptTokens, completionTokens, totalTokens, cachedTokens
+}
+
+func calculateClaudeUsageTokens(usage gjson.Result) (promptTokens, completionTokens, totalTokens, cachedTokens int64) {
+	tokens := claudeUsageTokens{}
+	tokens.Merge(usage)
+	return tokens.OpenAIUsage()
 }
 
 // ConvertClaudeResponseToOpenAI converts Claude Code streaming response format to OpenAI Chat Completions format.
@@ -107,6 +137,8 @@ func ConvertClaudeResponseToOpenAI(_ context.Context, modelName string, original
 
 			// Set initial role to assistant for the response
 			template, _ = sjson.Set(template, "choices.0.delta.role", "assistant")
+			// message_start 只给输入与缓存 token，先缓存起来等待 message_delta 补齐输出 token。
+			(*param).(*ConvertAnthropicResponseToOpenAIParams).Usage.Merge(message.Get("usage"))
 
 			// Initialize tool calls accumulator for tracking tool call progress
 			if (*param).(*ConvertAnthropicResponseToOpenAIParams).ToolCallsAccumulator == nil {
@@ -215,7 +247,9 @@ func ConvertClaudeResponseToOpenAI(_ context.Context, modelName string, original
 
 		// Handle usage information for token counts
 		if usage := root.Get("usage"); usage.Exists() {
-			promptTokens, completionTokens, totalTokens, cachedTokens := calculateClaudeUsageTokens(usage)
+			usageTokens := &(*param).(*ConvertAnthropicResponseToOpenAIParams).Usage
+			usageTokens.Merge(usage)
+			promptTokens, completionTokens, totalTokens, cachedTokens := usageTokens.OpenAIUsage()
 			template, _ = sjson.Set(template, "usage.prompt_tokens", promptTokens)
 			template, _ = sjson.Set(template, "usage.completion_tokens", completionTokens)
 			template, _ = sjson.Set(template, "usage.total_tokens", totalTokens)
@@ -296,6 +330,7 @@ func ConvertClaudeResponseToOpenAINonStream(_ context.Context, _ string, origina
 	var stopReason string
 	var contentParts []string
 	var reasoningParts []string
+	usageTokens := claudeUsageTokens{}
 	toolCallsAccumulator := make(map[int]*ToolCallAccumulator)
 
 	for _, chunk := range chunks {
@@ -309,6 +344,7 @@ func ConvertClaudeResponseToOpenAINonStream(_ context.Context, _ string, origina
 				messageID = message.Get("id").String()
 				model = message.Get("model").String()
 				createdAt = time.Now().Unix()
+				usageTokens.Merge(message.Get("usage"))
 			}
 
 		case "content_block_start":
@@ -371,13 +407,17 @@ func ConvertClaudeResponseToOpenAINonStream(_ context.Context, _ string, origina
 				}
 			}
 			if usage := root.Get("usage"); usage.Exists() {
-				promptTokens, completionTokens, totalTokens, cachedTokens := calculateClaudeUsageTokens(usage)
-				out, _ = sjson.Set(out, "usage.prompt_tokens", promptTokens)
-				out, _ = sjson.Set(out, "usage.completion_tokens", completionTokens)
-				out, _ = sjson.Set(out, "usage.total_tokens", totalTokens)
-				out, _ = sjson.Set(out, "usage.prompt_tokens_details.cached_tokens", cachedTokens)
+				usageTokens.Merge(usage)
 			}
 		}
+	}
+
+	if usageTokens.HasUsage {
+		promptTokens, completionTokens, totalTokens, cachedTokens := usageTokens.OpenAIUsage()
+		out, _ = sjson.Set(out, "usage.prompt_tokens", promptTokens)
+		out, _ = sjson.Set(out, "usage.completion_tokens", completionTokens)
+		out, _ = sjson.Set(out, "usage.total_tokens", totalTokens)
+		out, _ = sjson.Set(out, "usage.prompt_tokens_details.cached_tokens", cachedTokens)
 	}
 
 	// Set basic response fields including message ID, creation time, and model

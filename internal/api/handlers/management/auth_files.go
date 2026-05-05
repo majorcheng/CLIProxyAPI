@@ -2870,25 +2870,19 @@ func performGeminiCLISetup(ctx context.Context, httpClient *http.Client, storage
 				}
 			}
 
-			finalProjectID := projectID
-			if responseProjectID != "" {
-				if explicitProject && !strings.EqualFold(responseProjectID, projectID) {
-					// Check if this is a free user (gen-lang-client projects or free/legacy tier)
-					isFreeUser := strings.HasPrefix(projectID, "gen-lang-client-") ||
-						strings.EqualFold(tierID, "FREE") ||
-						strings.EqualFold(tierID, "LEGACY")
-
-					if isFreeUser {
-						// For free users, use backend project ID for preview model access
-						log.Infof("Gemini onboarding: frontend project %s maps to backend project %s", projectID, responseProjectID)
-						log.Infof("Using backend project ID: %s (recommended for preview model access)", responseProjectID)
-						finalProjectID = responseProjectID
-					} else {
-						// Pro users: keep requested project ID (original behavior)
-						log.Warnf("Gemini onboarding returned project %s instead of requested %s; keeping requested project ID.", responseProjectID, projectID)
-					}
+			finalProjectID := misc.ResolveGeminiCLIProjectID(misc.GeminiCLIProjectSelection{
+				RequestedProjectID: projectID,
+				ResponseProjectID:  responseProjectID,
+				TierID:             tierID,
+				ExplicitProject:    explicitProject,
+			})
+			if responseProjectID != "" && explicitProject && !strings.EqualFold(responseProjectID, projectID) {
+				if strings.EqualFold(finalProjectID, responseProjectID) {
+					// 免费或 legacy 账号需要使用后端项目访问 preview 模型，保证管理端与 CLI 登录结果一致。
+					log.Infof("Gemini onboarding: requested project %s maps to backend project %s", projectID, responseProjectID)
+					log.Infof("Using backend project ID: %s", responseProjectID)
 				} else {
-					finalProjectID = responseProjectID
+					log.Warnf("Gemini onboarding returned project %s instead of requested %s; keeping requested project ID.", responseProjectID, projectID)
 				}
 			}
 

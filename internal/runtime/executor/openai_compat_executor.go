@@ -95,17 +95,19 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 	originalPayload := originalPayloadSource
 	originalTranslated := sdktranslator.TranslateRequest(from, to, baseModel, originalPayload, opts.Stream)
 	translated := sdktranslator.TranslateRequest(from, to, baseModel, req.Payload, opts.Stream)
+
+	payloadConfigSource := originalTranslated
+	translated, payloadConfigSource, err = applyOpenAICompatThinkingPayloads(translated, payloadConfigSource, req.Model, from.String(), to.String(), e.Identifier())
+	if err != nil {
+		return resp, err
+	}
+
 	requestedModel := payloadRequestedModel(opts, req.Model)
-	translated = applyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", translated, originalTranslated, requestedModel, payloadRequestPath(opts))
+	translated = applyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", translated, payloadConfigSource, requestedModel, payloadRequestPath(opts))
 	if opts.Alt == "responses/compact" {
 		if updated, errDelete := sjson.DeleteBytes(translated, "stream"); errDelete == nil {
 			translated = updated
 		}
-	}
-
-	translated, err = thinking.ApplyThinking(translated, req.Model, from.String(), to.String(), e.Identifier())
-	if err != nil {
-		return resp, err
 	}
 
 	url := strings.TrimSuffix(baseURL, "/") + endpoint
@@ -197,13 +199,15 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 	originalPayload := originalPayloadSource
 	originalTranslated := sdktranslator.TranslateRequest(from, to, baseModel, originalPayload, true)
 	translated := sdktranslator.TranslateRequest(from, to, baseModel, req.Payload, true)
-	requestedModel := payloadRequestedModel(opts, req.Model)
-	translated = applyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", translated, originalTranslated, requestedModel, payloadRequestPath(opts))
 
-	translated, err = thinking.ApplyThinking(translated, req.Model, from.String(), to.String(), e.Identifier())
+	payloadConfigSource := originalTranslated
+	translated, payloadConfigSource, err = applyOpenAICompatThinkingPayloads(translated, payloadConfigSource, req.Model, from.String(), to.String(), e.Identifier())
 	if err != nil {
 		return nil, err
 	}
+
+	requestedModel := payloadRequestedModel(opts, req.Model)
+	translated = applyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", translated, payloadConfigSource, requestedModel, payloadRequestPath(opts))
 
 	// Request usage data in the final streaming chunk so that token statistics
 	// are captured even when the upstream is an OpenAI-compatible provider.
@@ -272,37 +276,68 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 		scanner := bufio.NewScanner(httpResp.Body)
 		scanner.Buffer(nil, 52_428_800) // 50MB
 		var param any
+		sawTerminalDone := false
 		for scanner.Scan() {
 			line := scanner.Bytes()
 			appendAPIResponseChunk(ctx, e.cfg, line)
-			if detail, ok := parseOpenAIStreamUsage(line); ok {
+			trimmedLine := bytes.TrimSpace(line)
+			if detail, ok := parseOpenAIStreamUsage(trimmedLine); ok {
 				reporter.publish(ctx, detail)
 			}
-			if len(line) == 0 {
+			if len(trimmedLine) == 0 {
 				continue
 			}
 
-			if !bytes.HasPrefix(line, []byte("data:")) {
+			if !bytes.HasPrefix(trimmedLine, []byte("data:")) {
+				if bytes.Equal(trimmedLine, []byte("[DONE]")) {
+					sawTerminalDone = true
+					chunks := sdktranslator.TranslateStream(ctx, to, from, req.Model, opts.OriginalRequest, translated, []byte("data: [DONE]"), &param)
+					for i := range chunks {
+						if !sendStreamChunk(ctx, out, cliproxyexecutor.StreamChunk{Payload: []byte(chunks[i])}) {
+							return
+						}
+					}
+					continue
+				}
+				if bytes.HasPrefix(trimmedLine, []byte(":")) || bytes.HasPrefix(trimmedLine, []byte("event:")) ||
+					bytes.HasPrefix(trimmedLine, []byte("id:")) || bytes.HasPrefix(trimmedLine, []byte("retry:")) {
+					continue
+				}
+				if bytes.HasPrefix(trimmedLine, []byte("{")) || bytes.HasPrefix(trimmedLine, []byte("[")) {
+					streamErr := statusErr{code: http.StatusBadGateway, msg: string(trimmedLine)}
+					recordAPIResponseError(ctx, e.cfg, streamErr)
+					reporter.publishFailure(ctx)
+					_ = sendStreamChunk(ctx, out, cliproxyexecutor.StreamChunk{Err: streamErr})
+					return
+				}
 				continue
 			}
 
-			// OpenAI-compatible streams are SSE: lines typically prefixed with "data: ".
-			// Pass through translator; it yields one or more chunks for the target schema.
-			chunks := sdktranslator.TranslateStream(ctx, to, from, req.Model, opts.OriginalRequest, translated, bytes.Clone(line), &param)
+			if bytes.Equal(bytes.TrimSpace(bytes.TrimPrefix(trimmedLine, []byte("data:"))), []byte("[DONE]")) {
+				sawTerminalDone = true
+			}
+			// OpenAI-compatible streams must use SSE data lines.
+			chunks := sdktranslator.TranslateStream(ctx, to, from, req.Model, opts.OriginalRequest, translated, bytes.Clone(trimmedLine), &param)
 			for i := range chunks {
-				out <- cliproxyexecutor.StreamChunk{Payload: []byte(chunks[i])}
+				if !sendStreamChunk(ctx, out, cliproxyexecutor.StreamChunk{Payload: []byte(chunks[i])}) {
+					return
+				}
 			}
 		}
 		if errScan := scanner.Err(); errScan != nil {
 			recordAPIResponseError(ctx, e.cfg, errScan)
 			reporter.publishFailure(ctx)
-			out <- cliproxyexecutor.StreamChunk{Err: errScan}
-		} else {
+			if !sendStreamChunk(ctx, out, cliproxyexecutor.StreamChunk{Err: errScan}) {
+				return
+			}
+		} else if !sawTerminalDone {
 			// 即使上游没有显式发出终止 [DONE]，也补一个合成的 DONE，
 			// 让 translator 有机会在流尾统一补发 response.completed。
 			chunks := sdktranslator.TranslateStream(ctx, to, from, req.Model, opts.OriginalRequest, translated, []byte("data: [DONE]"), &param)
 			for i := range chunks {
-				out <- cliproxyexecutor.StreamChunk{Payload: []byte(chunks[i])}
+				if !sendStreamChunk(ctx, out, cliproxyexecutor.StreamChunk{Payload: []byte(chunks[i])}) {
+					return
+				}
 			}
 		}
 		// Ensure we record the request if no usage chunk was ever seen
@@ -338,6 +373,23 @@ func (e *OpenAICompatExecutor) CountTokens(ctx context.Context, auth *cliproxyau
 	usageJSON := buildOpenAIUsageJSON(count)
 	translatedUsage := sdktranslator.TranslateTokenCount(ctx, to, from, count, usageJSON)
 	return cliproxyexecutor.Response{Payload: []byte(translatedUsage)}, nil
+}
+
+// applyOpenAICompatThinkingPayloads 同步处理实际 payload 与 default 判缺源。
+// default 只能补真正缺失的字段，不能把模型后缀推导出的 thinking 配置当成缺失值覆盖。
+func applyOpenAICompatThinkingPayloads(payload, source []byte, model, fromFormat, toFormat, providerKey string) ([]byte, []byte, error) {
+	updatedPayload, err := thinking.ApplyThinking(payload, model, fromFormat, toFormat, providerKey)
+	if err != nil {
+		return nil, nil, err
+	}
+	if len(source) == 0 {
+		return updatedPayload, source, nil
+	}
+	updatedSource, err := thinking.ApplyThinking(source, model, fromFormat, toFormat, providerKey)
+	if err != nil {
+		return nil, nil, err
+	}
+	return updatedPayload, updatedSource, nil
 }
 
 // Refresh is a no-op for API-key based compatibility providers.

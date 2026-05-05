@@ -942,9 +942,15 @@ func TestRemapOAuthToolNames_RenamesToolsChoiceAndMessages(t *testing.T) {
 		]
 	}`)
 
-	out, renamed := remapOAuthToolNames(input)
-	if !renamed {
-		t.Fatalf("renamed = false, want true")
+	out, reverseMap := remapOAuthToolNames(input)
+	if len(reverseMap) == 0 {
+		t.Fatalf("reverseMap is empty, want renamed tools")
+	}
+	if got := reverseMap["Bash"]; got != "bash" {
+		t.Fatalf("reverseMap[Bash] = %q, want %q", got, "bash")
+	}
+	if got := reverseMap["Question"]; got != "question" {
+		t.Fatalf("reverseMap[Question] = %q, want %q", got, "question")
 	}
 
 	if got := gjson.GetBytes(out, "tools.0.name").String(); got != "Bash" {
@@ -1009,7 +1015,7 @@ func TestStripClaudeToolPrefixFromStreamLine(t *testing.T) {
 
 func TestReverseRemapOAuthToolNamesFromStreamLine(t *testing.T) {
 	line := []byte(`data: {"type":"content_block_start","content_block":{"type":"tool_use","name":"Question","id":"t1"},"index":0}`)
-	out := reverseRemapOAuthToolNamesFromStreamLine(line)
+	out := reverseRemapOAuthToolNamesFromStreamLine(line, map[string]string{"Question": "question"})
 
 	payload := bytes.TrimSpace(out)
 	if bytes.HasPrefix(payload, []byte("data:")) {
@@ -1054,19 +1060,16 @@ func TestApplyClaudeToolPrefix_NestedToolReference(t *testing.T) {
 func TestRemapOAuthToolNames_TitleCase_NoReverseNeeded(t *testing.T) {
 	body := []byte(`{"tools":[{"name":"Bash","description":"Run shell commands","input_schema":{"type":"object","properties":{"cmd":{"type":"string"}}}}],"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}`)
 
-	out, renamed := remapOAuthToolNames(body)
-	if renamed {
-		t.Fatalf("renamed = true, want false")
+	out, reverseMap := remapOAuthToolNames(body)
+	if len(reverseMap) != 0 {
+		t.Fatalf("reverseMap = %#v, want empty", reverseMap)
 	}
 	if got := gjson.GetBytes(out, "tools.0.name").String(); got != "Bash" {
 		t.Fatalf("tools.0.name = %q, want %q", got, "Bash")
 	}
 
 	resp := []byte(`{"content":[{"type":"tool_use","id":"toolu_01","name":"Bash","input":{"cmd":"ls"}}]}`)
-	reversed := resp
-	if renamed {
-		reversed = reverseRemapOAuthToolNames(resp)
-	}
+	reversed := reverseRemapOAuthToolNames(resp, reverseMap)
 	if got := gjson.GetBytes(reversed, "content.0.name").String(); got != "Bash" {
 		t.Fatalf("content.0.name = %q, want %q", got, "Bash")
 	}
@@ -1075,21 +1078,67 @@ func TestRemapOAuthToolNames_TitleCase_NoReverseNeeded(t *testing.T) {
 func TestRemapOAuthToolNames_Lowercase_ReverseApplied(t *testing.T) {
 	body := []byte(`{"tools":[{"name":"bash","description":"Run shell commands","input_schema":{"type":"object","properties":{"cmd":{"type":"string"}}}}],"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}`)
 
-	out, renamed := remapOAuthToolNames(body)
-	if !renamed {
-		t.Fatalf("renamed = false, want true")
+	out, reverseMap := remapOAuthToolNames(body)
+	if got := reverseMap["Bash"]; got != "bash" {
+		t.Fatalf("reverseMap[Bash] = %q, want %q", got, "bash")
 	}
 	if got := gjson.GetBytes(out, "tools.0.name").String(); got != "Bash" {
 		t.Fatalf("tools.0.name = %q, want %q", got, "Bash")
 	}
 
 	resp := []byte(`{"content":[{"type":"tool_use","id":"toolu_01","name":"Bash","input":{"cmd":"ls"}}]}`)
-	reversed := resp
-	if renamed {
-		reversed = reverseRemapOAuthToolNames(resp)
-	}
+	reversed := reverseRemapOAuthToolNames(resp, reverseMap)
 	if got := gjson.GetBytes(reversed, "content.0.name").String(); got != "bash" {
 		t.Fatalf("content.0.name = %q, want %q", got, "bash")
+	}
+}
+
+func TestRemapOAuthToolNames_ReverseOnlyForwardRenamedTools(t *testing.T) {
+	body := []byte(`{"tools":[{"name":"Bash"},{"name":"glob"}],"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}`)
+
+	out, reverseMap := remapOAuthToolNames(body)
+	if got := gjson.GetBytes(out, "tools.0.name").String(); got != "Bash" {
+		t.Fatalf("tools.0.name = %q, want %q", got, "Bash")
+	}
+	if got := gjson.GetBytes(out, "tools.1.name").String(); got != "Glob" {
+		t.Fatalf("tools.1.name = %q, want %q", got, "Glob")
+	}
+	if _, exists := reverseMap["Bash"]; exists {
+		t.Fatalf("reverseMap should not contain Bash: %#v", reverseMap)
+	}
+	if got := reverseMap["Glob"]; got != "glob" {
+		t.Fatalf("reverseMap[Glob] = %q, want %q", got, "glob")
+	}
+
+	resp := []byte(`{"content":[{"type":"tool_use","id":"toolu_01","name":"Bash","input":{}},{"type":"tool_use","id":"toolu_02","name":"Glob","input":{}}]}`)
+	reversed := reverseRemapOAuthToolNames(resp, reverseMap)
+	if got := gjson.GetBytes(reversed, "content.0.name").String(); got != "Bash" {
+		t.Fatalf("content.0.name = %q, want %q", got, "Bash")
+	}
+	if got := gjson.GetBytes(reversed, "content.1.name").String(); got != "glob" {
+		t.Fatalf("content.1.name = %q, want %q", got, "glob")
+	}
+}
+
+func TestReverseRemapOAuthToolNamesFromStreamLine_ReverseOnlyForwardRenamedTools(t *testing.T) {
+	reverseMap := map[string]string{"Glob": "glob"}
+
+	unchangedLine := []byte(`data: {"type":"content_block_start","content_block":{"type":"tool_use","name":"Bash","id":"toolu_01"},"index":0}`)
+	unchangedPayload := bytes.TrimSpace(reverseRemapOAuthToolNamesFromStreamLine(unchangedLine, reverseMap))
+	if bytes.HasPrefix(unchangedPayload, []byte("data:")) {
+		unchangedPayload = bytes.TrimSpace(unchangedPayload[len("data:"):])
+	}
+	if got := gjson.GetBytes(unchangedPayload, "content_block.name").String(); got != "Bash" {
+		t.Fatalf("unchanged content_block.name = %q, want %q", got, "Bash")
+	}
+
+	renamedLine := []byte(`data: {"type":"content_block_start","content_block":{"type":"tool_use","name":"Glob","id":"toolu_02"},"index":1}`)
+	renamedPayload := bytes.TrimSpace(reverseRemapOAuthToolNamesFromStreamLine(renamedLine, reverseMap))
+	if bytes.HasPrefix(renamedPayload, []byte("data:")) {
+		renamedPayload = bytes.TrimSpace(renamedPayload[len("data:"):])
+	}
+	if got := gjson.GetBytes(renamedPayload, "content_block.name").String(); got != "glob" {
+		t.Fatalf("renamed content_block.name = %q, want %q", got, "glob")
 	}
 }
 

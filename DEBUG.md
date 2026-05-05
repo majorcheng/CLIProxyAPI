@@ -303,3 +303,82 @@
 - 新增回归测试：
   - `internal/translator/claude/openai/responses/claude_openai-responses_request_test.go::TestConvertOpenAIResponsesRequestToClaude_PreservesRawToolResultArrayWhenPartIsUnsupported`
   - `internal/translator/claude/openai/responses/claude_openai-responses_request_test.go::TestConvertOpenAIResponsesRequestToClaude_StripsFileDataURLPrefix`
+
+### Review Follow-up: v6.10.5/v6.10.6 OpenAI Compat thinking default 与 Claude refresh singleflight 上下文回归
+
+#### Observations
+- `internal/runtime/executor/openai_compat_executor.go::Execute` 与 `ExecuteStream` 先对 `translated` 执行 `thinking.ApplyThinking(...)`，随后把未经过 thinking 的 `originalTranslated` 传给 `applyPayloadConfigWithRoot(...)` 作为 default 缺字段判断源。
+- `applyPayloadDefaultRulesWithRoot(...)` / `applyPayloadDefaultRawRulesWithRoot(...)` 只看 `source` 是否存在字段；因此模型后缀 `(high)` 注入到 `translated.reasoning_effort` 后，仍会被 `payload.default.reasoning_effort=low` 判定为“原始缺失”并覆盖。
+- `internal/auth/claude/anthropic_auth.go::RefreshTokens` 当前用 `singleflight.Do(...)` 闭包捕获第一个调用者的 `ctx`；同一 key 后续等待者会共享第一个 HTTP 请求的取消和 deadline。
+- 现有测试覆盖了 payload override 胜过 thinking suffix、Claude refresh 并发去重、deadline 返回，但缺少“payload default 不覆盖 suffix”和“第一个等待者取消不拖死后续等待者”的回归用例。
+
+#### Hypotheses
+- H1：OpenAI Compat 回归来自 payload default 的 source 没同步 thinking suffix。（ROOT）Supports：源码中 `translated` 已写入 suffix，`originalTranslated` 未写入；default helper 按 source 判缺失。Conflicts：override 规则仍应继续覆盖 suffix。Test：配置 default low，请求 `custom-openai(high)`，断言上游 body 仍是 high；同时保留 override low 测试。
+- H2：OpenAI Compat 应该把 `thinking.ApplyThinking(...)` 移回 payload config 之后。Supports：旧 default 语义不会覆盖 suffix。Conflicts：这会破坏本轮要保留的“payload override 胜过 suffix”语义。Test：现有 `TestOpenAICompatExecutorPayloadOverrideWinsOverThinkingSuffix` 会约束不能回退。
+- H3：Claude refresh 回归来自 singleflight 执行体继承了第一个调用者 ctx。（ROOT）Supports：`singleflight.Do` 闭包直接捕获 `ctx`；Go singleflight 只运行第一个闭包。Conflicts：无。Test：第一个调用者 10ms 超时，第二个 background 等待同一 refresh token，释放上游后第二个必须成功且只有一次上游调用。
+- H4：Claude refresh 可以通过把 deadline 拼进 singleflight key 规避。Supports：不同 deadline 不再互相影响。Conflicts：手动 cancel 的 context 仍会绑架同 key 无 deadline 等待者，也会明显削弱并发去重。Test：手动取消首个 caller 时仍会失败。
+
+#### Experiments
+- E1：新增 OpenAI Compat 非流式 default/suffix 回归测试。预期旧实现得到 `reasoning_effort=low`，修复后得到 `high`。
+- E2：新增 OpenAI Compat 流式 default/suffix 回归测试。预期旧实现得到 `reasoning_effort=low`，修复后得到 `high`。
+- E3：新增 Claude refresh singleflight 上下文回归测试。预期旧实现中第二个等待者会收到第一个调用者的 deadline 错误；修复后第一个按自身 ctx 返回 deadline，第二个继续等待并拿到 token。
+
+#### Root Cause
+- OpenAI Compat 的根因是 suffix thinking 写在 `translated` 上，但 payload default 的缺字段判断仍读取未注入 suffix 的 `originalTranslated`。
+- Claude refresh 的根因是 singleflight 执行体继承了首个调用者 ctx，把共享刷新请求生命周期绑定到了第一个等待者。
+
+#### Fix Plan
+- OpenAI Compat：对 `originalTranslated` 同步执行 `thinking.ApplyThinking(...)`，仅作为 payload default 缺字段判断源；`translated` 仍先 apply thinking 再套 payload config，保持 override 可以覆盖 suffix。
+- Claude refresh：改用 `singleflight.DoChan(...)`，共享刷新执行使用内部有界 context，调用方只按自己的 `ctx` 等待结果；任一等待者取消只影响自身返回，不取消共享刷新执行。
+- 补上述三个回归测试，并跑受影响包验证与 `git diff --check`。
+
+#### Fix Implemented
+- OpenAI Compat 新增 `applyOpenAICompatThinkingPayloads(...)`，同时对实际上游 payload 和 payload default 判缺 source 执行 `thinking.ApplyThinking(...)`。
+- `Execute` / `ExecuteStream` 继续保持“thinking 后再套 payload config”的顺序，因此 payload override 仍能覆盖 suffix；但 default 现在会看到 suffix 注入的字段，不会把 `(high)` 改回默认 `low`。
+- Claude refresh 从 `singleflight.Do(...)` 改为 `singleflight.DoChan(...)`；共享 refresh HTTP 执行使用 `claudeRefreshSingleflightTimeout` 控制的内部 context，各调用方通过自己的 `ctx` select 等待结果。
+- 新增回归测试：
+  - `TestOpenAICompatExecutorPayloadDefaultDoesNotOverrideThinkingSuffix`
+  - `TestOpenAICompatExecutorStreamPayloadDefaultDoesNotOverrideThinkingSuffix`
+  - `TestRefreshTokens_DoesNotShareFirstCallerContext`
+- 验证通过：
+  - `timeout 60s go test ./internal/runtime/executor -run 'TestOpenAICompatExecutor(PayloadOverrideWinsOverThinkingSuffix|PayloadDefaultDoesNotOverrideThinkingSuffix|StreamPayloadDefaultDoesNotOverrideThinkingSuffix)' -count=1`
+  - `timeout 60s go test ./internal/auth/claude -run 'TestRefreshTokens_(DoesNotShareFirstCallerContext|DeduplicatesConcurrentRefresh|DoesNotDeduplicateDifferentProxyKeys)|TestRefreshTokensHonorsContextDeadline|TestRefreshTokensWithRetry_429BlocksImmediateReplay' -count=1`
+  - `timeout 60s go test ./internal/runtime/executor ./internal/auth/claude -count=1`
+  - `timeout 60s go test ./internal/cmd ./internal/api/handlers/management ./internal/misc ./internal/auth/claude ./internal/runtime/executor ./internal/api/modules/amp ./sdk/api/handlers/openai ./internal/translator/claude/openai/chat-completions ./internal/translator/openai/claude -count=1`
+  - `git diff --check && git diff --cached --check`
+
+### Review Follow-up: Gemini CLI 显式项目与 Responses SSE output 顺序回归
+
+#### Observations
+- `internal/misc/gemini_cli_project.go::ResolveGeminiCLIProjectID` 当前只要 `responseProjectID` 非空就返回后端项目，忽略了用户是否显式选择项目以及账号 tier。
+- `internal/cmd/login.go::performGeminiCLISetup` 旧逻辑在显式项目和返回项目不一致时，只有 `gen-lang-client-*`、`FREE`、`LEGACY` 这类免费/旧账号才切到后端项目；付费账号应保留用户显式选择的项目。
+- `sdk/api/handlers/openai/openai_responses_handlers.go::repairCompletedPayload` 当前先按 `output_index` 排序写入 indexed item，再把无 index item 追加到末尾；这会把实际 SSE 顺序里的 `reasoning -> message` 回填成 `message -> reasoning`。
+
+#### Hypotheses
+- H1：Gemini CLI 回归来自 helper 抽象丢失 `explicitProject` 和 `tierID` 两个决策输入。（ROOT）Supports：helper 只有两个字符串参数，无法区分付费显式项目与免费后端项目映射。Conflicts：自动发现和响应同项目场景仍可直接用 response。Test：显式付费项目 A、响应项目 B，断言最终仍是 A；显式 FREE/LEGACY 项目 A、响应项目 B，断言最终是 B。
+- H2：Responses SSE 顺序回归来自把 indexed/unindexed 分别存储并在 completed 时重新排序。（ROOT）Supports：源码按 sorted indexes 写完后再追加 unindexed。Conflicts：纯 indexed 且到达顺序等于 index 顺序的用例不会暴露。Test：先发送无 index reasoning，再发送带 index message，断言 completed.output 顺序仍是 reasoning、message。
+- H3：问题来自测试断言遗漏而非运行时代码。Supports：现有测试没有覆盖“无 index 在 indexed 前”的混合顺序，也没有覆盖显式付费项目。Conflicts：静态代码路径已经能直接证明运行时会重写/重排。Test：补回归测试应在旧实现上失败。
+
+#### Fix Plan
+- Gemini CLI：把项目选择 helper 改成显式输入对象，保留 `requestedProjectID`、`responseProjectID`、`explicitProject`、`tierID`，只在自动发现、响应同项目或免费/旧账号映射时采用后端项目；付费显式项目不被重写。
+- Responses SSE：改为按 `response.output_item.done` 到达顺序记录完整 output item 序列，completed.output 为空时直接按记录顺序回填，不再把 indexed/unindexed 分桶后重排。
+- 补两个回归测试并跑受影响包定向验证。
+
+#### Root Cause
+- Gemini CLI 的根因是项目选择 helper 在抽象时只保留 requested/response 两个项目 ID，丢掉了显式选择与 tier 这两个决定“是否允许改写项目”的关键上下文。
+- Responses SSE 的根因是 completed.output 回填阶段把 indexed 与 unindexed item 分桶重排，而不是使用真实 SSE 到达顺序。
+
+#### Fix Implemented
+- `ResolveGeminiCLIProjectID(...)` 改为接收 `GeminiCLIProjectSelection`，显式携带 requested project、response project、tier 和 explicit 标记；只有自动发现、同项目、FREE/LEGACY 或 `gen-lang-client-*` 场景会采用后端项目，付费显式项目保留用户选择。
+- CLI 登录与管理端 Gemini OAuth onboarding 调用点统一传入完整项目选择上下文，并在付费显式项目被 Google 返回不同项目时记录保留 requested project 的日志。
+- `responsesSSEFramer` 改为按 `response.output_item.done` 到达顺序保存 output item，completed.output 为空时按记录顺序回填，不再按 `output_index` 排序后追加 unindexed item。
+- 新增/调整回归测试：
+  - `TestResolveGeminiCLIProjectIDPreservesPaidExplicitProject`
+  - `TestResolveGeminiCLIProjectIDPrefersBackendProjectForFreeTier`
+  - `TestResolveGeminiCLIProjectIDUsesResponseForAutoDiscovery`
+  - `TestForwardResponsesStreamRepairsMixedDoneItemsInArrivalOrder`
+
+#### Validation
+- `timeout 60s go test ./internal/misc ./sdk/api/handlers/openai -run 'TestResolveGeminiCLIProjectID|TestForwardResponsesStreamRepairs' -count=1`
+- `timeout 60s go test ./internal/cmd ./internal/api/handlers/management ./internal/misc ./sdk/api/handlers/openai -count=1`
+- `git diff --check`

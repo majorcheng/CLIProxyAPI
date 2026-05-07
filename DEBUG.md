@@ -382,3 +382,45 @@
 - `timeout 60s go test ./internal/misc ./sdk/api/handlers/openai -run 'TestResolveGeminiCLIProjectID|TestForwardResponsesStreamRepairs' -count=1`
 - `timeout 60s go test ./internal/cmd ./internal/api/handlers/management ./internal/misc ./sdk/api/handlers/openai -count=1`
 - `git diff --check`
+
+### Review Follow-up: v6.10.9 Codex WebSocket upstream disconnect 边界回归
+
+#### Observations
+- `internal/runtime/executor/codex_websockets_executor.go::invalidateUpstreamConn` 当前对所有 reason 都调用 `notifyUpstreamDisconnect`，包括 `send_error` 重试、`upstream_error` 认证/额度状态错误、`unexpected_binary` 等路径。
+- `Execute` / `ExecuteStream` 中 `send_error` 分支会先 invalidate 旧 upstream conn，再用同一 execution session 立即重连重试；这属于可恢复路径，不应关闭 downstream websocket。
+- `/v1/responses/ws` handler 在 pinned auth 状态错误时依赖同一 downstream websocket 继续 failover；如果底层 invalidate 直接通知断连，客户端会在内部恢复前被踢掉。
+- `CodexWebsocketsExecutor` 当前 session map 绑定在 executor 实例上；`rebindExecutors()` 重新注册 executor 后，已有 downstream websocket 订阅旧 executor channel，而后续请求和断连发生在新 executor 实例上。
+
+#### Hypotheses
+- H1：P1 根因是 disconnect 通知挂在通用 invalidate helper 上，缺少“终局断连”语义区分。（ROOT）Supports：所有 reason 共用 `invalidateUpstreamConn`；review 明确指出 send retry 和 pinned failover 属于可恢复路径。Conflicts：idle upstream close 确实需要通知 downstream，否则会形成僵尸连接。Test：`send_error` invalidate 后 channel 不应收到信号；idle read loop 的 upstream close 应收到信号。
+- H2：P2 根因是 session/channel store 是 executor 实例字段，热重载替换 executor 后旧订阅和新执行路径使用不同 map。（ROOT）Supports：`NewCodexWebsocketsExecutor` 每次创建 `sessions: make(map...)`；`RegisterExecutor` 替换 old executor。Conflicts：未重绑场景下现有测试通过。Test：旧 executor 订阅 channel，模拟 CloseAll rebind 后用新 executor 通知，旧 channel 必须收到信号。
+- H3：只在 handler 侧每次请求重新订阅当前 executor 可以修 P2。Supports：能拿到新 executor。Conflicts：下游连接 idle 期间没有新请求时仍订阅旧 channel；无法覆盖真实 upstream idle disconnect。Test：idle 期间 rebind 后新 executor 通知旧订阅仍失败。
+
+#### Fix Plan
+- `invalidateUpstreamConn` 改为只负责移除/关闭 upstream conn，并返回是否实际 invalidated；不直接通知 downstream。
+- `readUpstreamLoop` 仅在没有 active request channel 时，把 upstream read error / unexpected binary 视为终局断连并通知 downstream；active request 场景交给请求执行链做 retry/failover/error 处理。
+- Codex WebSocket session store 改成进程级共享 store；`NewCodexWebsocketsExecutor` 绑定同一个 global store。
+- `CloseExecutionSession(__all_execution_sessions__)` 视为 executor replacement，不强制关闭共享 session，避免热重载中断已有 downstream websocket。
+- 补 P1/P2 回归测试并跑受影响包验证。
+
+#### Root Cause
+- P1 根因是把“关闭当前 upstream socket”的通用 helper 和“下游 websocket 必须终止”的终局事件绑定在一起；`send_error` 重试、状态错误 failover 都会复用 `invalidateUpstreamConn`，因此被误判成用户可见断线。
+- P2 根因是 upstream disconnect channel 跟 `CodexWebsocketsExecutor` 实例生命周期绑定；热重载重绑 executor 后，旧下游连接继续订阅旧实例，而真实 upstream 操作落在新实例。
+
+#### Fix Implemented
+- `invalidateUpstreamConn(...)` 只负责原子摘除并关闭当前 upstream conn，返回是否实际命中当前连接，不再直接通知下游。
+- `readUpstreamLoop(...)` 只在没有 active request channel 的空闲读断连场景触发 `notifyUpstreamDisconnect(...)`；active request 断连仍交给请求链路做重试、failover 或错误返回。
+- Codex WebSocket session/channel 改成进程级共享 store；`NewCodexWebsocketsExecutor(...)` 绑定同一份 store，使热重载后的新 executor 还能命中旧下游连接订阅的 channel。
+- `CloseExecutionSession(__all_execution_sessions__)` 视为 executor replacement 事件，不再强制关闭共享 websocket session；真实 websocket handler 结束时仍按具体 session id 清理会话。
+- 新增/调整回归测试：
+  - `TestCodexWebsocketsUpstreamDisconnectChanDoesNotSignalOnRecoverableInvalidate`
+  - `TestCodexWebsocketsUpstreamDisconnectChanSignalsOnIdleReadDisconnect`
+  - `TestCodexWebsocketsUpstreamDisconnectChanSurvivesExecutorRebind`
+  - `TestResponsesWebsocketClosesOnCodexUpstreamDisconnect`
+
+#### Validation
+- `timeout 60s go test ./internal/runtime/executor -run 'TestCodexWebsockets.*Disconnect|TestCodexWebsockets.*Rebind|TestCodexWebsockets.*PreviousResponse|TestApplyCodexWebsocketHeaders' -count=1`
+- `timeout 60s go test ./sdk/api/handlers/openai -run 'TestResponsesWebsocketClosesOnCodexUpstreamDisconnect|TestResponsesWebsocket' -count=1`
+- `timeout 60s go test ./internal/api/modules/amp -run 'TestRegisterManagementRoutes' -count=1`
+- `timeout 60s go test ./internal/api/modules/amp ./internal/runtime/executor ./sdk/api/handlers/openai -count=1`
+- `git diff --check`

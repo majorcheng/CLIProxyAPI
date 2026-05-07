@@ -63,6 +63,30 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 		clientRemoteAddr = strings.TrimSpace(c.Request.RemoteAddr)
 	}
 	log.Infof("responses websocket: client connected id=%s remote=%s", passthroughSessionID, clientRemoteAddr)
+
+	wsDone := make(chan struct{})
+	defer close(wsDone)
+	if h != nil && h.AuthManager != nil {
+		if exec, ok := h.AuthManager.Executor("codex"); ok && exec != nil {
+			type upstreamDisconnectSubscriber interface {
+				UpstreamDisconnectChan(sessionID string) <-chan error
+			}
+			if subscriber, ok := exec.(upstreamDisconnectSubscriber); ok && subscriber != nil {
+				disconnectCh := subscriber.UpstreamDisconnectChan(passthroughSessionID)
+				if disconnectCh != nil {
+					go func() {
+						select {
+						case <-wsDone:
+						case <-disconnectCh:
+							// 上游 Codex WebSocket 已断开，下游继续挂起只会制造僵尸会话。
+							_ = conn.Close()
+						}
+					}()
+				}
+			}
+		}
+	}
+
 	var wsTerminateErr error
 	var wsBodyLog strings.Builder
 	defer func() {

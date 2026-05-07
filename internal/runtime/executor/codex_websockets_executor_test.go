@@ -3,8 +3,10 @@ package executor
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -34,6 +36,131 @@ func TestBuildCodexWebsocketRequestBodyPreservesPreviousResponseID(t *testing.T)
 	}
 	if got := gjson.GetBytes(wsReqBody, "type").String(); got == "response.append" {
 		t.Fatalf("unexpected websocket request type: %s", got)
+	}
+}
+
+func TestCodexWebsocketsUpstreamDisconnectChanDoesNotSignalOnRecoverableInvalidate(t *testing.T) {
+	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Errorf("upgrade websocket: %v", err)
+			return
+		}
+		defer func() { _ = conn.Close() }()
+		for {
+			if _, _, errRead := conn.ReadMessage(); errRead != nil {
+				return
+			}
+		}
+	}))
+	defer server.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http")
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	if err != nil {
+		t.Fatalf("dial websocket: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	exec := NewCodexWebsocketsExecutor(&config.Config{})
+	sessionID := "sess-recoverable-" + t.Name()
+	defer exec.CloseExecutionSession(sessionID)
+	disconnectCh := exec.UpstreamDisconnectChan(sessionID)
+	if disconnectCh == nil {
+		t.Fatal("expected disconnect channel")
+	}
+
+	sess := exec.getOrCreateSession(sessionID)
+	if sess == nil {
+		t.Fatal("expected session")
+	}
+	sess.connMu.Lock()
+	sess.conn = conn
+	sess.authID = "auth-1"
+	sess.wsURL = "ws://example.test/responses"
+	sess.readerConn = conn
+	sess.connMu.Unlock()
+
+	upstreamErr := errors.New("upstream gone")
+	exec.invalidateUpstreamConn(sess, conn, "test_invalidate", upstreamErr)
+
+	select {
+	case errRead, ok := <-disconnectCh:
+		t.Fatalf("recoverable invalidate signaled disconnect: ok=%v err=%v", ok, errRead)
+	default:
+	}
+}
+
+func TestCodexWebsocketsUpstreamDisconnectChanSignalsOnIdleReadDisconnect(t *testing.T) {
+	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	accepted := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Errorf("upgrade websocket: %v", err)
+			return
+		}
+		close(accepted)
+		_ = conn.Close()
+	}))
+	defer server.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http")
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	if err != nil {
+		t.Fatalf("dial websocket: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+	<-accepted
+
+	exec := NewCodexWebsocketsExecutor(&config.Config{})
+	sessionID := "sess-idle-" + t.Name()
+	defer exec.CloseExecutionSession(sessionID)
+	disconnectCh := exec.UpstreamDisconnectChan(sessionID)
+	sess := exec.getOrCreateSession(sessionID)
+	sess.connMu.Lock()
+	sess.conn = conn
+	sess.readerConn = conn
+	sess.connMu.Unlock()
+
+	go exec.readUpstreamLoop(sess, conn)
+
+	select {
+	case errRead, ok := <-disconnectCh:
+		if !ok || errRead == nil {
+			t.Fatalf("disconnect signal = ok:%v err:%v, want error before close", ok, errRead)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for idle disconnect signal")
+	}
+}
+
+func TestCodexWebsocketsUpstreamDisconnectChanSurvivesExecutorRebind(t *testing.T) {
+	sessionID := "sess-rebind-" + t.Name()
+	first := NewCodexWebsocketsExecutor(&config.Config{})
+	disconnectCh := first.UpstreamDisconnectChan(sessionID)
+	if disconnectCh == nil {
+		t.Fatal("expected disconnect channel")
+	}
+
+	first.CloseExecutionSession(cliproxyauth.CloseAllExecutionSessionsID)
+
+	second := NewCodexWebsocketsExecutor(&config.Config{})
+	defer second.CloseExecutionSession(sessionID)
+	if got := second.UpstreamDisconnectChan(sessionID); got != disconnectCh {
+		t.Fatalf("disconnect channel changed across executor rebind")
+	}
+
+	upstreamErr := errors.New("upstream gone after rebind")
+	second.getOrCreateSession(sessionID).notifyUpstreamDisconnect(upstreamErr)
+	select {
+	case errRead, ok := <-disconnectCh:
+		if !ok || errRead == nil || errRead.Error() != upstreamErr.Error() {
+			t.Fatalf("disconnect signal = ok:%v err:%v, want %v", ok, errRead, upstreamErr)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for rebind disconnect signal")
 	}
 }
 

@@ -44,8 +44,16 @@ const (
 type CodexWebsocketsExecutor struct {
 	*CodexExecutor
 
-	sessMu   sync.Mutex
+	store *codexWebsocketSessionStore
+}
+
+type codexWebsocketSessionStore struct {
+	mu       sync.Mutex
 	sessions map[string]*codexWebsocketSession
+}
+
+var globalCodexWebsocketSessionStore = &codexWebsocketSessionStore{
+	sessions: make(map[string]*codexWebsocketSession),
 }
 
 type codexWebsocketSession struct {
@@ -66,12 +74,15 @@ type codexWebsocketSession struct {
 	activeCancel context.CancelFunc
 
 	readerConn *websocket.Conn
+
+	upstreamDisconnectOnce sync.Once
+	upstreamDisconnectCh   chan error
 }
 
 func NewCodexWebsocketsExecutor(cfg *config.Config) *CodexWebsocketsExecutor {
 	return &CodexWebsocketsExecutor{
 		CodexExecutor: NewCodexExecutor(cfg),
-		sessions:      make(map[string]*codexWebsocketSession),
+		store:         globalCodexWebsocketSessionStore,
 	}
 }
 
@@ -138,6 +149,23 @@ func (s *codexWebsocketSession) configureConn(conn *websocket.Conn) {
 		defer s.writeMu.Unlock()
 		// Reply pongs from the same write lock to avoid concurrent writes.
 		return conn.WriteControl(websocket.PongMessage, []byte(appData), time.Now().Add(10*time.Second))
+	})
+}
+
+// notifyUpstreamDisconnect 只向下游报告一次上游连接断开，避免重复 close 客户端连接。
+func (s *codexWebsocketSession) notifyUpstreamDisconnect(err error) {
+	if s == nil {
+		return
+	}
+	s.upstreamDisconnectOnce.Do(func() {
+		if s.upstreamDisconnectCh == nil {
+			return
+		}
+		select {
+		case s.upstreamDisconnectCh <- err:
+		default:
+		}
+		close(s.upstreamDisconnectCh)
 	})
 }
 
@@ -1064,17 +1092,39 @@ func (e *CodexWebsocketsExecutor) getOrCreateSession(sessionID string) *codexWeb
 	if sessionID == "" {
 		return nil
 	}
-	e.sessMu.Lock()
-	defer e.sessMu.Unlock()
-	if e.sessions == nil {
-		e.sessions = make(map[string]*codexWebsocketSession)
+	if e == nil {
+		return nil
 	}
-	if sess, ok := e.sessions[sessionID]; ok && sess != nil {
+	store := e.store
+	if store == nil {
+		store = globalCodexWebsocketSessionStore
+	}
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if store.sessions == nil {
+		store.sessions = make(map[string]*codexWebsocketSession)
+	}
+	if sess, ok := store.sessions[sessionID]; ok && sess != nil {
 		return sess
 	}
-	sess := &codexWebsocketSession{sessionID: sessionID}
-	e.sessions[sessionID] = sess
+	sess := &codexWebsocketSession{
+		sessionID:            sessionID,
+		upstreamDisconnectCh: make(chan error, 1),
+	}
+	store.sessions[sessionID] = sess
 	return sess
+}
+
+// UpstreamDisconnectChan 返回指定执行会话的上游断开通知通道。
+func (e *CodexWebsocketsExecutor) UpstreamDisconnectChan(sessionID string) <-chan error {
+	if e == nil {
+		return nil
+	}
+	sess := e.getOrCreateSession(sessionID)
+	if sess == nil {
+		return nil
+	}
+	return sess.upstreamDisconnectCh
 }
 
 func (e *CodexWebsocketsExecutor) ensureUpstreamConn(ctx context.Context, auth *cliproxyauth.Auth, sess *codexWebsocketSession, authID string, wsURL string, headers http.Header) (*websocket.Conn, *http.Response, error) {
@@ -1135,6 +1185,7 @@ func (e *CodexWebsocketsExecutor) readUpstreamLoop(sess *codexWebsocketSession, 
 			ch := sess.activeCh
 			done := sess.activeDone
 			sess.activeMu.Unlock()
+			terminalDisconnect := ch == nil
 			if ch != nil {
 				select {
 				case ch <- codexWebsocketRead{conn: conn, err: errRead}:
@@ -1144,7 +1195,9 @@ func (e *CodexWebsocketsExecutor) readUpstreamLoop(sess *codexWebsocketSession, 
 				sess.clearActive(ch)
 				close(ch)
 			}
-			e.invalidateUpstreamConn(sess, conn, "upstream_disconnected", errRead)
+			if e.invalidateUpstreamConn(sess, conn, "upstream_disconnected", errRead) && terminalDisconnect {
+				sess.notifyUpstreamDisconnect(errRead)
+			}
 			return
 		}
 
@@ -1155,6 +1208,7 @@ func (e *CodexWebsocketsExecutor) readUpstreamLoop(sess *codexWebsocketSession, 
 				ch := sess.activeCh
 				done := sess.activeDone
 				sess.activeMu.Unlock()
+				terminalDisconnect := ch == nil
 				if ch != nil {
 					select {
 					case ch <- codexWebsocketRead{conn: conn, err: errBinary}:
@@ -1164,7 +1218,9 @@ func (e *CodexWebsocketsExecutor) readUpstreamLoop(sess *codexWebsocketSession, 
 					sess.clearActive(ch)
 					close(ch)
 				}
-				e.invalidateUpstreamConn(sess, conn, "unexpected_binary", errBinary)
+				if e.invalidateUpstreamConn(sess, conn, "unexpected_binary", errBinary) && terminalDisconnect {
+					sess.notifyUpstreamDisconnect(errBinary)
+				}
 				return
 			}
 			continue
@@ -1184,9 +1240,9 @@ func (e *CodexWebsocketsExecutor) readUpstreamLoop(sess *codexWebsocketSession, 
 	}
 }
 
-func (e *CodexWebsocketsExecutor) invalidateUpstreamConn(sess *codexWebsocketSession, conn *websocket.Conn, reason string, err error) {
+func (e *CodexWebsocketsExecutor) invalidateUpstreamConn(sess *codexWebsocketSession, conn *websocket.Conn, reason string, err error) bool {
 	if sess == nil || conn == nil {
-		return
+		return false
 	}
 
 	sess.connMu.Lock()
@@ -1196,7 +1252,7 @@ func (e *CodexWebsocketsExecutor) invalidateUpstreamConn(sess *codexWebsocketSes
 	sessionID := sess.sessionID
 	if current == nil || current != conn {
 		sess.connMu.Unlock()
-		return
+		return false
 	}
 	sess.conn = nil
 	if sess.readerConn == conn {
@@ -1208,6 +1264,7 @@ func (e *CodexWebsocketsExecutor) invalidateUpstreamConn(sess *codexWebsocketSes
 	if errClose := conn.Close(); errClose != nil {
 		log.Errorf("codex websockets executor: close websocket error: %v", errClose)
 	}
+	return true
 }
 
 func (e *CodexWebsocketsExecutor) CloseExecutionSession(sessionID string) {
@@ -1219,14 +1276,19 @@ func (e *CodexWebsocketsExecutor) CloseExecutionSession(sessionID string) {
 		return
 	}
 	if sessionID == cliproxyauth.CloseAllExecutionSessionsID {
-		e.closeAllExecutionSessions("executor_replaced")
+		// 热重载替换 executor 时不能强制关闭共享 websocket 会话。
+		// 旧下游连接需要继续订阅同一个会话，等待新 executor 上的终局断连事件。
 		return
 	}
 
-	e.sessMu.Lock()
-	sess := e.sessions[sessionID]
-	delete(e.sessions, sessionID)
-	e.sessMu.Unlock()
+	store := e.store
+	if store == nil {
+		store = globalCodexWebsocketSessionStore
+	}
+	store.mu.Lock()
+	sess := store.sessions[sessionID]
+	delete(store.sessions, sessionID)
+	store.mu.Unlock()
 
 	e.closeExecutionSession(sess, "session_closed")
 }
@@ -1236,15 +1298,19 @@ func (e *CodexWebsocketsExecutor) closeAllExecutionSessions(reason string) {
 		return
 	}
 
-	e.sessMu.Lock()
-	sessions := make([]*codexWebsocketSession, 0, len(e.sessions))
-	for sessionID, sess := range e.sessions {
-		delete(e.sessions, sessionID)
+	store := e.store
+	if store == nil {
+		store = globalCodexWebsocketSessionStore
+	}
+	store.mu.Lock()
+	sessions := make([]*codexWebsocketSession, 0, len(store.sessions))
+	for sessionID, sess := range store.sessions {
+		delete(store.sessions, sessionID)
 		if sess != nil {
 			sessions = append(sessions, sess)
 		}
 	}
-	e.sessMu.Unlock()
+	store.mu.Unlock()
 
 	for i := range sessions {
 		e.closeExecutionSession(sessions[i], reason)
@@ -1323,6 +1389,14 @@ func (e *CodexAutoExecutor) HttpRequest(ctx context.Context, auth *cliproxyauth.
 		return nil, fmt.Errorf("codex auto executor: http executor is nil")
 	}
 	return e.httpExec.HttpRequest(ctx, auth, req)
+}
+
+// UpstreamDisconnectChan 透出 Codex WebSocket 上游断开事件，供下游 websocket handler 关闭客户端连接。
+func (e *CodexAutoExecutor) UpstreamDisconnectChan(sessionID string) <-chan error {
+	if e == nil || e.wsExec == nil {
+		return nil
+	}
+	return e.wsExec.UpstreamDisconnectChan(sessionID)
 }
 
 func (e *CodexAutoExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {

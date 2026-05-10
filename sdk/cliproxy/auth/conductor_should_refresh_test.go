@@ -196,6 +196,136 @@ func TestManagerShouldRefresh_CodexInitialRefreshPendingForcesFreshLookingToken(
 	}
 }
 
+func TestManagerShouldRefresh_DisabledAuthStillEvaluatesRefresh(t *testing.T) {
+	manager := NewManager(nil, nil, nil)
+	now := time.Date(2026, 4, 1, 12, 0, 0, 0, time.UTC)
+	auth := &Auth{
+		ID:              "disabled-refresh",
+		Provider:        "claude",
+		Disabled:        true,
+		Status:          StatusDisabled,
+		Runtime:         staticRefreshLeadRuntime(time.Hour),
+		LastRefreshedAt: now.Add(-2 * time.Hour),
+		Metadata: map[string]any{
+			"refresh_token": "refresh-token",
+			"email":         "disabled@example.com",
+		},
+	}
+
+	if got := manager.shouldRefresh(auth, now); !got {
+		t.Fatal("shouldRefresh() = false, want disabled auth to remain refresh-eligible")
+	}
+}
+
+func TestManagerMarkRefreshPending_AllowsDisabledAuth(t *testing.T) {
+	manager := NewManager(nil, nil, nil)
+	now := time.Date(2026, 4, 1, 12, 0, 0, 0, time.UTC)
+	manager.mu.Lock()
+	manager.auths["disabled-refresh"] = &Auth{
+		ID:       "disabled-refresh",
+		Provider: "claude",
+		Disabled: true,
+		Status:   StatusDisabled,
+		Metadata: map[string]any{
+			"refresh_token": "refresh-token",
+		},
+	}
+	manager.mu.Unlock()
+
+	if ok := manager.markRefreshPending("disabled-refresh", now); !ok {
+		t.Fatal("markRefreshPending() = false, want disabled auth to be schedulable")
+	}
+	manager.mu.RLock()
+	updated := manager.auths["disabled-refresh"]
+	manager.mu.RUnlock()
+	if updated == nil || updated.NextRefreshAfter.IsZero() {
+		t.Fatalf("NextRefreshAfter was not set for disabled auth: %#v", updated)
+	}
+}
+
+func TestManagerCollectRefreshTargets_IncludesDisabledRefreshEligibleAuth(t *testing.T) {
+	manager := NewManager(nil, nil, nil)
+	manager.RegisterExecutor(refreshFailureTestExecutor{provider: "claude"})
+	now := time.Date(2026, 4, 1, 12, 0, 0, 0, time.UTC)
+	auth := &Auth{
+		ID:              "disabled-refresh",
+		Provider:        "claude",
+		Disabled:        true,
+		Status:          StatusDisabled,
+		Runtime:         staticRefreshLeadRuntime(time.Hour),
+		LastRefreshedAt: now.Add(-2 * time.Hour),
+		Metadata: map[string]any{
+			"refresh_token": "refresh-token",
+			"email":         "disabled@example.com",
+		},
+	}
+	if _, err := manager.Register(context.Background(), auth); err != nil {
+		t.Fatalf("register disabled auth: %v", err)
+	}
+
+	targets := manager.collectRefreshTargets(now)
+	found := false
+	for _, target := range targets {
+		if target == auth.ID {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("collectRefreshTargets() = %v, want disabled auth %q", targets, auth.ID)
+	}
+}
+
+func TestManagerCollectRefreshTargets_SkipsPendingDeleteDisabledAuth(t *testing.T) {
+	manager := NewManager(nil, nil, nil)
+	manager.RegisterExecutor(refreshFailureTestExecutor{provider: "claude"})
+	now := time.Date(2026, 4, 1, 12, 0, 0, 0, time.UTC)
+	auth := &Auth{
+		ID:              "pending-delete-refresh",
+		Provider:        "claude",
+		Disabled:        true,
+		Status:          StatusDisabled,
+		Runtime:         staticRefreshLeadRuntime(time.Hour),
+		LastRefreshedAt: now.Add(-2 * time.Hour),
+		Metadata: map[string]any{
+			"refresh_token":                         "refresh-token",
+			"email":                                 "disabled@example.com",
+			authMaintenancePendingDeleteMetadataKey: true,
+		},
+	}
+	if _, err := manager.Register(context.Background(), auth); err != nil {
+		t.Fatalf("register pending-delete auth: %v", err)
+	}
+
+	targets := manager.collectRefreshTargets(now)
+	for _, target := range targets {
+		if target == auth.ID {
+			t.Fatalf("collectRefreshTargets() = %v, want pending-delete auth skipped", targets)
+		}
+	}
+}
+
+func TestManagerMarkRefreshPending_SkipsPendingDeleteAuth(t *testing.T) {
+	manager := NewManager(nil, nil, nil)
+	now := time.Date(2026, 4, 1, 12, 0, 0, 0, time.UTC)
+	manager.mu.Lock()
+	manager.auths["pending-delete-refresh"] = &Auth{
+		ID:       "pending-delete-refresh",
+		Provider: "claude",
+		Disabled: true,
+		Status:   StatusDisabled,
+		Metadata: map[string]any{
+			"refresh_token":                         "refresh-token",
+			authMaintenancePendingDeleteMetadataKey: true,
+		},
+	}
+	manager.mu.Unlock()
+
+	if ok := manager.markRefreshPending("pending-delete-refresh", now); ok {
+		t.Fatal("markRefreshPending() = true, want pending-delete auth skipped")
+	}
+}
+
 func TestManagerCollectRefreshTargets_SkipsCodexWithUnknownTokenTiming(t *testing.T) {
 	t.Parallel()
 

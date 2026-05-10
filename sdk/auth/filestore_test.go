@@ -314,6 +314,51 @@ func TestFileTokenStoreListIgnoresNonAuthJSON(t *testing.T) {
 	}
 }
 
+func TestFileTokenStoreSaveDefaultsToDefaultAuthDirWhenBaseDirEmpty(t *testing.T) {
+	home := t.TempDir()
+	cwd := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	oldWD, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("Getwd() error = %v", err)
+	}
+	if err = os.Chdir(cwd); err != nil {
+		t.Fatalf("Chdir() error = %v", err)
+	}
+	t.Cleanup(func() {
+		if errChdir := os.Chdir(oldWD); errChdir != nil {
+			t.Fatalf("restore cwd: %v", errChdir)
+		}
+	})
+
+	store := NewFileTokenStore()
+	auth := &cliproxyauth.Auth{
+		ID:       "default-auth-dir.json",
+		FileName: "default-auth-dir.json",
+		Provider: "codex",
+		Metadata: map[string]any{
+			"type":  "codex",
+			"email": "user@example.com",
+		},
+	}
+
+	path, err := store.Save(context.Background(), auth)
+	if err != nil {
+		t.Fatalf("Save() error = %v", err)
+	}
+	want := filepath.Join(home, ".cli-proxy-api", "default-auth-dir.json")
+	if path != want {
+		t.Fatalf("Save() path = %q, want %q", path, want)
+	}
+	if _, err = os.Stat(want); err != nil {
+		t.Fatalf("default auth file was not created: %v", err)
+	}
+	if _, err = os.Stat(filepath.Join(cwd, "default-auth-dir.json")); !os.IsNotExist(err) {
+		t.Fatalf("unexpected auth file in cwd, stat err = %v", err)
+	}
+}
+
 func TestFileTokenStoreSaveAndListRoundTripRuntimeState(t *testing.T) {
 	tempDir := t.TempDir()
 	store := NewFileTokenStore()

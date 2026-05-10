@@ -80,6 +80,8 @@ const (
 	codexLastRefreshStaleWindow = 8 * 24 * time.Hour
 	// RT 交换返回 401 后，把凭证收口到 priority=5，便于按“优先使用”原则继续消费当前 token。
 	rtExchangeUnauthorizedPreferredPriority = 5
+	// auth-maintenance 已判定待删除的凭证不能再进入后台 refresh 调度。
+	authMaintenancePendingDeleteMetadataKey = "auth_maintenance_pending_delete"
 )
 
 var quotaCooldownDisabled atomic.Bool
@@ -4099,10 +4101,10 @@ func (m *Manager) collectRefreshTargets(now time.Time) []string {
 		if auth == nil {
 			continue
 		}
-		if m.executors[auth.Provider] == nil {
+		if authRefreshPendingDelete(auth) {
 			continue
 		}
-		if auth.Disabled {
+		if m.executors[auth.Provider] == nil {
 			continue
 		}
 		if !auth.NextRefreshAfter.IsZero() && now.Before(auth.NextRefreshAfter) {
@@ -4142,7 +4144,7 @@ func (m *Manager) snapshotAuths() []*Auth {
 }
 
 func (m *Manager) shouldRefresh(a *Auth, now time.Time) bool {
-	if a == nil || a.Disabled {
+	if a == nil || authRefreshPendingDelete(a) {
 		return false
 	}
 	if !a.NextRefreshAfter.IsZero() && now.Before(a.NextRefreshAfter) {
@@ -4248,6 +4250,26 @@ func authHasRefreshToken(a *Auth) bool {
 	}
 	refreshToken, _ := a.Metadata["refresh_token"].(string)
 	return strings.TrimSpace(refreshToken) != ""
+}
+
+// authRefreshPendingDelete 判断凭证是否已被 auth-maintenance 判定为待删除。
+// 这类凭证即使 Disabled=true 仍保留在 manager 中等待归档，也不能再触发后台 refresh。
+func authRefreshPendingDelete(a *Auth) bool {
+	if a == nil || len(a.Metadata) == 0 {
+		return false
+	}
+	raw, ok := a.Metadata[authMaintenancePendingDeleteMetadataKey]
+	if !ok {
+		return false
+	}
+	switch value := raw.(type) {
+	case bool:
+		return value
+	case string:
+		return strings.EqualFold(strings.TrimSpace(value), "true")
+	default:
+		return false
+	}
 }
 
 // authRefreshTokenValue 返回 auth metadata 中当前 refresh_token 的规范化字符串。
@@ -4482,7 +4504,7 @@ func lookupMetadataTime(meta map[string]any, keys ...string) (time.Time, bool) {
 func (m *Manager) markRefreshPending(id string, now time.Time) bool {
 	m.mu.Lock()
 	auth, ok := m.auths[id]
-	if !ok || auth == nil || auth.Disabled {
+	if !ok || auth == nil || authRefreshPendingDelete(auth) {
 		m.mu.Unlock()
 		return false
 	}
@@ -4500,7 +4522,7 @@ func (m *Manager) markRefreshPending(id string, now time.Time) bool {
 func (m *Manager) markCodexInitialRefreshPending(id string, now time.Time) bool {
 	m.mu.Lock()
 	auth, ok := m.auths[id]
-	if !ok || auth == nil || auth.Disabled {
+	if !ok || auth == nil || authRefreshPendingDelete(auth) {
 		m.mu.Unlock()
 		return false
 	}

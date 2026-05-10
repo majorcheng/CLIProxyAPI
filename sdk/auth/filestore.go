@@ -17,6 +17,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/proxyutil"
 	log "github.com/sirupsen/logrus"
@@ -96,6 +97,12 @@ func (s *FileTokenStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (str
 	} else if metadata != nil {
 		delete(metadata, "proxy_url")
 	}
+	if metadata == nil && (auth.Storage != nil || auth.Disabled) {
+		metadata = make(map[string]any, 1)
+	}
+	if metadata != nil {
+		metadata["disabled"] = auth.Disabled
+	}
 
 	switch {
 	case auth.Storage != nil:
@@ -106,7 +113,6 @@ func (s *FileTokenStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (str
 			return "", err
 		}
 	case metadata != nil:
-		metadata["disabled"] = auth.Disabled
 		raw, errMarshal := json.Marshal(metadata)
 		if errMarshal != nil {
 			return "", fmt.Errorf("auth filestore: marshal metadata failed: %w", errMarshal)
@@ -151,7 +157,10 @@ func (s *FileTokenStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (str
 
 // List enumerates all auth JSON files under the configured directory.
 func (s *FileTokenStore) List(ctx context.Context) ([]*cliproxyauth.Auth, error) {
-	dir := s.baseDirSnapshot()
+	dir, errResolveDir := s.resolvedBaseDirSnapshot()
+	if errResolveDir != nil {
+		return nil, errResolveDir
+	}
 	if dir == "" {
 		return nil, fmt.Errorf("auth filestore: directory not configured")
 	}
@@ -204,7 +213,10 @@ func (s *FileTokenStore) resolveDeletePath(id string) (string, error) {
 	if strings.ContainsRune(id, os.PathSeparator) || filepath.IsAbs(id) {
 		return id, nil
 	}
-	dir := s.baseDirSnapshot()
+	dir, errResolveDir := s.resolvedBaseDirSnapshot()
+	if errResolveDir != nil {
+		return "", errResolveDir
+	}
 	if dir == "" {
 		return "", fmt.Errorf("auth filestore: directory not configured")
 	}
@@ -343,7 +355,11 @@ func (s *FileTokenStore) resolveAuthPath(auth *cliproxyauth.Auth) (string, error
 		if filepath.IsAbs(fileName) {
 			return fileName, nil
 		}
-		if dir := s.baseDirSnapshot(); dir != "" {
+		dir, errResolveDir := s.resolvedBaseDirSnapshot()
+		if errResolveDir != nil {
+			return "", errResolveDir
+		}
+		if dir != "" {
 			return filepath.Join(dir, fileName), nil
 		}
 		return fileName, nil
@@ -354,7 +370,10 @@ func (s *FileTokenStore) resolveAuthPath(auth *cliproxyauth.Auth) (string, error
 	if filepath.IsAbs(auth.ID) {
 		return auth.ID, nil
 	}
-	dir := s.baseDirSnapshot()
+	dir, errResolveDir := s.resolvedBaseDirSnapshot()
+	if errResolveDir != nil {
+		return "", errResolveDir
+	}
 	if dir == "" {
 		return "", fmt.Errorf("auth filestore: directory not configured")
 	}
@@ -381,6 +400,11 @@ func (s *FileTokenStore) baseDirSnapshot() string {
 	s.dirLock.RLock()
 	defer s.dirLock.RUnlock()
 	return s.baseDir
+}
+
+// resolvedBaseDirSnapshot 返回已展开默认值的鉴权目录，避免空配置写入当前工作目录。
+func (s *FileTokenStore) resolvedBaseDirSnapshot() (string, error) {
+	return util.ResolveAuthDir(s.baseDirSnapshot())
 }
 
 func (s *FileTokenStore) globalProxyURLSnapshot() string {

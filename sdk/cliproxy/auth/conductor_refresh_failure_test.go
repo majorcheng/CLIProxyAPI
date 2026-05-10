@@ -504,6 +504,52 @@ func TestManagerTriggerCodexInitialRefreshOnLoadIfNeeded_RequiresPendingMarker(t
 	}
 }
 
+func TestManagerTriggerCodexInitialRefreshOnLoadIfNeeded_AllowsDisabledAuth(t *testing.T) {
+	ctx := context.Background()
+	calls := make(chan string, 1)
+	manager := NewManager(nil, nil, nil)
+	manager.SetConfig(&internalconfig.Config{
+		SDKConfig: internalconfig.SDKConfig{
+			CodexInitialRefreshOnLoad: true,
+		},
+	})
+	manager.RegisterExecutor(refreshFailureTestExecutor{
+		provider: "codex",
+		after: func(auth *Auth) {
+			if auth != nil {
+				calls <- auth.ID
+			}
+		},
+	})
+
+	now := time.Date(2026, 4, 1, 12, 0, 0, 0, time.UTC)
+	auth := &Auth{
+		ID:       "disabled-initial-refresh",
+		Provider: "codex",
+		Disabled: true,
+		Status:   StatusDisabled,
+		Metadata: map[string]any{
+			"refresh_token": "refresh-token",
+			"last_refresh":  now.Add(-time.Minute).Format(time.RFC3339),
+			"expired":       now.Add(30 * 24 * time.Hour).Format(time.RFC3339),
+		},
+	}
+	MarkCodexInitialRefreshPendingForNewFile(auth)
+	if _, err := manager.Register(ctx, auth); err != nil {
+		t.Fatalf("register disabled auth: %v", err)
+	}
+
+	manager.TriggerCodexInitialRefreshOnLoadIfNeeded(ctx, auth.ID)
+	select {
+	case got := <-calls:
+		if got != auth.ID {
+			t.Fatalf("initial refresh auth id = %q, want %q", got, auth.ID)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected disabled pending initial refresh to call executor")
+	}
+}
+
 func TestManagerRefreshAuth_ClearsCodexInitialRefreshPendingAfterSuccess(t *testing.T) {
 	ctx := context.Background()
 	store := &codexRefreshRecordingStore{}

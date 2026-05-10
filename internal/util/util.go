@@ -71,11 +71,12 @@ func SetLogLevel(cfg *config.Config) {
 	}
 }
 
-// ResolveAuthDir normalizes the auth directory path for consistent reuse throughout the app.
-// It expands a leading tilde (~) to the user's home directory and returns a cleaned path.
+// ResolveAuthDir 统一规范化鉴权目录，保证应用内部复用同一套路径口径。
+// 它会把开头的波浪号（~）展开为用户主目录，并返回清理后的路径。
+// authDir 为空时回退到文档约定的默认鉴权目录。
 func ResolveAuthDir(authDir string) (string, error) {
 	if authDir == "" {
-		return "", nil
+		authDir = config.DefaultAuthDir
 	}
 	if strings.HasPrefix(authDir, "~") {
 		home, err := os.UserHomeDir()

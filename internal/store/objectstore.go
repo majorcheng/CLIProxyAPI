@@ -185,6 +185,12 @@ func (s *ObjectTokenStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (s
 		SetMetadata(map[string]any)
 	}
 	metadata := cliproxyauth.MetadataWithPersistedRuntimeState(auth)
+	if metadata == nil && (auth.Storage != nil || auth.Disabled) {
+		metadata = make(map[string]any, 1)
+	}
+	if metadata != nil {
+		metadata["disabled"] = auth.Disabled
+	}
 
 	switch {
 	case auth.Storage != nil:

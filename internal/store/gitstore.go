@@ -287,6 +287,12 @@ func (s *GitTokenStore) Save(_ context.Context, auth *cliproxyauth.Auth) (string
 		SetMetadata(map[string]any)
 	}
 	metadata := cliproxyauth.MetadataWithPersistedRuntimeState(auth)
+	if metadata == nil && (auth.Storage != nil || auth.Disabled) {
+		metadata = make(map[string]any, 1)
+	}
+	if metadata != nil {
+		metadata["disabled"] = auth.Disabled
+	}
 
 	switch {
 	case auth.Storage != nil:

@@ -215,6 +215,12 @@ func (s *PostgresStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (stri
 		SetMetadata(map[string]any)
 	}
 	metadata := cliproxyauth.MetadataWithPersistedRuntimeState(auth)
+	if metadata == nil && (auth.Storage != nil || auth.Disabled) {
+		metadata = make(map[string]any, 1)
+	}
+	if metadata != nil {
+		metadata["disabled"] = auth.Disabled
+	}
 
 	switch {
 	case auth.Storage != nil:

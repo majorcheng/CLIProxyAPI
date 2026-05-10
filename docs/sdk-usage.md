@@ -1,13 +1,13 @@
 # CLI Proxy SDK Guide
 
-> This document describes the SDK as shipped in this independently maintained fork. The repository is derived from `router-for-me/CLIProxyAPI` but is not affiliated with the upstream project. The Go module path still uses `github.com/router-for-me/CLIProxyAPI/v6` for compatibility.
+> This document describes the SDK as shipped in this independently maintained fork. The repository is derived from `router-for-me/CLIProxyAPI` but is not affiliated with the upstream project. Starting with v7, external consumers must import `github.com/router-for-me/CLIProxyAPI/v7`; this module does not provide a `/v6` shim, and HTTP API routes such as `/v1` are unchanged.
 
 The `sdk/cliproxy` module exposes the proxy as a reusable Go library so external programs can embed the routing, authentication, hot‑reload, and translation layers without depending on the CLI binary.
 
 ## Install & Import
 
 ```bash
-go get github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy
+go get github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy
 ```
 
 ```go
@@ -16,8 +16,8 @@ import (
     "errors"
     "time"
 
-    "github.com/router-for-me/CLIProxyAPI/v6/internal/config"
-    "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy"
+    "github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+    "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy"
 )
 ```
 

@@ -6,7 +6,7 @@ import (
 	"runtime"
 	"strings"
 
-	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 )
 
 // disableAuthsForDeletedPath 按 token 实际落盘路径禁用所有同源 auth。

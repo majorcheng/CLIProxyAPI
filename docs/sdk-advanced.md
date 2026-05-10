@@ -1,6 +1,6 @@
 # SDK Advanced: Executors & Translators
 
-> This guide applies to the SDK shipped in this independently maintained fork. The repository is derived from `router-for-me/CLIProxyAPI` but is not affiliated with the upstream project. The `github.com/router-for-me/CLIProxyAPI/v6` module path remains in examples for compatibility.
+> This guide applies to the SDK shipped in this independently maintained fork. The repository is derived from `router-for-me/CLIProxyAPI` but is not affiliated with the upstream project. Starting with v7, external consumers must import `github.com/router-for-me/CLIProxyAPI/v7`; this module does not provide a `/v6` shim, and HTTP API routes such as `/v1` are unchanged.
 
 This guide explains how to extend the embedded proxy with custom providers and schemas using the SDK. You will:
 - Implement a provider executor that talks to your upstream API
@@ -26,8 +26,8 @@ import (
   "context"
   "net/http"
 
-  coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
-  clipexec "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
+  coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+  clipexec "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 )
 
 type Executor struct{}
@@ -84,7 +84,7 @@ package myprov
 
 import (
   "context"
-  sdktr "github.com/router-for-me/CLIProxyAPI/v6/sdk/translator"
+  sdktr "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
 )
 
 const (

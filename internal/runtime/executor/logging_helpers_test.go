@@ -7,7 +7,7 @@ import (
 	"testing"
 
 	"github.com/gin-gonic/gin"
-	internalusage "github.com/router-for-me/CLIProxyAPI/v6/internal/usage"
+	internalusage "github.com/router-for-me/CLIProxyAPI/v7/internal/usage"
 )
 
 func TestRecordAPIRequestStoresReasoningEffortWhenRequestLogDisabled(t *testing.T) {

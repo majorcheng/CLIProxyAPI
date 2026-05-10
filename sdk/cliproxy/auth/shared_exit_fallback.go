@@ -3,7 +3,7 @@ package auth
 import (
 	"strings"
 
-	internalconfig "github.com/router-for-me/CLIProxyAPI/v6/internal/config"
+	internalconfig "github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 )
 
 const skipPriorityZeroOAuthMetadataKey = "__skip_priority_zero_oauth_after_network_jitter"

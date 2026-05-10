@@ -9,12 +9,12 @@ import (
 	"strings"
 
 	"github.com/gin-gonic/gin"
-	internalconfig "github.com/router-for-me/CLIProxyAPI/v6/internal/config"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/logging"
-	"github.com/router-for-me/CLIProxyAPI/v6/sdk/api/handlers"
-	"github.com/router-for-me/CLIProxyAPI/v6/sdk/api/handlers/claude"
-	"github.com/router-for-me/CLIProxyAPI/v6/sdk/api/handlers/gemini"
-	"github.com/router-for-me/CLIProxyAPI/v6/sdk/api/handlers/openai"
+	internalconfig "github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers"
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers/claude"
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers/gemini"
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers/openai"
 	log "github.com/sirupsen/logrus"
 )
 

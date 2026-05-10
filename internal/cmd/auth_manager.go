@@ -1,7 +1,7 @@
 package cmd
 
 import (
-	sdkAuth "github.com/router-for-me/CLIProxyAPI/v6/sdk/auth"
+	sdkAuth "github.com/router-for-me/CLIProxyAPI/v7/sdk/auth"
 )
 
 // newAuthManager 创建基于文件存储的认证管理器，

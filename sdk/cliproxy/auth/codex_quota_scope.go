@@ -4,7 +4,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 )
 
 // codexFreeSharesModelState 统一收口 Codex free 账号的 token 级模型状态语义。

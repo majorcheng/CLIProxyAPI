@@ -4,7 +4,7 @@ import (
 	"context"
 	"testing"
 
-	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 )
 
 func BenchmarkManagerPickNext2813(b *testing.B) {

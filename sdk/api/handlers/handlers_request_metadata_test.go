@@ -7,9 +7,9 @@ import (
 	"testing"
 
 	"github.com/gin-gonic/gin"
-	sdkaccess "github.com/router-for-me/CLIProxyAPI/v6/sdk/access"
-	coreexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
-	sdkconfig "github.com/router-for-me/CLIProxyAPI/v6/sdk/config"
+	sdkaccess "github.com/router-for-me/CLIProxyAPI/v7/sdk/access"
+	coreexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
+	sdkconfig "github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
 )
 
 func TestApplyClientRoutingPolicyMetadata_MarksPriorityZeroDisabledClientKey(t *testing.T) {

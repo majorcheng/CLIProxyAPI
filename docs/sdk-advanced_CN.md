@@ -1,6 +1,6 @@
 # SDK 高级指南：执行器与翻译器
 
-> 本文档适用于当前独立维护分支中的 SDK。该仓库基于 `router-for-me/CLIProxyAPI` 修改而来，但与上游项目无关联。示例中继续使用 `github.com/router-for-me/CLIProxyAPI/v6` 模块路径，仅用于兼容现有代码结构。
+> 本文档适用于当前独立维护分支中的 SDK。该仓库基于 `router-for-me/CLIProxyAPI` 修改而来，但与上游项目无关联。从 v7 起，外部导入路径必须使用 `github.com/router-for-me/CLIProxyAPI/v7`；当前 module 不再提供 `/v6` shim，`/v1` 等 HTTP API 路由不因此改变。
 
 本文介绍如何使用 SDK 扩展内嵌代理：
 - 实现自定义 Provider 执行器以调用你的上游 API
@@ -26,8 +26,8 @@ import (
     "context"
     "net/http"
 
-    coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
-    clipexec "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
+    coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+    clipexec "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 )
 
 type Executor struct{}
@@ -79,7 +79,7 @@ package myprov
 
 import (
   "context"
-  sdktr "github.com/router-for-me/CLIProxyAPI/v6/sdk/translator"
+  sdktr "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
 )
 
 const (

@@ -1,18 +1,18 @@
 # @sdk/access SDK Reference
 
-> This document covers the access SDK in this independently maintained fork. The repository is derived from `router-for-me/CLIProxyAPI` but has no affiliation with the upstream project. Import paths remain on `github.com/router-for-me/CLIProxyAPI/v6` for compatibility.
+> This document covers the access SDK in this independently maintained fork. The repository is derived from `router-for-me/CLIProxyAPI` but has no affiliation with the upstream project. Starting with v7, external consumers must import `github.com/router-for-me/CLIProxyAPI/v7`; this module does not provide a `/v6` shim, and HTTP API routes such as `/v1` are unchanged.
 
-The `github.com/router-for-me/CLIProxyAPI/v6/sdk/access` package centralizes inbound request authentication for the proxy. It offers a lightweight manager that chains credential providers, so servers can reuse the same access control logic inside or outside the CLI runtime.
+The `github.com/router-for-me/CLIProxyAPI/v7/sdk/access` package centralizes inbound request authentication for the proxy. It offers a lightweight manager that chains credential providers, so servers can reuse the same access control logic inside or outside the CLI runtime.
 
 ## Importing
 
 ```go
 import (
-    sdkaccess "github.com/router-for-me/CLIProxyAPI/v6/sdk/access"
+    sdkaccess "github.com/router-for-me/CLIProxyAPI/v7/sdk/access"
 )
 ```
 
-Add the module with `go get github.com/router-for-me/CLIProxyAPI/v6/sdk/access`.
+Add the module with `go get github.com/router-for-me/CLIProxyAPI/v7/sdk/access`.
 
 ## Provider Registry
 
@@ -78,7 +78,7 @@ To consume a provider shipped in another Go module, import it for its registrati
 ```go
 import (
     _ "github.com/acme/xplatform/sdk/access/providers/partner" // registers partner-token
-    sdkaccess "github.com/router-for-me/CLIProxyAPI/v6/sdk/access"
+    sdkaccess "github.com/router-for-me/CLIProxyAPI/v7/sdk/access"
 )
 ```
 
@@ -148,7 +148,7 @@ Register any custom providers (typically via blank imports) before calling `Buil
 When configuration changes, refresh any config-backed providers and then reset the manager's provider chain:
 
 ```go
-// configaccess is github.com/router-for-me/CLIProxyAPI/v6/internal/access/config_access
+// configaccess is github.com/router-for-me/CLIProxyAPI/v7/internal/access/config_access
 configaccess.Register(&newCfg.SDKConfig)
 accessManager.SetProviders(sdkaccess.RegisteredProviders())
 ```

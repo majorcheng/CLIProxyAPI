@@ -275,6 +275,10 @@ func shouldPersistFailureRuntimeState(statusCode int, nextRetryAfter time.Time, 
 		now = time.Now()
 	}
 	switch statusCode {
+	case 401:
+		// refresh 401 / unauthorized 是终态停刷信号；NextRetryAfter 为空时表示不自动恢复，
+		// 仍必须落盘，否则 watcher 或进程重启会重新安排 auto-refresh。
+		return nextRetryAfter.IsZero() || nextRetryAfter.After(now)
 	case 429:
 		if !nextRetryAfter.IsZero() {
 			return nextRetryAfter.After(now)

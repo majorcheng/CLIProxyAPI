@@ -369,6 +369,9 @@ func isAuthBlockedForModel(auth *Auth, model string, now time.Time) (bool, block
 	if auth.Disabled || auth.Status == StatusDisabled {
 		return true, blockReasonDisabled, time.Time{}
 	}
+	if hasUnauthorizedAuthFailure(auth) {
+		return true, blockReasonOther, time.Time{}
+	}
 	if blocked, reason, next := codexFreeSharedBlockForAuth(auth, now); blocked {
 		return true, reason, next
 	}

@@ -437,6 +437,7 @@ func TestManagerExecute_DoesNotBlockRepeatedUnauthorizedRequest(t *testing.T) {
 	auth.Unavailable = false
 	auth.NextRetryAfter = time.Time{}
 	auth.LastError = nil
+	auth.FailureHTTPStatus = 0
 	auth.ModelStates = nil
 	snapshot := auth.Clone()
 	m.mu.Unlock()

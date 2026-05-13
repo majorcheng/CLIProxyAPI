@@ -3048,13 +3048,19 @@ func isUnauthorizedError(err error) bool {
 }
 
 func hasUnauthorizedAuthFailure(auth *Auth) bool {
-	if auth == nil || auth.LastError == nil {
+	if auth == nil {
 		return false
 	}
-	if auth.LastError.StatusCode() == http.StatusUnauthorized {
+	if auth.LastError != nil && auth.LastError.StatusCode() == http.StatusUnauthorized {
 		return true
 	}
-	return isUnauthorizedAuthCode(auth.LastError.Code)
+	if auth.LastError != nil && isUnauthorizedAuthCode(auth.LastError.Code) {
+		return true
+	}
+	if NormalizePersistableFailureHTTPStatus(auth.FailureHTTPStatus) == http.StatusUnauthorized {
+		return true
+	}
+	return auth.Unavailable && strings.EqualFold(strings.TrimSpace(auth.StatusMessage), "unauthorized")
 }
 
 func refreshErrorFromError(err error) *Error {
@@ -4702,9 +4708,11 @@ func (m *Manager) executeRefreshAuth(ctx context.Context, id string) (*Auth, err
 			}
 			if unauthorized {
 				current.NextRefreshAfter = time.Time{}
+				current.NextRetryAfter = time.Time{}
 				current.Unavailable = true
 				current.Status = StatusError
 				current.StatusMessage = "unauthorized"
+				current.FailureHTTPStatus = http.StatusUnauthorized
 				persistNeeded = true
 			} else {
 				current.NextRefreshAfter = now.Add(refreshFailureBackoff)

@@ -221,24 +221,53 @@ func TestManagerShouldRefresh_DisabledAuthStillEvaluatesRefresh(t *testing.T) {
 func TestManagerShouldRefresh_UnauthorizedFailureStopsRefresh(t *testing.T) {
 	manager := NewManager(nil, nil, nil)
 	now := time.Date(2026, 4, 1, 12, 0, 0, 0, time.UTC)
-	auth := &Auth{
-		ID:              "unauthorized-refresh",
-		Provider:        "claude",
-		Runtime:         staticRefreshLeadRuntime(time.Hour),
-		LastRefreshedAt: now.Add(-2 * time.Hour),
-		LastError: &Error{
-			Code:       "unauthorized",
-			Message:    "token refresh failed with status 401",
-			HTTPStatus: http.StatusUnauthorized,
+	tests := []struct {
+		name string
+		auth *Auth
+	}{
+		{
+			name: "last error",
+			auth: &Auth{
+				ID:              "unauthorized-refresh",
+				Provider:        "claude",
+				Runtime:         staticRefreshLeadRuntime(time.Hour),
+				LastRefreshedAt: now.Add(-2 * time.Hour),
+				LastError: &Error{
+					Code:       "unauthorized",
+					Message:    "token refresh failed with status 401",
+					HTTPStatus: http.StatusUnauthorized,
+				},
+				Metadata: map[string]any{
+					"refresh_token": "refresh-token",
+					"email":         "unauthorized@example.com",
+				},
+			},
 		},
-		Metadata: map[string]any{
-			"refresh_token": "refresh-token",
-			"email":         "unauthorized@example.com",
+		{
+			name: "restored runtime state",
+			auth: &Auth{
+				ID:                "restored-unauthorized-refresh",
+				Provider:          "claude",
+				Runtime:           staticRefreshLeadRuntime(time.Hour),
+				LastRefreshedAt:   now.Add(-2 * time.Hour),
+				Status:            StatusError,
+				StatusMessage:     "unauthorized",
+				Unavailable:       true,
+				FailureHTTPStatus: http.StatusUnauthorized,
+				Metadata: map[string]any{
+					"refresh_token": "refresh-token",
+					"email":         "unauthorized@example.com",
+				},
+			},
 		},
 	}
 
-	if got := manager.shouldRefresh(auth, now); got {
-		t.Fatal("shouldRefresh() = true, want unauthorized auth to stop refresh attempts")
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := manager.shouldRefresh(tt.auth, now); got {
+				t.Fatal("shouldRefresh() = true, want unauthorized auth to stop refresh attempts")
+			}
+		})
 	}
 }
 

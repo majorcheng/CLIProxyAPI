@@ -190,11 +190,23 @@ func TestManagerRefreshAuth_PersistsTerminalRefresh401ForMaintenance(t *testing.
 	if !updated.NextRefreshAfter.IsZero() {
 		t.Fatalf("expected NextRefreshAfter to stay zero after terminal unauthorized, got %v", updated.NextRefreshAfter)
 	}
+	if !updated.NextRetryAfter.IsZero() {
+		t.Fatalf("expected NextRetryAfter to stay zero for terminal unauthorized, got %v", updated.NextRetryAfter)
+	}
+	if updated.FailureHTTPStatus != http.StatusUnauthorized {
+		t.Fatalf("expected FailureHTTPStatus = 401, got %d", updated.FailureHTTPStatus)
+	}
+	if !hasUnauthorizedAuthFailure(updated) {
+		t.Fatal("expected terminal unauthorized refresh failure to be recognized from persisted auth state")
+	}
 	if manager.shouldRefresh(updated, time.Now()) {
 		t.Fatal("expected terminal unauthorized refresh failure to stop auto-refresh decisions")
 	}
 	if next, ok := nextRefreshCheckAt(time.Now(), updated, time.Second); ok {
 		t.Fatalf("expected terminal unauthorized refresh failure to be unscheduled, got next=%s", next)
+	}
+	if blocked, reason, next := isAuthBlockedForModel(updated, "gpt-5.4", time.Now()); !blocked || reason != blockReasonOther || !next.IsZero() {
+		t.Fatalf("expected terminal unauthorized auth to be blocked from selection, blocked=%v reason=%v next=%v", blocked, reason, next)
 	}
 	if CodexInitialRefreshPending(updated) {
 		t.Fatal("expected terminal initial refresh failure to clear pending flag")
@@ -213,6 +225,19 @@ func TestManagerRefreshAuth_PersistsTerminalRefresh401ForMaintenance(t *testing.
 			}
 			if got, ok := last.Metadata["priority"].(int); !ok || got != 5 {
 				t.Fatalf("expected persisted metadata priority 5 after RT 401 failure, got %#v", last.Metadata["priority"])
+			}
+			metadata := MetadataWithPersistedRuntimeState(last)
+			restored := &Auth{
+				ID:       last.ID,
+				Provider: last.Provider,
+				Metadata: metadata,
+			}
+			RestorePersistedRuntimeState(restored, time.Now())
+			if !hasUnauthorizedAuthFailure(restored) {
+				t.Fatalf("expected restored persisted runtime state to remain unauthorized: %#v", restored)
+			}
+			if manager.shouldRefresh(restored, time.Now()) {
+				t.Fatal("expected restored unauthorized runtime state to stop auto-refresh decisions")
 			}
 			break
 		}

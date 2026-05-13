@@ -94,22 +94,49 @@ func TestNextRefreshCheckAt_PendingDeleteUnschedule(t *testing.T) {
 
 func TestNextRefreshCheckAt_UnauthorizedFailureUnschedule(t *testing.T) {
 	now := time.Date(2026, 4, 12, 0, 0, 0, 0, time.UTC)
-	auth := &Auth{
-		ID:       "unauthorized-refresh",
-		Provider: "claude",
-		Runtime:  testRefreshEvaluator{},
-		LastError: &Error{
-			Code:       "unauthorized",
-			Message:    "token refresh failed with status 401",
-			HTTPStatus: http.StatusUnauthorized,
+	tests := []struct {
+		name string
+		auth *Auth
+	}{
+		{
+			name: "last error",
+			auth: &Auth{
+				ID:       "unauthorized-refresh",
+				Provider: "claude",
+				Runtime:  testRefreshEvaluator{},
+				LastError: &Error{
+					Code:       "unauthorized",
+					Message:    "token refresh failed with status 401",
+					HTTPStatus: http.StatusUnauthorized,
+				},
+				Metadata: map[string]any{
+					"email": "x@example.com",
+				},
+			},
 		},
-		Metadata: map[string]any{
-			"email": "x@example.com",
+		{
+			name: "restored runtime state",
+			auth: &Auth{
+				ID:                "restored-unauthorized-refresh",
+				Provider:          "claude",
+				Runtime:           testRefreshEvaluator{},
+				Status:            StatusError,
+				StatusMessage:     "unauthorized",
+				Unavailable:       true,
+				FailureHTTPStatus: http.StatusUnauthorized,
+				Metadata: map[string]any{
+					"email": "x@example.com",
+				},
+			},
 		},
 	}
 
-	if got, ok := nextRefreshCheckAt(now, auth, 15*time.Minute); ok {
-		t.Fatalf("nextRefreshCheckAt() = %s, true; want unscheduled unauthorized auth", got)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got, ok := nextRefreshCheckAt(now, tt.auth, 15*time.Minute); ok {
+				t.Fatalf("nextRefreshCheckAt() = %s, true; want unscheduled unauthorized auth", got)
+			}
+		})
 	}
 }
 

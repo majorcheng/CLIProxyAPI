@@ -120,6 +120,37 @@ func TestSchedulerPick_FillFirstSticksToFirstReady(t *testing.T) {
 	}
 }
 
+func TestSchedulerPick_SkipsTerminalUnauthorizedAuth(t *testing.T) {
+	t.Parallel()
+
+	scheduler := newSchedulerForTest(
+		&FillFirstSelector{},
+		&Auth{
+			ID:                "unauthorized-high-priority",
+			Provider:          "codex",
+			Status:            StatusError,
+			StatusMessage:     "unauthorized",
+			Unavailable:       true,
+			FailureHTTPStatus: http.StatusUnauthorized,
+			Attributes:        map[string]string{"priority": "10"},
+		},
+		&Auth{
+			ID:         "ready-low-priority",
+			Provider:   "codex",
+			Status:     StatusActive,
+			Attributes: map[string]string{"priority": "1"},
+		},
+	)
+
+	got, errPick := scheduler.pickSingle(context.Background(), "codex", "", cliproxyexecutor.Options{}, nil)
+	if errPick != nil {
+		t.Fatalf("pickSingle() error = %v", errPick)
+	}
+	if got == nil || got.ID != "ready-low-priority" {
+		t.Fatalf("pickSingle() auth = %#v, want ready-low-priority", got)
+	}
+}
+
 func TestSchedulerPick_FillFirstUsesFirstRegisteredAt(t *testing.T) {
 	t.Parallel()
 

@@ -57,10 +57,70 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 
 	// Convert input array to messages
 	if input := root.Get("input"); input.Exists() && input.IsArray() {
-		input.ForEach(func(_, item gjson.Result) bool {
+		inputItems := input.Array()
+		outputCallIDs := make(map[string]struct{})
+		for _, item := range inputItems {
+			if item.Get("type").String() != "function_call_output" {
+				continue
+			}
+			callID := strings.TrimSpace(item.Get("call_id").String())
+			if callID == "" {
+				continue
+			}
+			outputCallIDs[callID] = struct{}{}
+		}
+
+		pendingToolCalls := make([]interface{}, 0)
+		pendingToolCallIDs := make([]string, 0)
+		awaitingToolOutputs := make(map[string]struct{})
+		deferredMessages := make([]string, 0)
+
+		flushPendingToolCalls := func() {
+			if len(pendingToolCalls) == 0 {
+				return
+			}
+			assistantMessage := `{"role":"assistant","tool_calls":[]}`
+			assistantMessage, _ = sjson.Set(assistantMessage, "tool_calls", pendingToolCalls)
+			out, _ = sjson.SetRaw(out, "messages.-1", assistantMessage)
+			for _, id := range pendingToolCallIDs {
+				if strings.TrimSpace(id) == "" {
+					continue
+				}
+				awaitingToolOutputs[id] = struct{}{}
+			}
+			pendingToolCalls = pendingToolCalls[:0]
+			pendingToolCallIDs = pendingToolCallIDs[:0]
+		}
+		flushDeferredMessages := func() {
+			for _, message := range deferredMessages {
+				out, _ = sjson.SetRaw(out, "messages.-1", message)
+			}
+			deferredMessages = deferredMessages[:0]
+		}
+		hasAwaitingToolOutput := func() bool {
+			for id := range awaitingToolOutputs {
+				if _, ok := outputCallIDs[id]; ok {
+					return true
+				}
+			}
+			return false
+		}
+		appendRegularMessage := func(message string) {
+			// 部分 OpenAI 兼容后端要求 assistant(tool_calls) 与紧随其后的 tool 消息严格相邻。
+			if hasAwaitingToolOutput() {
+				deferredMessages = append(deferredMessages, message)
+				return
+			}
+			out, _ = sjson.SetRaw(out, "messages.-1", message)
+		}
+
+		for _, item := range inputItems {
 			itemType := item.Get("type").String()
 			if itemType == "" && item.Get("role").String() != "" {
 				itemType = "message"
+			}
+			if itemType != "function_call" {
+				flushPendingToolCalls()
 			}
 
 			switch itemType {
@@ -75,7 +135,6 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 
 				if content := item.Get("content"); content.Exists() && content.IsArray() {
 					var messageContent string
-					var toolCalls []interface{}
 
 					content.ForEach(func(_, contentItem gjson.Result) bool {
 						contentType := contentItem.Get("type").String()
@@ -102,19 +161,14 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 						message, _ = sjson.Set(message, "content", messageContent)
 					}
 
-					if len(toolCalls) > 0 {
-						message, _ = sjson.Set(message, "tool_calls", toolCalls)
-					}
 				} else if content.Type == gjson.String {
 					message, _ = sjson.Set(message, "content", content.String())
 				}
 
-				out, _ = sjson.SetRaw(out, "messages.-1", message)
+				appendRegularMessage(message)
 
 			case "function_call":
-				// Handle function call conversion to assistant message with tool_calls
-				assistantMessage := `{"role":"assistant","tool_calls":[]}`
-
+				// 连续 function_call 必须合并到同一个 assistant.tool_calls 中，避免下游拒绝多条空 assistant 消息。
 				toolCall := `{"id":"","type":"function","function":{"name":"","arguments":""}}`
 
 				if callId := item.Get("call_id"); callId.Exists() {
@@ -129,15 +183,19 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 					toolCall, _ = sjson.Set(toolCall, "function.arguments", arguments.String())
 				}
 
-				assistantMessage, _ = sjson.SetRaw(assistantMessage, "tool_calls.0", toolCall)
-				out, _ = sjson.SetRaw(out, "messages.-1", assistantMessage)
+				pendingToolCalls = append(pendingToolCalls, gjson.Parse(toolCall).Value())
+				if callID := strings.TrimSpace(item.Get("call_id").String()); callID != "" {
+					pendingToolCallIDs = append(pendingToolCallIDs, callID)
+				}
 
 			case "function_call_output":
 				// Handle function call output conversion to tool message
 				toolMessage := `{"role":"tool","tool_call_id":"","content":""}`
+				callID := ""
 
 				if callId := item.Get("call_id"); callId.Exists() {
-					toolMessage, _ = sjson.Set(toolMessage, "tool_call_id", callId.String())
+					callID = strings.TrimSpace(callId.String())
+					toolMessage, _ = sjson.Set(toolMessage, "tool_call_id", callID)
 				}
 
 				if output := item.Get("output"); output.Exists() {
@@ -145,10 +203,16 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 				}
 
 				out, _ = sjson.SetRaw(out, "messages.-1", toolMessage)
+				if callID != "" {
+					delete(awaitingToolOutputs, callID)
+				}
+				if len(awaitingToolOutputs) == 0 && len(deferredMessages) > 0 {
+					flushDeferredMessages()
+				}
 			}
-
-			return true
-		})
+		}
+		flushPendingToolCalls()
+		flushDeferredMessages()
 	} else if input.Type == gjson.String {
 		msg := "{}"
 		msg, _ = sjson.Set(msg, "role", "user")

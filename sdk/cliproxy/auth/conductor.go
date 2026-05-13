@@ -3019,6 +3019,79 @@ func terminalStatusCodeFromError(err error) int {
 	return 0
 }
 
+func isUnauthorizedAuthCode(code string) bool {
+	switch strings.ToLower(strings.TrimSpace(code)) {
+	case "unauthorized",
+		codexauth.RefreshTokenExpiredErrorCode,
+		codexauth.RefreshTokenReusedErrorCode,
+		codexauth.RefreshTokenRevokedErrorCode,
+		codexauth.RefreshUnauthorizedErrorCode,
+		codexauth.UnauthorizedAfterRecoveryErrorCode:
+		return true
+	default:
+		return false
+	}
+}
+
+func isUnauthorizedError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if statusCodeFromError(err) == http.StatusUnauthorized || terminalStatusCodeFromError(err) == http.StatusUnauthorized {
+		return true
+	}
+	if isUnauthorizedAuthCode(errorCodeFromError(err)) {
+		return true
+	}
+	raw := strings.ToLower(err.Error())
+	return strings.Contains(raw, "status 401") || strings.Contains(raw, "401 unauthorized")
+}
+
+func hasUnauthorizedAuthFailure(auth *Auth) bool {
+	if auth == nil || auth.LastError == nil {
+		return false
+	}
+	if auth.LastError.StatusCode() == http.StatusUnauthorized {
+		return true
+	}
+	return isUnauthorizedAuthCode(auth.LastError.Code)
+}
+
+func refreshErrorFromError(err error) *Error {
+	if err == nil {
+		return nil
+	}
+	if authErr, ok := errors.AsType[*Error](err); ok && authErr != nil {
+		out := cloneError(authErr)
+		if out.HTTPStatus == 0 && isUnauthorizedError(err) {
+			out.HTTPStatus = http.StatusUnauthorized
+		}
+		if out.HTTPStatus == http.StatusUnauthorized {
+			if strings.TrimSpace(out.Code) == "" {
+				out.Code = "unauthorized"
+			}
+			out.Retryable = false
+		}
+		return out
+	}
+	statusCode := terminalStatusCodeFromError(err)
+	if statusCode == 0 && isUnauthorizedError(err) {
+		statusCode = http.StatusUnauthorized
+	}
+	out := &Error{
+		Code:       errorCodeFromError(err),
+		Message:    err.Error(),
+		HTTPStatus: statusCode,
+	}
+	if statusCode == http.StatusUnauthorized {
+		if strings.TrimSpace(out.Code) == "" {
+			out.Code = "unauthorized"
+		}
+		out.Retryable = false
+	}
+	return out
+}
+
 func retryAfterFromError(err error) *time.Duration {
 	if err == nil {
 		return nil
@@ -4101,7 +4174,7 @@ func (m *Manager) collectRefreshTargets(now time.Time) []string {
 		if auth == nil {
 			continue
 		}
-		if authRefreshPendingDelete(auth) {
+		if authRefreshPendingDelete(auth) || hasUnauthorizedAuthFailure(auth) {
 			continue
 		}
 		if m.executors[auth.Provider] == nil {
@@ -4145,6 +4218,9 @@ func (m *Manager) snapshotAuths() []*Auth {
 
 func (m *Manager) shouldRefresh(a *Auth, now time.Time) bool {
 	if a == nil || authRefreshPendingDelete(a) {
+		return false
+	}
+	if hasUnauthorizedAuthFailure(a) {
 		return false
 	}
 	if !a.NextRefreshAfter.IsZero() && now.Before(a.NextRefreshAfter) {
@@ -4504,7 +4580,7 @@ func lookupMetadataTime(meta map[string]any, keys ...string) (time.Time, bool) {
 func (m *Manager) markRefreshPending(id string, now time.Time) bool {
 	m.mu.Lock()
 	auth, ok := m.auths[id]
-	if !ok || auth == nil || authRefreshPendingDelete(auth) {
+	if !ok || auth == nil || authRefreshPendingDelete(auth) || hasUnauthorizedAuthFailure(auth) {
 		m.mu.Unlock()
 		return false
 	}
@@ -4522,7 +4598,7 @@ func (m *Manager) markRefreshPending(id string, now time.Time) bool {
 func (m *Manager) markCodexInitialRefreshPending(id string, now time.Time) bool {
 	m.mu.Lock()
 	auth, ok := m.auths[id]
-	if !ok || auth == nil || authRefreshPendingDelete(auth) {
+	if !ok || auth == nil || authRefreshPendingDelete(auth) || hasUnauthorizedAuthFailure(auth) {
 		m.mu.Unlock()
 		return false
 	}
@@ -4612,23 +4688,30 @@ func (m *Manager) executeRefreshAuth(ctx context.Context, id string) (*Auth, err
 		if rtExchangeLogged {
 			log.Warnf("auth manager: rt 交换失败: provider=%s auth=%s err=%v", strings.TrimSpace(auth.Provider), strings.TrimSpace(auth.ID), err)
 		}
-		refreshErr := &Error{Message: err.Error(), Code: errorCodeFromError(err)}
+		refreshErr := refreshErrorFromError(err)
 		terminalStatus := terminalStatusCodeFromError(err)
-		if terminalStatus > 0 {
-			refreshErr.HTTPStatus = terminalStatus
-		}
+		unauthorized := isUnauthorizedError(err)
+		terminalOrUnauthorized := terminalStatus > 0 || unauthorized
 		var persistSnapshot *Auth
 		var currentSnapshot *Auth
 		m.mu.Lock()
 		if current := m.auths[id]; current != nil {
 			persistNeeded := false
-			if rtExchangeLogged && terminalStatus == http.StatusUnauthorized && setPreferredPriorityAfterRTUnauthorized(current) {
+			if rtExchangeLogged && unauthorized && setPreferredPriorityAfterRTUnauthorized(current) {
 				persistNeeded = true
 			}
-			current.NextRefreshAfter = now.Add(refreshFailureBackoff)
+			if unauthorized {
+				current.NextRefreshAfter = time.Time{}
+				current.Unavailable = true
+				current.Status = StatusError
+				current.StatusMessage = "unauthorized"
+				persistNeeded = true
+			} else {
+				current.NextRefreshAfter = now.Add(refreshFailureBackoff)
+			}
 			current.LastError = refreshErr
 			current.UpdatedAt = now
-			if initialRefreshPending && terminalStatus > 0 && ClearCodexInitialRefreshPending(current) {
+			if initialRefreshPending && terminalOrUnauthorized && ClearCodexInitialRefreshPending(current) {
 				persistNeeded = true
 			}
 			if persistNeeded {
@@ -4646,7 +4729,7 @@ func (m *Manager) executeRefreshAuth(ctx context.Context, id string) (*Auth, err
 			m.enqueuePersist(persistSnapshot)
 		}
 		if initialRefreshPending {
-			if terminalStatus > 0 {
+			if terminalOrUnauthorized {
 				log.Warnf("codex 新文件初始 refresh 终态失败，停止继续初始 refresh: %s, %v", strings.TrimSpace(id), err)
 			} else {
 				log.Warnf("codex 新文件初始 refresh 失败，将按退避继续重试: %s, %v", strings.TrimSpace(id), err)

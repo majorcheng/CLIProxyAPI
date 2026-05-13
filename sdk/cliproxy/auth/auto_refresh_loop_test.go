@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"net/http"
 	"strings"
 	"testing"
 	"time"
@@ -88,6 +89,27 @@ func TestNextRefreshCheckAt_PendingDeleteUnschedule(t *testing.T) {
 
 	if got, ok := nextRefreshCheckAt(now, auth, 15*time.Minute); ok {
 		t.Fatalf("nextRefreshCheckAt() = %s, true; want unscheduled pending-delete auth", got)
+	}
+}
+
+func TestNextRefreshCheckAt_UnauthorizedFailureUnschedule(t *testing.T) {
+	now := time.Date(2026, 4, 12, 0, 0, 0, 0, time.UTC)
+	auth := &Auth{
+		ID:       "unauthorized-refresh",
+		Provider: "claude",
+		Runtime:  testRefreshEvaluator{},
+		LastError: &Error{
+			Code:       "unauthorized",
+			Message:    "token refresh failed with status 401",
+			HTTPStatus: http.StatusUnauthorized,
+		},
+		Metadata: map[string]any{
+			"email": "x@example.com",
+		},
+	}
+
+	if got, ok := nextRefreshCheckAt(now, auth, 15*time.Minute); ok {
+		t.Fatalf("nextRefreshCheckAt() = %s, true; want unscheduled unauthorized auth", got)
 	}
 }
 

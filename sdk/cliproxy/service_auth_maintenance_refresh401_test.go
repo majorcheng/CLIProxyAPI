@@ -96,3 +96,63 @@ func TestScanAuthMaintenanceCandidates_CodexTerminalRefresh401Without429QueuesDe
 		t.Fatalf("expected semantic terminal reason, got %q", got)
 	}
 }
+
+func TestScanAuthMaintenanceCandidates_RestoredCodexTerminalRefresh401Without429QueuesDeleteWhenProtectionDisabled(t *testing.T) {
+	authDir := t.TempDir()
+	service := &Service{
+		cfg: &config.Config{
+			AuthDir: authDir,
+			AuthMaintenance: config.AuthMaintenanceConfig{
+				Enable:                true,
+				DeleteStatusCodes:     []int{401},
+				Refresh401Requires429: false,
+			},
+		},
+		coreManager: coreauth.NewManager(nil, nil, nil),
+	}
+
+	filePath := filepath.Join(authDir, "restored-terminal-refresh-401-no-429.json")
+	metadata := coreauth.MetadataWithPersistedRuntimeState(&coreauth.Auth{
+		ID:                "restored-terminal-refresh-401-no-429",
+		FileName:          filepath.Base(filePath),
+		Provider:          "codex",
+		Status:            coreauth.StatusError,
+		StatusMessage:     "unauthorized",
+		FailureHTTPStatus: 401,
+		Unavailable:       true,
+		LastError: &coreauth.Error{
+			Code:       codexauth.RefreshTokenReusedErrorCode,
+			HTTPStatus: 401,
+			Message:    "token refresh failed with status 401: refresh_token_reused",
+		},
+		Metadata: map[string]any{
+			"type":  "codex",
+			"email": "restored@example.com",
+		},
+	})
+	restored := &coreauth.Auth{
+		ID:       "restored-terminal-refresh-401-no-429",
+		FileName: filepath.Base(filePath),
+		Provider: "codex",
+		Attributes: map[string]string{
+			"path":      filePath,
+			"plan_type": "free",
+		},
+		Metadata: metadata,
+	}
+	coreauth.RestorePersistedRuntimeState(restored, timeNowForTest())
+	if restored.LastError == nil || restored.LastError.Code != codexauth.RefreshTokenReusedErrorCode {
+		t.Fatalf("expected restored auth to keep terminal refresh code, got %#v", restored.LastError)
+	}
+	if _, err := service.coreManager.Register(context.Background(), restored); err != nil {
+		t.Fatalf("failed to register auth: %v", err)
+	}
+
+	candidates := service.scanAuthMaintenanceCandidates(timeNowForTest(), service.cfg.AuthMaintenance, authDir)
+	if len(candidates) != 1 {
+		t.Fatalf("expected restored terminal refresh 401 without 429 to queue delete when protection disabled, got %d", len(candidates))
+	}
+	if got := candidates[0].Reason; got != "terminal_refresh_token_reused" {
+		t.Fatalf("expected semantic terminal reason after restore, got %q", got)
+	}
+}

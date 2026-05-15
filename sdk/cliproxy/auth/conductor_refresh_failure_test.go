@@ -233,6 +233,12 @@ func TestManagerRefreshAuth_PersistsTerminalRefresh401ForMaintenance(t *testing.
 				Metadata: metadata,
 			}
 			RestorePersistedRuntimeState(restored, time.Now())
+			if restored.LastError == nil {
+				t.Fatalf("expected restored runtime state to keep terminal refresh code: %#v", restored)
+			}
+			if restored.LastError.Code != codexauth.RefreshUnauthorizedErrorCode {
+				t.Fatalf("expected restored LastError.Code = %q, got %q", codexauth.RefreshUnauthorizedErrorCode, restored.LastError.Code)
+			}
 			if !hasUnauthorizedAuthFailure(restored) {
 				t.Fatalf("expected restored persisted runtime state to remain unauthorized: %#v", restored)
 			}

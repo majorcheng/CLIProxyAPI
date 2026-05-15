@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"testing"
 	"time"
+
+	codexauth "github.com/router-for-me/CLIProxyAPI/v7/internal/auth/codex"
 )
 
 func TestNormalizePersistableFailureHTTPStatus_Whitelist(t *testing.T) {
@@ -264,6 +266,60 @@ func TestMetadataWithPersistedRuntimeState_PersistsTerminalUnauthorizedWithoutRe
 	}
 	if !hasUnauthorizedAuthFailure(restored) {
 		t.Fatal("expected restored terminal unauthorized state to stop refresh scheduling")
+	}
+}
+
+func TestMetadataWithPersistedRuntimeState_PersistsTerminalRefreshErrorCodeWithoutFullLastError(t *testing.T) {
+	t.Parallel()
+
+	source := &Auth{
+		ID:                "terminal-refresh-code",
+		Provider:          "codex",
+		Status:            StatusError,
+		StatusMessage:     "unauthorized",
+		Unavailable:       true,
+		FailureHTTPStatus: 401,
+		LastError: &Error{
+			Code:       codexauth.RefreshTokenReusedErrorCode,
+			Message:    "token refresh failed with status 401: refresh_token_reused",
+			HTTPStatus: 401,
+		},
+		Metadata: map[string]any{
+			"type":  "codex",
+			"email": "user@example.com",
+		},
+	}
+
+	metadata := MetadataWithPersistedRuntimeState(source)
+	encoded, err := json.Marshal(metadata)
+	if err != nil {
+		t.Fatalf("Marshal() error = %v", err)
+	}
+	if !jsonContainsField(encoded, "last_error_code") {
+		t.Fatalf("persisted runtime state should contain last_error_code: %s", string(encoded))
+	}
+	if jsonContainsField(encoded, "last_error") {
+		t.Fatalf("persisted runtime state should not contain full last_error: %s", string(encoded))
+	}
+
+	restored := &Auth{
+		ID:       source.ID,
+		Provider: source.Provider,
+		Metadata: metadata,
+	}
+	RestorePersistedRuntimeState(restored, time.Now())
+
+	if restored.LastError == nil {
+		t.Fatal("expected restored.LastError to keep terminal refresh code")
+	}
+	if restored.LastError.Code != codexauth.RefreshTokenReusedErrorCode {
+		t.Fatalf("restored.LastError.Code = %q, want %q", restored.LastError.Code, codexauth.RefreshTokenReusedErrorCode)
+	}
+	if restored.LastError.HTTPStatus != 401 {
+		t.Fatalf("restored.LastError.HTTPStatus = %d, want 401", restored.LastError.HTTPStatus)
+	}
+	if !hasUnauthorizedAuthFailure(restored) {
+		t.Fatal("expected restored terminal refresh code to keep unauthorized semantics")
 	}
 }
 

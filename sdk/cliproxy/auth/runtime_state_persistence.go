@@ -2,8 +2,11 @@ package auth
 
 import (
 	"encoding/json"
+	"net/http"
 	"strings"
 	"time"
+
+	codexauth "github.com/router-for-me/CLIProxyAPI/v7/internal/auth/codex"
 )
 
 // PersistedRuntimeStateMetadataKey 是 auth JSON 中保留给运行时状态快照的字段。
@@ -16,6 +19,7 @@ type persistedRuntimeState struct {
 	Status         Status                         `json:"status,omitempty"`
 	StatusMessage  string                         `json:"status_message,omitempty"`
 	HTTPStatus     int                            `json:"http_status,omitempty"`
+	LastErrorCode  string                         `json:"last_error_code,omitempty"`
 	Unavailable    bool                           `json:"unavailable,omitempty"`
 	NextRetryAfter time.Time                      `json:"next_retry_after,omitempty"`
 	Quota          QuotaState                     `json:"quota,omitempty"`
@@ -66,8 +70,8 @@ func MetadataWithPersistedRuntimeState(auth *Auth) map[string]any {
 }
 
 // RestorePersistedRuntimeState 从 metadata 中恢复 runtime state。
-// 这里仍然故意忽略 last_error 详情本身：我们只恢复精确状态码与 cooldown / quota /
-// next_retry 等能影响调度与展示的状态，不把一次性的错误正文长期保存在磁盘里。
+// 这里仍然不会恢复完整的 last_error 正文，只会在确有必要时恢复少量机器错误码，
+// 让 maintenance 之类依赖 terminal 语义的逻辑在 watcher reload / 重启后继续成立。
 func RestorePersistedRuntimeState(auth *Auth, now time.Time) {
 	if auth == nil || auth.Metadata == nil {
 		return
@@ -89,6 +93,7 @@ func RestorePersistedRuntimeState(auth *Auth, now time.Time) {
 		return
 	}
 
+	restoredLastError := restoredPersistedLastError(state.LastErrorCode, state.HTTPStatus, state.StatusMessage)
 	auth.Status = state.Status
 	auth.StatusMessage = strings.TrimSpace(state.StatusMessage)
 	auth.FailureHTTPStatus = NormalizePersistableFailureHTTPStatus(state.HTTPStatus)
@@ -99,6 +104,9 @@ func RestorePersistedRuntimeState(auth *Auth, now time.Time) {
 	auth.ModelStates = hydratePersistedModelStates(state.ModelStates)
 
 	normalizeRestoredRuntimeState(auth, now)
+	if restoredLastError != nil && shouldRestorePersistedLastError(auth, now) {
+		auth.LastError = restoredLastError
+	}
 }
 
 func buildPersistedRuntimeState(auth *Auth) (persistedRuntimeState, bool) {
@@ -122,6 +130,12 @@ func buildPersistedRuntimeState(auth *Auth) (persistedRuntimeState, bool) {
 	if shouldPersistAuth {
 		if message := strings.TrimSpace(auth.StatusMessage); message != "" {
 			state.StatusMessage = message
+			hasState = true
+		}
+	}
+	if shouldPersistAuth {
+		if code := persistedRuntimeLastErrorCode(auth); code != "" {
+			state.LastErrorCode = code
 			hasState = true
 		}
 	}
@@ -256,6 +270,50 @@ func currentPersistableModelFailureHTTPStatus(state *ModelState) int {
 		return NormalizePersistableFailureHTTPStatus(state.LastError.HTTPStatus)
 	}
 	return 0
+}
+
+func persistedRuntimeLastErrorCode(auth *Auth) string {
+	if auth == nil || auth.LastError == nil {
+		return ""
+	}
+	switch code := strings.TrimSpace(auth.LastError.Code); code {
+	case codexauth.RefreshTokenExpiredErrorCode,
+		codexauth.RefreshTokenReusedErrorCode,
+		codexauth.RefreshTokenRevokedErrorCode,
+		codexauth.RefreshUnauthorizedErrorCode,
+		codexauth.UnauthorizedAfterRecoveryErrorCode:
+		return code
+	default:
+		return ""
+	}
+}
+
+func restoredPersistedLastError(code string, statusCode int, statusMessage string) *Error {
+	code = strings.TrimSpace(code)
+	if code == "" {
+		return nil
+	}
+	normalizedStatus := NormalizePersistableFailureHTTPStatus(statusCode)
+	message := strings.TrimSpace(statusMessage)
+	if message == "" && normalizedStatus > 0 {
+		message = strings.ToLower(strings.TrimSpace(http.StatusText(normalizedStatus)))
+	}
+	return &Error{
+		Code:       code,
+		Message:    message,
+		HTTPStatus: normalizedStatus,
+	}
+}
+
+func shouldRestorePersistedLastError(auth *Auth, now time.Time) bool {
+	if auth == nil {
+		return false
+	}
+	statusCode := currentPersistableFailureHTTPStatus(auth)
+	if statusCode == 0 {
+		return false
+	}
+	return shouldPersistFailureRuntimeState(statusCode, auth.NextRetryAfter, auth.Quota, now)
 }
 
 func quotaHasPersistedState(quota QuotaState) bool {

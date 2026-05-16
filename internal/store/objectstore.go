@@ -615,6 +615,7 @@ func (s *ObjectTokenStore) readAuthFile(path, baseDir string) (*cliproxyauth.Aut
 		auth.CreatedAt = registeredAt
 	}
 	cliproxyauth.RestorePersistedRuntimeState(auth, time.Now())
+	applyDisabledMetadata(auth, metadata)
 	return auth, nil
 }
 

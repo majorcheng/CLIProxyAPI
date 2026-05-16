@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/gin-gonic/gin"
+	apihandlers "github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers"
 )
 
 const (
@@ -103,7 +104,7 @@ func firstMultipartFormValue(form *multipart.Form, key string) string {
 
 // readValidJSONBody 统一读取并校验 JSON 请求体，避免重复散落错误格式。
 func readValidJSONBody(c *gin.Context) ([]byte, bool) {
-	rawJSON, err := c.GetRawData()
+	rawJSON, err := apihandlers.ReadRequestBody(c)
 	if err != nil {
 		writeInvalidRequestError(c, fmt.Sprintf("Invalid request: %v", err))
 		return nil, false

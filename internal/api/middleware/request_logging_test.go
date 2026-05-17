@@ -1,11 +1,16 @@
 package middleware
 
 import (
+	"bytes"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"strings"
 	"testing"
+
+	"github.com/gin-gonic/gin"
+	"github.com/klauspost/compress/zstd"
 )
 
 func TestShouldSkipMethodForRequestLogging(t *testing.T) {
@@ -71,6 +76,52 @@ func TestShouldSkipMethodForRequestLogging(t *testing.T) {
 			t.Fatalf("%s: got skip=%t, want %t", tests[i].name, got, tests[i].skip)
 		}
 	}
+}
+
+func TestCaptureRequestInfoDecodesZstdRequestBodyForLog(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	payload := []byte(`{"model":"test-model","stream":true}`)
+	compressed := zstdCompressForRequestLoggingTest(t, payload)
+
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(compressed))
+	req.Header.Set("Content-Encoding", "zstd")
+	c.Request = req
+
+	info, err := captureRequestInfo(c, true)
+	if err != nil {
+		t.Fatalf("captureRequestInfo: %v", err)
+	}
+	if !bytes.Equal(info.Body, payload) {
+		t.Fatalf("logged request body = %q, want %q", string(info.Body), string(payload))
+	}
+
+	restoredBody, err := io.ReadAll(c.Request.Body)
+	if err != nil {
+		t.Fatalf("read restored request body: %v", err)
+	}
+	if !bytes.Equal(restoredBody, compressed) {
+		t.Fatal("request body was not restored with the original compressed bytes")
+	}
+}
+
+func zstdCompressForRequestLoggingTest(t *testing.T, payload []byte) []byte {
+	t.Helper()
+
+	var compressed bytes.Buffer
+	encoder, err := zstd.NewWriter(&compressed)
+	if err != nil {
+		t.Fatalf("zstd.NewWriter: %v", err)
+	}
+	if _, err = encoder.Write(payload); err != nil {
+		t.Fatalf("zstd write: %v", err)
+	}
+	if err = encoder.Close(); err != nil {
+		t.Fatalf("zstd close: %v", err)
+	}
+	return compressed.Bytes()
 }
 
 func TestShouldCaptureRequestBody(t *testing.T) {

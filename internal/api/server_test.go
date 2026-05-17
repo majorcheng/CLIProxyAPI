@@ -14,6 +14,7 @@ import (
 	gin "github.com/gin-gonic/gin"
 	proxyconfig "github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	internallogging "github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	sdkaccess "github.com/router-for-me/CLIProxyAPI/v7/sdk/access"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
@@ -150,6 +151,92 @@ func TestAmpProviderModelRoutes(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestModelsWithClientVersionReturnsCodexCatalog(t *testing.T) {
+	registerServerCodexCatalogTestModel(t)
+
+	server := newTestServer(t)
+	req := httptest.NewRequest(http.MethodGet, "/v1/models?client_version", nil)
+	req.Header.Set("Authorization", "Bearer test-key")
+	req.Header.Set("User-Agent", "claude-cli/1.0")
+	rr := httptest.NewRecorder()
+	server.engine.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d body=%s", rr.Code, http.StatusOK, rr.Body.String())
+	}
+
+	resp := parseServerCodexCatalogResponse(t, rr)
+	if resp.Object != "" || resp.Data != nil {
+		t.Fatalf("expected codex catalog format without object/data, got object=%q data=%v", resp.Object, resp.Data)
+	}
+	if len(resp.Models) == 0 {
+		t.Fatal("expected codex catalog models")
+	}
+	assertServerCodexCatalogCustomModel(t, resp.Models)
+}
+
+func registerServerCodexCatalogTestModel(t *testing.T) {
+	t.Helper()
+
+	modelRegistry := registry.GetGlobalRegistry()
+	clientID := "server-codex-client-model-test-client"
+	modelRegistry.RegisterClient(clientID, "openai", []*registry.ModelInfo{{
+		ID:            "custom-codex-client-model-test",
+		Object:        "model",
+		OwnedBy:       "openai",
+		DisplayName:   "Custom Codex Model",
+		Description:   "Custom model from registry",
+		ContextLength: 123456,
+	}})
+	t.Cleanup(func() {
+		modelRegistry.UnregisterClient(clientID)
+	})
+}
+
+func parseServerCodexCatalogResponse(t *testing.T, rr *httptest.ResponseRecorder) struct {
+	Models []map[string]any `json:"models"`
+	Object string           `json:"object"`
+	Data   []any            `json:"data"`
+} {
+	t.Helper()
+
+	var resp struct {
+		Models []map[string]any `json:"models"`
+		Object string           `json:"object"`
+		Data   []any            `json:"data"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed to parse response JSON: %v; body=%s", err, rr.Body.String())
+	}
+	return resp
+}
+
+func assertServerCodexCatalogCustomModel(t *testing.T, models []map[string]any) {
+	t.Helper()
+
+	custom := findServerCodexCatalogModel(models, "custom-codex-client-model-test")
+	if custom == nil {
+		t.Fatal("expected custom model in codex catalog")
+	}
+	if got, _ := custom["display_name"].(string); got != "Custom Codex Model" {
+		t.Fatalf("custom display_name = %q, want Custom Codex Model", got)
+	}
+	if got, _ := custom["description"].(string); got != "Custom model from registry" {
+		t.Fatalf("custom description = %q, want Custom model from registry", got)
+	}
+	if got, _ := custom["context_window"].(float64); got != 123456 {
+		t.Fatalf("custom context_window = %v, want 123456", custom["context_window"])
+	}
+}
+
+func findServerCodexCatalogModel(models []map[string]any, slug string) map[string]any {
+	for _, model := range models {
+		if got, _ := model["slug"].(string); got == slug {
+			return model
+		}
+	}
+	return nil
 }
 
 func TestDefaultRequestLoggerFactory_UsesResolvedLogDirectory(t *testing.T) {

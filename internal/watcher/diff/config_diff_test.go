@@ -108,6 +108,26 @@ func TestBuildConfigChangeDetails_NoChanges(t *testing.T) {
 	}
 }
 
+func TestBuildConfigChangeDetails_PayloadRules(t *testing.T) {
+	oldCfg := &config.Config{
+		Payload: config.PayloadConfig{
+			Default: []config.PayloadRule{{Params: map[string]any{"temperature": 0.1}}},
+		},
+	}
+	newCfg := &config.Config{
+		Payload: config.PayloadConfig{
+			Default:     []config.PayloadRule{{Params: map[string]any{"temperature": 0.2}}, {Params: map[string]any{"top_p": 0.8}}},
+			OverrideRaw: []config.PayloadRule{{Params: map[string]any{"tool_choice": `{"type":"auto"}`}}},
+			Filter:      []config.PayloadFilterRule{{Params: []string{"metadata.debug"}}},
+		},
+	}
+
+	details := BuildConfigChangeDetails(oldCfg, newCfg)
+	expectContains(t, details, "payload.default: updated (1 -> 2 rules)")
+	expectContains(t, details, "payload.override-raw: updated (0 -> 1 rules)")
+	expectContains(t, details, "payload.filter: updated (0 -> 1 rules)")
+}
+
 func TestBuildConfigChangeDetails_GeminiVertexHeadersAndForceMappings(t *testing.T) {
 	oldCfg := &config.Config{
 		GeminiKey: []config.GeminiKey{

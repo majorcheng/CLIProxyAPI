@@ -91,18 +91,23 @@ func applyPayloadDefaultRulesWithRoot(out, source []byte, rules []config.Payload
 		}
 		for path, value := range rule.Params {
 			fullPath := buildPayloadPath(root, path)
-			if fullPath == "" || gjson.GetBytes(source, fullPath).Exists() {
+			if fullPath == "" {
 				continue
 			}
-			if _, ok := appliedDefaults[fullPath]; ok {
-				continue
+			for _, resolvedPath := range resolvePayloadRulePaths(out, fullPath) {
+				if gjson.GetBytes(source, resolvedPath).Exists() {
+					continue
+				}
+				if _, ok := appliedDefaults[resolvedPath]; ok {
+					continue
+				}
+				updated, errSet := sjson.SetBytes(out, resolvedPath, value)
+				if errSet != nil {
+					continue
+				}
+				out = updated
+				appliedDefaults[resolvedPath] = struct{}{}
 			}
-			updated, errSet := sjson.SetBytes(out, fullPath, value)
-			if errSet != nil {
-				continue
-			}
-			out = updated
-			appliedDefaults[fullPath] = struct{}{}
 		}
 	}
 	return out
@@ -117,22 +122,27 @@ func applyPayloadDefaultRawRulesWithRoot(out, source []byte, rules []config.Payl
 		}
 		for path, value := range rule.Params {
 			fullPath := buildPayloadPath(root, path)
-			if fullPath == "" || gjson.GetBytes(source, fullPath).Exists() {
-				continue
-			}
-			if _, ok := appliedDefaults[fullPath]; ok {
+			if fullPath == "" {
 				continue
 			}
 			rawValue, ok := payloadRawValue(value)
 			if !ok {
 				continue
 			}
-			updated, errSet := sjson.SetRawBytes(out, fullPath, rawValue)
-			if errSet != nil {
-				continue
+			for _, resolvedPath := range resolvePayloadRulePaths(out, fullPath) {
+				if gjson.GetBytes(source, resolvedPath).Exists() {
+					continue
+				}
+				if _, ok := appliedDefaults[resolvedPath]; ok {
+					continue
+				}
+				updated, errSet := sjson.SetRawBytes(out, resolvedPath, rawValue)
+				if errSet != nil {
+					continue
+				}
+				out = updated
+				appliedDefaults[resolvedPath] = struct{}{}
 			}
-			out = updated
-			appliedDefaults[fullPath] = struct{}{}
 		}
 	}
 	return out
@@ -150,11 +160,13 @@ func applyPayloadOverrideRulesWithRoot(out []byte, rules []config.PayloadRule, p
 			if fullPath == "" {
 				continue
 			}
-			updated, errSet := sjson.SetBytes(out, fullPath, value)
-			if errSet != nil {
-				continue
+			for _, resolvedPath := range resolvePayloadRulePaths(out, fullPath) {
+				updated, errSet := sjson.SetBytes(out, resolvedPath, value)
+				if errSet != nil {
+					continue
+				}
+				out = updated
 			}
-			out = updated
 		}
 	}
 	return out
@@ -176,11 +188,13 @@ func applyPayloadOverrideRawRulesWithRoot(out []byte, rules []config.PayloadRule
 			if !ok {
 				continue
 			}
-			updated, errSet := sjson.SetRawBytes(out, fullPath, rawValue)
-			if errSet != nil {
-				continue
+			for _, resolvedPath := range resolvePayloadRulePaths(out, fullPath) {
+				updated, errSet := sjson.SetRawBytes(out, resolvedPath, rawValue)
+				if errSet != nil {
+					continue
+				}
+				out = updated
 			}
-			out = updated
 		}
 	}
 	return out
@@ -198,11 +212,14 @@ func applyPayloadFilterRulesWithRoot(out []byte, rules []config.PayloadFilterRul
 			if fullPath == "" {
 				continue
 			}
-			updated, errDel := sjson.DeleteBytes(out, fullPath)
-			if errDel != nil {
-				continue
+			resolvedPaths := resolvePayloadRulePaths(out, fullPath)
+			for i := len(resolvedPaths) - 1; i >= 0; i-- {
+				updated, errDel := sjson.DeleteBytes(out, resolvedPaths[i])
+				if errDel != nil {
+					continue
+				}
+				out = updated
 			}
-			out = updated
 		}
 	}
 	return out

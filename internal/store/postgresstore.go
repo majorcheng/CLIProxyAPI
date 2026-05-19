@@ -327,6 +327,7 @@ func (s *PostgresStore) List(ctx context.Context) ([]*cliproxyauth.Auth, error) 
 			auth.CreatedAt = registeredAt
 		}
 		cliproxyauth.RestorePersistedRuntimeState(auth, time.Now())
+		applyDisabledMetadata(auth, metadata)
 		auths = append(auths, auth)
 	}
 	if err = rows.Err(); err != nil {

@@ -2,6 +2,8 @@ package executor
 
 import (
 	"encoding/json"
+	"net/http"
+	"reflect"
 	"strings"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
@@ -15,6 +17,11 @@ import (
 // root 主要用于 Gemini CLI 这类把真实请求包在 `request` 字段下的协议；
 // requestedModel 保留客户端原始模型名，让 payload 规则能精确匹配 alias。
 func applyPayloadConfigWithRoot(cfg *config.Config, model, protocol, root string, payload, original []byte, requestedModel string, requestPath string) []byte {
+	return applyPayloadConfigWithRequest(cfg, model, protocol, "", root, payload, original, requestedModel, requestPath, nil)
+}
+
+// applyPayloadConfigWithRequest 按目标协议、来源协议和入站 header 共同应用 payload 规则。
+func applyPayloadConfigWithRequest(cfg *config.Config, model, protocol, fromProtocol, root string, payload, original []byte, requestedModel string, requestPath string, headers http.Header) []byte {
 	if cfg == nil || len(payload) == 0 {
 		return payload
 	}
@@ -30,7 +37,7 @@ func applyPayloadConfigWithRoot(cfg *config.Config, model, protocol, root string
 			if len(source) == 0 {
 				source = payload
 			}
-			out = applyPayloadRulesWithRoot(rules, protocol, root, out, source, candidates)
+			out = applyPayloadRulesWithRoot(rules, protocol, fromProtocol, root, out, source, headers, candidates)
 		}
 	}
 
@@ -72,77 +79,87 @@ func isImagesEndpointRequestPath(path string) bool {
 }
 
 // applyPayloadRulesWithRoot 按既有顺序应用 payload 规则，确保 default、override、filter 的优先级不变。
-func applyPayloadRulesWithRoot(rules config.PayloadConfig, protocol, root string, payload, source []byte, candidates []string) []byte {
+func applyPayloadRulesWithRoot(rules config.PayloadConfig, protocol, fromProtocol, root string, payload, source []byte, headers http.Header, candidates []string) []byte {
 	out := payload
 	appliedDefaults := make(map[string]struct{})
-	out = applyPayloadDefaultRulesWithRoot(out, source, rules.Default, protocol, root, candidates, appliedDefaults)
-	out = applyPayloadDefaultRawRulesWithRoot(out, source, rules.DefaultRaw, protocol, root, candidates, appliedDefaults)
-	out = applyPayloadOverrideRulesWithRoot(out, rules.Override, protocol, root, candidates)
-	out = applyPayloadOverrideRawRulesWithRoot(out, rules.OverrideRaw, protocol, root, candidates)
-	return applyPayloadFilterRulesWithRoot(out, rules.Filter, protocol, root, candidates)
+	out = applyPayloadDefaultRulesWithRoot(out, source, rules.Default, protocol, fromProtocol, root, headers, candidates, appliedDefaults)
+	out = applyPayloadDefaultRawRulesWithRoot(out, source, rules.DefaultRaw, protocol, fromProtocol, root, headers, candidates, appliedDefaults)
+	out = applyPayloadOverrideRulesWithRoot(out, rules.Override, protocol, fromProtocol, root, headers, candidates)
+	out = applyPayloadOverrideRawRulesWithRoot(out, rules.OverrideRaw, protocol, fromProtocol, root, headers, candidates)
+	return applyPayloadFilterRulesWithRoot(out, rules.Filter, protocol, fromProtocol, root, headers, candidates)
 }
 
 // applyPayloadDefaultRulesWithRoot 只在原始请求缺少字段时写入普通 JSON 值。
-func applyPayloadDefaultRulesWithRoot(out, source []byte, rules []config.PayloadRule, protocol, root string, candidates []string, appliedDefaults map[string]struct{}) []byte {
+func applyPayloadDefaultRulesWithRoot(out, source []byte, rules []config.PayloadRule, protocol, fromProtocol, root string, headers http.Header, candidates []string, appliedDefaults map[string]struct{}) []byte {
 	for i := range rules {
 		rule := &rules[i]
-		if !payloadModelRulesMatch(rule.Models, protocol, candidates) {
+		if !payloadModelRulesMatch(rule.Models, protocol, fromProtocol, headers, out, root, candidates) {
 			continue
 		}
 		for path, value := range rule.Params {
 			fullPath := buildPayloadPath(root, path)
-			if fullPath == "" || gjson.GetBytes(source, fullPath).Exists() {
+			if fullPath == "" {
 				continue
 			}
-			if _, ok := appliedDefaults[fullPath]; ok {
-				continue
+			for _, resolvedPath := range resolvePayloadRulePaths(out, fullPath) {
+				if gjson.GetBytes(source, resolvedPath).Exists() {
+					continue
+				}
+				if _, ok := appliedDefaults[resolvedPath]; ok {
+					continue
+				}
+				updated, errSet := sjson.SetBytes(out, resolvedPath, value)
+				if errSet != nil {
+					continue
+				}
+				out = updated
+				appliedDefaults[resolvedPath] = struct{}{}
 			}
-			updated, errSet := sjson.SetBytes(out, fullPath, value)
-			if errSet != nil {
-				continue
-			}
-			out = updated
-			appliedDefaults[fullPath] = struct{}{}
 		}
 	}
 	return out
 }
 
 // applyPayloadDefaultRawRulesWithRoot 只在原始请求缺少字段时写入 raw JSON，避免字符串被二次编码。
-func applyPayloadDefaultRawRulesWithRoot(out, source []byte, rules []config.PayloadRule, protocol, root string, candidates []string, appliedDefaults map[string]struct{}) []byte {
+func applyPayloadDefaultRawRulesWithRoot(out, source []byte, rules []config.PayloadRule, protocol, fromProtocol, root string, headers http.Header, candidates []string, appliedDefaults map[string]struct{}) []byte {
 	for i := range rules {
 		rule := &rules[i]
-		if !payloadModelRulesMatch(rule.Models, protocol, candidates) {
+		if !payloadModelRulesMatch(rule.Models, protocol, fromProtocol, headers, out, root, candidates) {
 			continue
 		}
 		for path, value := range rule.Params {
 			fullPath := buildPayloadPath(root, path)
-			if fullPath == "" || gjson.GetBytes(source, fullPath).Exists() {
-				continue
-			}
-			if _, ok := appliedDefaults[fullPath]; ok {
+			if fullPath == "" {
 				continue
 			}
 			rawValue, ok := payloadRawValue(value)
 			if !ok {
 				continue
 			}
-			updated, errSet := sjson.SetRawBytes(out, fullPath, rawValue)
-			if errSet != nil {
-				continue
+			for _, resolvedPath := range resolvePayloadRulePaths(out, fullPath) {
+				if gjson.GetBytes(source, resolvedPath).Exists() {
+					continue
+				}
+				if _, ok := appliedDefaults[resolvedPath]; ok {
+					continue
+				}
+				updated, errSet := sjson.SetRawBytes(out, resolvedPath, rawValue)
+				if errSet != nil {
+					continue
+				}
+				out = updated
+				appliedDefaults[resolvedPath] = struct{}{}
 			}
-			out = updated
-			appliedDefaults[fullPath] = struct{}{}
 		}
 	}
 	return out
 }
 
 // applyPayloadOverrideRulesWithRoot 按匹配顺序覆盖普通 JSON 值，后命中的规则自然覆盖前值。
-func applyPayloadOverrideRulesWithRoot(out []byte, rules []config.PayloadRule, protocol, root string, candidates []string) []byte {
+func applyPayloadOverrideRulesWithRoot(out []byte, rules []config.PayloadRule, protocol, fromProtocol, root string, headers http.Header, candidates []string) []byte {
 	for i := range rules {
 		rule := &rules[i]
-		if !payloadModelRulesMatch(rule.Models, protocol, candidates) {
+		if !payloadModelRulesMatch(rule.Models, protocol, fromProtocol, headers, out, root, candidates) {
 			continue
 		}
 		for path, value := range rule.Params {
@@ -150,21 +167,23 @@ func applyPayloadOverrideRulesWithRoot(out []byte, rules []config.PayloadRule, p
 			if fullPath == "" {
 				continue
 			}
-			updated, errSet := sjson.SetBytes(out, fullPath, value)
-			if errSet != nil {
-				continue
+			for _, resolvedPath := range resolvePayloadRulePaths(out, fullPath) {
+				updated, errSet := sjson.SetBytes(out, resolvedPath, value)
+				if errSet != nil {
+					continue
+				}
+				out = updated
 			}
-			out = updated
 		}
 	}
 	return out
 }
 
 // applyPayloadOverrideRawRulesWithRoot 按匹配顺序覆盖 raw JSON，保证数组和对象片段保持原始类型。
-func applyPayloadOverrideRawRulesWithRoot(out []byte, rules []config.PayloadRule, protocol, root string, candidates []string) []byte {
+func applyPayloadOverrideRawRulesWithRoot(out []byte, rules []config.PayloadRule, protocol, fromProtocol, root string, headers http.Header, candidates []string) []byte {
 	for i := range rules {
 		rule := &rules[i]
-		if !payloadModelRulesMatch(rule.Models, protocol, candidates) {
+		if !payloadModelRulesMatch(rule.Models, protocol, fromProtocol, headers, out, root, candidates) {
 			continue
 		}
 		for path, value := range rule.Params {
@@ -176,21 +195,23 @@ func applyPayloadOverrideRawRulesWithRoot(out []byte, rules []config.PayloadRule
 			if !ok {
 				continue
 			}
-			updated, errSet := sjson.SetRawBytes(out, fullPath, rawValue)
-			if errSet != nil {
-				continue
+			for _, resolvedPath := range resolvePayloadRulePaths(out, fullPath) {
+				updated, errSet := sjson.SetRawBytes(out, resolvedPath, rawValue)
+				if errSet != nil {
+					continue
+				}
+				out = updated
 			}
-			out = updated
 		}
 	}
 	return out
 }
 
 // applyPayloadFilterRulesWithRoot 删除匹配规则指定的字段，保持 filter 在所有写入规则之后执行。
-func applyPayloadFilterRulesWithRoot(out []byte, rules []config.PayloadFilterRule, protocol, root string, candidates []string) []byte {
+func applyPayloadFilterRulesWithRoot(out []byte, rules []config.PayloadFilterRule, protocol, fromProtocol, root string, headers http.Header, candidates []string) []byte {
 	for i := range rules {
 		rule := &rules[i]
-		if !payloadModelRulesMatch(rule.Models, protocol, candidates) {
+		if !payloadModelRulesMatch(rule.Models, protocol, fromProtocol, headers, out, root, candidates) {
 			continue
 		}
 		for _, path := range rule.Params {
@@ -198,11 +219,14 @@ func applyPayloadFilterRulesWithRoot(out []byte, rules []config.PayloadFilterRul
 			if fullPath == "" {
 				continue
 			}
-			updated, errDel := sjson.DeleteBytes(out, fullPath)
-			if errDel != nil {
-				continue
+			resolvedPaths := resolvePayloadRulePaths(out, fullPath)
+			for i := len(resolvedPaths) - 1; i >= 0; i-- {
+				updated, errDel := sjson.DeleteBytes(out, resolvedPaths[i])
+				if errDel != nil {
+					continue
+				}
+				out = updated
 			}
-			out = updated
 		}
 	}
 	return out
@@ -355,7 +379,7 @@ func payloadResultRaw(item gjson.Result) string {
 	return string(raw)
 }
 
-func payloadModelRulesMatch(rules []config.PayloadModelRule, protocol string, models []string) bool {
+func payloadModelRulesMatch(rules []config.PayloadModelRule, protocol string, fromProtocol string, headers http.Header, payload []byte, root string, models []string) bool {
 	if len(rules) == 0 || len(models) == 0 {
 		return false
 	}
@@ -368,12 +392,222 @@ func payloadModelRulesMatch(rules []config.PayloadModelRule, protocol string, mo
 			if ep := strings.TrimSpace(entry.Protocol); ep != "" && protocol != "" && !strings.EqualFold(ep, protocol) {
 				continue
 			}
-			if matchModelPattern(name, model) {
+			if !payloadFromProtocolMatches(entry.FromProtocol, fromProtocol) {
+				continue
+			}
+			if !payloadHeadersMatch(headers, entry.Headers) {
+				continue
+			}
+			if !matchModelPattern(name, model) {
+				continue
+			}
+			if payloadModelRuleConditionsMatch(payload, root, entry) {
 				return true
 			}
 		}
 	}
 	return false
+}
+
+func payloadModelRuleConditionsMatch(payload []byte, root string, rule config.PayloadModelRule) bool {
+	if !payloadMatchConditionsMatch(payload, root, rule.Match) {
+		return false
+	}
+	if !payloadNotMatchConditionsMatch(payload, root, rule.NotMatch) {
+		return false
+	}
+	if !payloadExistConditionsMatch(payload, root, rule.Exist) {
+		return false
+	}
+	if !payloadNotExistConditionsMatch(payload, root, rule.NotExist) {
+		return false
+	}
+	return true
+}
+
+func payloadMatchConditionsMatch(payload []byte, root string, conditions []map[string]any) bool {
+	for _, condition := range conditions {
+		for path, value := range condition {
+			if strings.TrimSpace(path) == "" {
+				continue
+			}
+			if !payloadPathMatchesValue(payload, buildPayloadPath(root, path), value) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func payloadNotMatchConditionsMatch(payload []byte, root string, conditions []map[string]any) bool {
+	for _, condition := range conditions {
+		for path, value := range condition {
+			if strings.TrimSpace(path) == "" {
+				continue
+			}
+			if payloadPathMatchesValue(payload, buildPayloadPath(root, path), value) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func payloadExistConditionsMatch(payload []byte, root string, paths []string) bool {
+	for _, path := range paths {
+		if strings.TrimSpace(path) == "" {
+			continue
+		}
+		if !payloadPathExists(payload, buildPayloadPath(root, path)) {
+			return false
+		}
+	}
+	return true
+}
+
+func payloadNotExistConditionsMatch(payload []byte, root string, paths []string) bool {
+	for _, path := range paths {
+		if strings.TrimSpace(path) == "" {
+			continue
+		}
+		if payloadPathExists(payload, buildPayloadPath(root, path)) {
+			return false
+		}
+	}
+	return true
+}
+
+func payloadPathMatchesValue(payload []byte, path string, value any) bool {
+	for _, resolvedPath := range resolvePayloadRulePaths(payload, path) {
+		result := gjson.GetBytes(payload, resolvedPath)
+		if !result.Exists() {
+			continue
+		}
+		if payloadResultEquals(result, value) {
+			return true
+		}
+	}
+	return false
+}
+
+func payloadPathExists(payload []byte, path string) bool {
+	for _, resolvedPath := range resolvePayloadRulePaths(payload, path) {
+		result := gjson.GetBytes(payload, resolvedPath)
+		if result.Exists() && result.Type != gjson.Null {
+			return true
+		}
+	}
+	return false
+}
+
+func payloadResultEquals(result gjson.Result, value any) bool {
+	actual, ok := normalizedPayloadResult(result)
+	if !ok {
+		return false
+	}
+	expected, ok := normalizedPayloadValue(value)
+	if !ok {
+		return false
+	}
+	return reflect.DeepEqual(actual, expected)
+}
+
+func normalizedPayloadResult(result gjson.Result) (any, bool) {
+	if !result.Exists() {
+		return nil, false
+	}
+	raw := strings.TrimSpace(result.Raw)
+	if raw == "" {
+		encoded, errMarshal := json.Marshal(result.Value())
+		if errMarshal != nil {
+			return nil, false
+		}
+		raw = string(encoded)
+	}
+	return normalizedPayloadJSON([]byte(raw))
+}
+
+func normalizedPayloadValue(value any) (any, bool) {
+	encoded, errMarshal := json.Marshal(value)
+	if errMarshal != nil {
+		return nil, false
+	}
+	return normalizedPayloadJSON(encoded)
+}
+
+func normalizedPayloadJSON(data []byte) (any, bool) {
+	if len(strings.TrimSpace(string(data))) == 0 {
+		return nil, false
+	}
+	var out any
+	if errUnmarshal := json.Unmarshal(data, &out); errUnmarshal != nil {
+		return nil, false
+	}
+	return out, true
+}
+
+func payloadFromProtocolMatches(pattern, fromProtocol string) bool {
+	pattern = normalizePayloadFromProtocol(pattern)
+	if pattern == "" {
+		return true
+	}
+	fromProtocol = normalizePayloadFromProtocol(fromProtocol)
+	if fromProtocol == "" {
+		return false
+	}
+	return strings.EqualFold(pattern, fromProtocol)
+}
+
+func normalizePayloadFromProtocol(protocol string) string {
+	protocol = strings.ToLower(strings.TrimSpace(protocol))
+	switch protocol {
+	case "openai-response", "openai-responses", "response":
+		return "responses"
+	case "gemini-cli":
+		return "gemini"
+	default:
+		return protocol
+	}
+}
+
+func payloadHeadersMatch(headers http.Header, rules map[string]string) bool {
+	if len(rules) == 0 {
+		return true
+	}
+	for key, pattern := range rules {
+		key = strings.TrimSpace(key)
+		if key == "" {
+			continue
+		}
+		values := payloadHeaderValues(headers, key)
+		if len(values) == 0 {
+			return false
+		}
+		matched := false
+		for _, value := range values {
+			if matchModelPattern(pattern, value) {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			return false
+		}
+	}
+	return true
+}
+
+func payloadHeaderValues(headers http.Header, key string) []string {
+	if headers == nil {
+		return nil
+	}
+	var values []string
+	for headerKey, headerValues := range headers {
+		if strings.EqualFold(headerKey, key) {
+			values = append(values, headerValues...)
+		}
+	}
+	return values
 }
 
 func payloadModelCandidates(model, requestedModel string) []string {
@@ -508,12 +742,29 @@ func payloadConfigNeedsOriginal(cfg *config.Config, model, protocol, requestedMo
 		return false
 	}
 	for i := range cfg.Payload.Default {
-		if payloadModelRulesMatch(cfg.Payload.Default[i].Models, protocol, candidates) {
+		if payloadModelRulesMayMatch(cfg.Payload.Default[i].Models, protocol, candidates) {
 			return true
 		}
 	}
 	for i := range cfg.Payload.DefaultRaw {
-		if payloadModelRulesMatch(cfg.Payload.DefaultRaw[i].Models, protocol, candidates) {
+		if payloadModelRulesMayMatch(cfg.Payload.DefaultRaw[i].Models, protocol, candidates) {
+			return true
+		}
+	}
+	return false
+}
+
+// payloadModelRulesMayMatch 只用模型和目标协议判断 default 是否可能命中，用于决定是否保留 original source。
+func payloadModelRulesMayMatch(rules []config.PayloadModelRule, protocol string, models []string) bool {
+	for _, model := range models {
+		for _, entry := range rules {
+			name := strings.TrimSpace(entry.Name)
+			if name == "" || !matchModelPattern(name, model) {
+				continue
+			}
+			if ep := strings.TrimSpace(entry.Protocol); ep != "" && protocol != "" && !strings.EqualFold(ep, protocol) {
+				continue
+			}
 			return true
 		}
 	}

@@ -1681,6 +1681,11 @@ func authMaintenanceRefreshUnauthorized(auth *coreauth.Auth, result *coreauth.Re
 	if auth.LastError.HTTPStatus != http.StatusUnauthorized {
 		return false
 	}
+	// watcher reload / 进程重启后，refresh 终态失败正文可能不会继续保留，
+	// 但轻量恢复出的机器错误码已经足够表达“这是一条 refresh 401 语义”。
+	if authMaintenanceCodexTerminalRefresh401(auth, nil) {
+		return true
+	}
 	message := strings.ToLower(strings.TrimSpace(auth.LastError.Message))
 	if message == "" {
 		return false
@@ -2577,12 +2582,16 @@ func (s *Service) registerModelsForAuth(a *coreauth.Auth) {
 						}
 						thinking := m.Thinking
 						userDefined := thinking == nil
+						modelType := "openai-compatibility"
+						if m.Image {
+							modelType = registry.OpenAIImageModelType
+						}
 						ms = append(ms, &ModelInfo{
 							ID:          modelID,
 							Object:      "model",
 							Created:     time.Now().Unix(),
 							OwnedBy:     compat.Name,
-							Type:        "openai-compatibility",
+							Type:        modelType,
 							DisplayName: modelID,
 							UserDefined: userDefined,
 							Thinking:    thinking,

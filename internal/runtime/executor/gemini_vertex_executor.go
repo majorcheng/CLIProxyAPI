@@ -333,7 +333,7 @@ func (e *GeminiVertexExecutor) executeWithServiceAccount(ctx context.Context, au
 
 		body = fixGeminiImageAspectRatio(baseModel, body)
 		requestedModel := payloadRequestedModel(opts, req.Model)
-		body = applyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", body, originalTranslated, requestedModel, payloadRequestPath(opts))
+		body = applyPayloadConfigWithRequest(e.cfg, baseModel, to.String(), from.String(), "", body, originalTranslated, requestedModel, payloadRequestPath(opts), opts.Headers)
 		body, _ = sjson.SetBytes(body, "model", baseModel)
 		body = stripVertexOpenAIResponsesToolCallIDs(body, from.String())
 	}
@@ -449,7 +449,7 @@ func (e *GeminiVertexExecutor) executeWithAPIKey(ctx context.Context, auth *clip
 
 	body = fixGeminiImageAspectRatio(baseModel, body)
 	requestedModel := payloadRequestedModel(opts, req.Model)
-	body = applyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", body, originalTranslated, requestedModel, payloadRequestPath(opts))
+	body = applyPayloadConfigWithRequest(e.cfg, baseModel, to.String(), from.String(), "", body, originalTranslated, requestedModel, payloadRequestPath(opts), opts.Headers)
 	body, _ = sjson.SetBytes(body, "model", baseModel)
 	body = stripVertexOpenAIResponsesToolCallIDs(body, from.String())
 
@@ -555,7 +555,7 @@ func (e *GeminiVertexExecutor) executeStreamWithServiceAccount(ctx context.Conte
 
 	body = fixGeminiImageAspectRatio(baseModel, body)
 	requestedModel := payloadRequestedModel(opts, req.Model)
-	body = applyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", body, originalTranslated, requestedModel, payloadRequestPath(opts))
+	body = applyPayloadConfigWithRequest(e.cfg, baseModel, to.String(), from.String(), "", body, originalTranslated, requestedModel, payloadRequestPath(opts), opts.Headers)
 	body, _ = sjson.SetBytes(body, "model", baseModel)
 	body = stripVertexOpenAIResponsesToolCallIDs(body, from.String())
 
@@ -686,7 +686,7 @@ func (e *GeminiVertexExecutor) executeStreamWithAPIKey(ctx context.Context, auth
 
 	body = fixGeminiImageAspectRatio(baseModel, body)
 	requestedModel := payloadRequestedModel(opts, req.Model)
-	body = applyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", body, originalTranslated, requestedModel, payloadRequestPath(opts))
+	body = applyPayloadConfigWithRequest(e.cfg, baseModel, to.String(), from.String(), "", body, originalTranslated, requestedModel, payloadRequestPath(opts), opts.Headers)
 	body, _ = sjson.SetBytes(body, "model", baseModel)
 	body = stripVertexOpenAIResponsesToolCallIDs(body, from.String())
 

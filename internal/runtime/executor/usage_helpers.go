@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	internallogging "github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
 	"github.com/tidwall/gjson"
@@ -64,7 +65,7 @@ func (r *usageReporter) publishAdditionalModel(ctx context.Context, model string
 	if !hasNonZeroTokenUsage(detail) {
 		return
 	}
-	usage.PublishRecord(ctx, r.buildRecordForModel(model, detail, false))
+	r.publishRecord(ctx, r.buildRecordForModel(model, detail, false))
 }
 
 func (r *usageReporter) trackFailure(ctx context.Context, errPtr *error) {
@@ -84,7 +85,7 @@ func (r *usageReporter) publishWithOutcome(ctx context.Context, detail usage.Det
 	// 成功请求即使 usage 全为 0 也要落一条记录；
 	// 否则管理端会把“请求成功但上游未计费/未返回 token”的场景误判成根本没发生过。
 	r.once.Do(func() {
-		usage.PublishRecord(ctx, r.buildRecord(detail, failed))
+		r.publishRecord(ctx, r.buildRecord(detail, failed))
 	})
 }
 
@@ -115,8 +116,13 @@ func (r *usageReporter) ensurePublished(ctx context.Context) {
 		return
 	}
 	r.once.Do(func() {
-		usage.PublishRecord(ctx, r.buildRecord(usage.Detail{}, false))
+		r.publishRecord(ctx, r.buildRecord(usage.Detail{}, false))
 	})
+}
+
+func (r *usageReporter) publishRecord(ctx context.Context, record usage.Record) {
+	record.ResponseHeaders = internallogging.GetResponseHeaders(ctx)
+	usage.PublishRecord(ctx, record)
 }
 
 func (r *usageReporter) buildRecord(detail usage.Detail, failed bool) usage.Record {

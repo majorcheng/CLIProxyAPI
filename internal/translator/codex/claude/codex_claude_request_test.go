@@ -8,6 +8,8 @@ import (
 	"github.com/tidwall/gjson"
 )
 
+const codexCallIDLimitForTest = 64
+
 func TestConvertClaudeRequestToCodex_SystemMessageScenarios(t *testing.T) {
 	tests := []struct {
 		name             string
@@ -202,6 +204,56 @@ func TestConvertClaudeRequestToCodex_ToolChoiceSpecificFunctionUsesConvertedName
 	}
 	if choiceName == longName {
 		t.Fatalf("tool_choice.name should use shortened Codex tool name. Output: %s", string(result))
+	}
+}
+
+func TestShortenCodexCallIDIfNeededIsStableAndBounded(t *testing.T) {
+	longID := "toolu_" + strings.Repeat("a", 90)
+
+	first := shortenCodexCallIDIfNeeded(longID)
+	second := shortenCodexCallIDIfNeeded(longID)
+
+	if first != second {
+		t.Fatalf("short id 不稳定：first=%q second=%q", first, second)
+	}
+	if len(first) > codexCallIDLimitForTest {
+		t.Fatalf("short id length = %d, want <= %d: %q", len(first), codexCallIDLimitForTest, first)
+	}
+	if first == longID {
+		t.Fatalf("long id 未被缩短：%q", first)
+	}
+	if !strings.Contains(first, "_") {
+		t.Fatalf("short id = %q，期望包含哈希分隔符", first)
+	}
+}
+
+func TestConvertClaudeRequestToCodex_ShortensToolUseAndResultCallIDs(t *testing.T) {
+	longID := "toolu_" + strings.Repeat("b", 90)
+	inputJSON := `{
+		"model": "claude-3-opus",
+		"messages": [
+			{"role": "assistant", "content": [
+				{"type": "tool_use", "id": "` + longID + `", "name": "lookup", "input": {"q": "hi"}}
+			]},
+			{"role": "user", "content": [
+				{"type": "tool_result", "tool_use_id": "` + longID + `", "content": "ok"}
+			]}
+		]
+	}`
+
+	result := ConvertClaudeRequestToCodex("test-model", []byte(inputJSON), false)
+	resultJSON := gjson.ParseBytes(result)
+	callID := resultJSON.Get(`input.#(type=="function_call").call_id`).String()
+	outputCallID := resultJSON.Get(`input.#(type=="function_call_output").call_id`).String()
+
+	if callID == "" || outputCallID == "" {
+		t.Fatalf("未找到转换后的 call_id：%s", string(result))
+	}
+	if callID != outputCallID {
+		t.Fatalf("tool_use/tool_result call_id 不一致：%q vs %q", callID, outputCallID)
+	}
+	if len(callID) > codexCallIDLimitForTest {
+		t.Fatalf("call_id length = %d, want <= %d: %q", len(callID), codexCallIDLimitForTest, callID)
 	}
 }
 

@@ -89,6 +89,18 @@ func TestObjectTokenStoreReadAuthFileRestoresRuntimeState(t *testing.T) {
 	})
 }
 
+func TestGitTokenStoreReadAuthFileRestoresDisabledMetadata(t *testing.T) {
+	testTokenStoreReadAuthFileRestoresDisabledMetadata(t, func() authFileReader {
+		return &GitTokenStore{}
+	})
+}
+
+func TestObjectTokenStoreReadAuthFileRestoresDisabledMetadata(t *testing.T) {
+	testTokenStoreReadAuthFileRestoresDisabledMetadata(t, func() authFileReader {
+		return &ObjectTokenStore{}
+	})
+}
+
 type authFileReader interface {
 	readAuthFile(path, baseDir string) (*cliproxyauth.Auth, error)
 }
@@ -180,5 +192,45 @@ func testTokenStoreReadAuthFileRestoresRuntimeState(t *testing.T, newReader func
 	}
 	if _, ok := auth.Metadata[cliproxyauth.PersistedRuntimeStateMetadataKey]; ok {
 		t.Fatal("expected metadata to strip persisted runtime state after restore")
+	}
+}
+
+func testTokenStoreReadAuthFileRestoresDisabledMetadata(t *testing.T, newReader func() authFileReader) {
+	t.Helper()
+
+	tempDir := t.TempDir()
+	path := filepath.Join(tempDir, "codex-disabled.json")
+	if err := os.WriteFile(path, []byte(`{"type":"codex","disabled":true}`), 0o600); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	auth, err := newReader().readAuthFile(path, tempDir)
+	if err != nil {
+		t.Fatalf("readAuthFile() error = %v", err)
+	}
+	if auth == nil {
+		t.Fatal("readAuthFile() returned nil auth")
+	}
+	if !auth.Disabled {
+		t.Fatal("expected auth.Disabled restored from metadata")
+	}
+	if auth.Status != cliproxyauth.StatusDisabled {
+		t.Fatalf("auth.Status = %q, want %q", auth.Status, cliproxyauth.StatusDisabled)
+	}
+}
+
+func TestApplyDisabledMetadataMarksAuthDisabled(t *testing.T) {
+	auth := &cliproxyauth.Auth{Status: cliproxyauth.StatusActive, FailureHTTPStatus: 401}
+
+	applyDisabledMetadata(auth, map[string]any{"disabled": true})
+
+	if !auth.Disabled {
+		t.Fatal("expected auth.Disabled = true")
+	}
+	if auth.Status != cliproxyauth.StatusDisabled {
+		t.Fatalf("auth.Status = %q, want %q", auth.Status, cliproxyauth.StatusDisabled)
+	}
+	if auth.FailureHTTPStatus != 0 {
+		t.Fatalf("auth.FailureHTTPStatus = %d, want 0", auth.FailureHTTPStatus)
 	}
 }

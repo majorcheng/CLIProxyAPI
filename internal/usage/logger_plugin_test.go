@@ -37,6 +37,41 @@ func TestRequestStatisticsRecordIncludesLatency(t *testing.T) {
 	}
 }
 
+func TestRequestStatisticsRecordFiltersAndClonesResponseHeaders(t *testing.T) {
+	stats := NewRequestStatistics()
+	headers := http.Header{
+		"Authorization":  []string{"Bearer secret"},
+		"Connection":     []string{"X-Internal-Hop"},
+		"Set-Cookie":     []string{"session=secret"},
+		"X-Api-Key":      []string{"secret-key"},
+		"X-Internal-Hop": []string{"must-drop"},
+		"X-Litellm-Key":  []string{"gateway-secret"},
+		"X-Request-Id":   []string{"upstream-1"},
+	}
+
+	stats.Record(context.Background(), coreusage.Record{
+		APIKey:          "test-key",
+		Model:           "gpt-5.4",
+		RequestedAt:     time.Date(2026, 3, 20, 12, 0, 0, 0, time.UTC),
+		ResponseHeaders: headers,
+		Detail:          coreusage.Detail{TotalTokens: 1},
+	})
+	headers.Set("X-Request-Id", "mutated")
+
+	details := stats.Snapshot().APIs["test-key"].Models["gpt-5.4"].Details
+	if len(details) != 1 {
+		t.Fatalf("details len = %d, want 1", len(details))
+	}
+	if got := details[0].ResponseHeaders.Get("X-Request-Id"); got != "upstream-1" {
+		t.Fatalf("response_headers X-Request-Id = %q, want upstream-1", got)
+	}
+	for _, blocked := range []string{"Authorization", "Set-Cookie", "X-Api-Key", "X-Internal-Hop", "X-Litellm-Key"} {
+		if got := details[0].ResponseHeaders.Get(blocked); got != "" {
+			t.Fatalf("response_headers %s = %q, want filtered", blocked, got)
+		}
+	}
+}
+
 func TestRequestStatisticsRecordUsesStableMetadataAfterGinMutation(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 

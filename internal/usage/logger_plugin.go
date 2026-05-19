@@ -21,6 +21,39 @@ import (
 var statisticsEnabled atomic.Bool
 var statisticsRetentionDays atomic.Int64
 
+var usageResponseHeaderPrefixes = []string{
+	"x-litellm-",
+	"helicone-",
+	"x-portkey-",
+	"cf-aig-",
+	"x-kong-",
+	"x-bt-",
+}
+
+var usageBlockedResponseHeaders = map[string]struct{}{
+	"Authentication-Info":       {},
+	"Authorization":             {},
+	"Connection":                {},
+	"Content-Encoding":          {},
+	"Content-Length":            {},
+	"Cookie":                    {},
+	"Keep-Alive":                {},
+	"Proxy-Authenticate":        {},
+	"Proxy-Authentication-Info": {},
+	"Proxy-Authorization":       {},
+	"Set-Cookie":                {},
+	"Te":                        {},
+	"Trailer":                   {},
+	"Transfer-Encoding":         {},
+	"Upgrade":                   {},
+	"Www-Authenticate":          {},
+	"X-Access-Token":            {},
+	"X-Api-Key":                 {},
+	"X-Auth-Token":              {},
+	"X-Refresh-Token":           {},
+	"X-Session-Token":           {},
+}
+
 func init() {
 	statisticsEnabled.Store(true)
 	statisticsRetentionDays.Store(0)
@@ -115,17 +148,18 @@ type modelStats struct {
 
 // RequestDetail stores the timestamp, latency, and token usage for a single request.
 type RequestDetail struct {
-	Timestamp       time.Time  `json:"timestamp"`
-	LatencyMs       int64      `json:"latency_ms"`
-	RequestType     string     `json:"request_type,omitempty"`
-	FirstTokenMs    int64      `json:"first_token_ms,omitempty"`
-	UserAgent       string     `json:"user_agent,omitempty"`
-	Source          string     `json:"source"`
-	ClientIP        string     `json:"client_ip"`
-	AuthIndex       string     `json:"auth_index"`
-	ReasoningEffort string     `json:"reasoning_effort,omitempty"`
-	Tokens          TokenStats `json:"tokens"`
-	Failed          bool       `json:"failed"`
+	Timestamp       time.Time   `json:"timestamp"`
+	LatencyMs       int64       `json:"latency_ms"`
+	RequestType     string      `json:"request_type,omitempty"`
+	FirstTokenMs    int64       `json:"first_token_ms,omitempty"`
+	UserAgent       string      `json:"user_agent,omitempty"`
+	Source          string      `json:"source"`
+	ClientIP        string      `json:"client_ip"`
+	AuthIndex       string      `json:"auth_index"`
+	ReasoningEffort string      `json:"reasoning_effort,omitempty"`
+	Tokens          TokenStats  `json:"tokens"`
+	Failed          bool        `json:"failed"`
+	ResponseHeaders http.Header `json:"response_headers,omitempty"`
 }
 
 // TokenStats captures the token usage breakdown for a request.
@@ -257,6 +291,7 @@ func (s *RequestStatistics) Record(ctx context.Context, record coreusage.Record)
 		ReasoningEffort: resolveReasoningEffort(ctx),
 		Tokens:          detail,
 		Failed:          failed,
+		ResponseHeaders: filterResponseHeadersForUsage(record.ResponseHeaders),
 	})
 
 	s.requestsByDay[dayKey]++
@@ -264,6 +299,58 @@ func (s *RequestStatistics) Record(ctx context.Context, record coreusage.Record)
 	s.tokensByDay[dayKey] += totalTokens
 	s.tokensByHour[hourKey] += totalTokens
 	s.markChangedLocked()
+}
+
+// filterResponseHeadersForUsage 只持久化安全的诊断响应头，避免 cookie/token 类头进入 usage 导出。
+func filterResponseHeadersForUsage(headers http.Header) http.Header {
+	if len(headers) == 0 {
+		return nil
+	}
+	connectionScoped := usageConnectionScopedHeaders(headers)
+	out := make(http.Header)
+	for key, values := range headers {
+		canonicalKey := http.CanonicalHeaderKey(key)
+		if _, blocked := usageBlockedResponseHeaders[canonicalKey]; blocked {
+			continue
+		}
+		if _, scoped := connectionScoped[canonicalKey]; scoped {
+			continue
+		}
+		if usageResponseHeaderHasBlockedPrefix(key) {
+			continue
+		}
+		out[key] = append([]string(nil), values...)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// usageConnectionScopedHeaders 解析 Connection 头声明的 hop-by-hop 扩展头。
+func usageConnectionScopedHeaders(headers http.Header) map[string]struct{} {
+	scoped := make(map[string]struct{})
+	for _, rawValue := range headers.Values("Connection") {
+		for _, token := range strings.Split(rawValue, ",") {
+			headerName := strings.TrimSpace(token)
+			if headerName == "" {
+				continue
+			}
+			scoped[http.CanonicalHeaderKey(headerName)] = struct{}{}
+		}
+	}
+	return scoped
+}
+
+// usageResponseHeaderHasBlockedPrefix 过滤常见 AI 网关注入的指纹型响应头。
+func usageResponseHeaderHasBlockedPrefix(key string) bool {
+	lowerKey := strings.ToLower(key)
+	for _, prefix := range usageResponseHeaderPrefixes {
+		if strings.HasPrefix(lowerKey, prefix) {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *RequestStatistics) applyRetentionIfNeededLocked(now time.Time) {

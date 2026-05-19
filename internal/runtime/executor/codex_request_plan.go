@@ -119,7 +119,7 @@ func (e *CodexExecutor) buildCodexRequestPlan(ctx context.Context, req cliproxye
 	}
 
 	requestPath := payloadRequestPath(opts)
-	body = applyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", body, originalTranslated, requestedModel, requestPath)
+	body = applyPayloadConfigWithRequest(e.cfg, baseModel, to.String(), from.String(), "", body, originalTranslated, requestedModel, requestPath, opts.Headers)
 	disableImageGeneration := imageGenerationDisabledForRequest(e.cfg, requestPath)
 	body = normalizeCodexPreparedBody(body, mode, baseModel, disableImageGeneration)
 

@@ -296,7 +296,7 @@ func assertUnsupportedImagesEndpointResponse(t *testing.T, resp *httptest.Respon
 		t.Fatalf("status = %d, want %d: %s", resp.Code, http.StatusBadRequest, resp.Body.String())
 	}
 	message := gjson.GetBytes(resp.Body.Bytes(), "error.message").String()
-	wantMessage := "Invalid request: model \"" + model + "\" is not supported for " + endpointPath + " (only " + defaultImagesToolModel + " is supported)"
+	wantMessage := "Invalid request: model \"" + model + "\" is not supported for " + endpointPath + " (only " + defaultImagesToolModel + " or configured OpenAI-compatible image models are supported)"
 	if message != wantMessage {
 		t.Fatalf("error.message = %q, want %q", message, wantMessage)
 	}

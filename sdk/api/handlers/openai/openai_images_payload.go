@@ -9,6 +9,8 @@ import (
 	"strings"
 
 	"github.com/gin-gonic/gin"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
+	apihandlers "github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers"
 )
 
 const (
@@ -103,7 +105,7 @@ func firstMultipartFormValue(form *multipart.Form, key string) string {
 
 // readValidJSONBody 统一读取并校验 JSON 请求体，避免重复散落错误格式。
 func readValidJSONBody(c *gin.Context) ([]byte, bool) {
-	rawJSON, err := c.GetRawData()
+	rawJSON, err := apihandlers.ReadRequestBody(c)
 	if err != nil {
 		writeInvalidRequestError(c, fmt.Sprintf("Invalid request: %v", err))
 		return nil, false
@@ -254,9 +256,20 @@ func isSupportedImagesToolModel(model string) bool {
 		return true
 	}
 	if idx := strings.LastIndex(trimmed, "/"); idx > 0 && idx < len(trimmed)-1 {
-		return strings.EqualFold(strings.TrimSpace(trimmed[idx+1:]), defaultImagesToolModel)
+		if strings.EqualFold(strings.TrimSpace(trimmed[idx+1:]), defaultImagesToolModel) {
+			return true
+		}
 	}
-	return false
+	return isOpenAICompatImagesModel(trimmed)
+}
+
+func isOpenAICompatImagesModel(model string) bool {
+	model = strings.TrimSpace(model)
+	if model == "" {
+		return false
+	}
+	info := registry.LookupModelInfo(model)
+	return info != nil && info.Type == registry.OpenAIImageModelType
 }
 
 // collectImageURLs 提取 JSON 模式下的输入图片 URL，并拒绝 file_id。

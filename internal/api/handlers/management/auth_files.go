@@ -402,6 +402,9 @@ func (h *Handler) listAuthFilesFromDisk(c *gin.Context) {
 			"email":             gjson.GetBytes(data, "email").String(),
 			"has_refresh_token": authFileDataHasRefreshToken(data),
 		}
+		if projectID := strings.TrimSpace(gjson.GetBytes(data, "project_id").String()); projectID != "" {
+			fileData["project_id"] = projectID
+		}
 		firstRegisteredAt := info.ModTime()
 		if parsed, ok := coreauth.ParseFirstRegisteredAtValue(gjson.GetBytes(data, coreauth.FirstRegisteredAtMetadataKey).String()); ok {
 			firstRegisteredAt = parsed
@@ -479,6 +482,9 @@ func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
 	}
 	if email := authEmail(auth); email != "" {
 		entry["email"] = email
+	}
+	if projectID := authProjectID(auth); projectID != "" {
+		entry["project_id"] = projectID
 	}
 	if accountType, account := auth.AccountInfo(); accountType != "" || account != "" {
 		if accountType != "" {
@@ -785,6 +791,28 @@ func authEmail(auth *coreauth.Auth) string {
 		}
 		if v := strings.TrimSpace(auth.Attributes["account_email"]); v != "" {
 			return v
+		}
+	}
+	return ""
+}
+
+func authProjectID(auth *coreauth.Auth) string {
+	if auth == nil {
+		return ""
+	}
+	if auth.Metadata != nil {
+		if v, ok := auth.Metadata["project_id"].(string); ok {
+			if projectID := strings.TrimSpace(v); projectID != "" {
+				return projectID
+			}
+		}
+	}
+	if auth.Attributes != nil {
+		if projectID := strings.TrimSpace(auth.Attributes["project_id"]); projectID != "" {
+			return projectID
+		}
+		if projectID := strings.TrimSpace(auth.Attributes["gemini_virtual_project"]); projectID != "" {
+			return projectID
 		}
 	}
 	return ""
@@ -2151,7 +2179,7 @@ func (h *Handler) RequestCodexToken(c *gin.Context) {
 		bundle, errExchange := openaiAuth.ExchangeCodeForTokens(ctx, code, pkceCodes)
 		if errExchange != nil {
 			authErr := codex.NewAuthenticationError(codex.ErrCodeExchangeFailed, errExchange)
-			SetOAuthSessionError(state, "Failed to exchange authorization code for tokens")
+			SetOAuthSessionError(state, oauthSessionErrorWithCause("Failed to exchange authorization code for tokens", errExchange))
 			log.Errorf("Failed to exchange authorization code for tokens: %v", authErr)
 			return
 		}

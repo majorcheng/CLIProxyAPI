@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"testing"
 	"time"
+
+	codexauth "github.com/router-for-me/CLIProxyAPI/v7/internal/auth/codex"
 )
 
 func TestNormalizePersistableFailureHTTPStatus_Whitelist(t *testing.T) {
@@ -212,6 +214,112 @@ func TestRestorePersistedRuntimeState_ClearsExpiredCooldown(t *testing.T) {
 	}
 	if !state.NextRetryAfter.IsZero() {
 		t.Fatalf("restored model NextRetryAfter = %v, want zero", state.NextRetryAfter)
+	}
+}
+
+func TestMetadataWithPersistedRuntimeState_PersistsTerminalUnauthorizedWithoutRetryAfter(t *testing.T) {
+	t.Parallel()
+
+	source := &Auth{
+		ID:                "terminal-unauthorized",
+		Provider:          "codex",
+		Status:            StatusError,
+		StatusMessage:     "unauthorized",
+		Unavailable:       true,
+		FailureHTTPStatus: 401,
+		LastError:         &Error{HTTPStatus: 401, Message: "token refresh failed with status 401"},
+		Metadata: map[string]any{
+			"type":  "codex",
+			"email": "user@example.com",
+		},
+	}
+
+	metadata := MetadataWithPersistedRuntimeState(source)
+	if _, ok := metadata[PersistedRuntimeStateMetadataKey]; !ok {
+		t.Fatalf("expected terminal unauthorized runtime state to be persisted: %#v", metadata)
+	}
+
+	restored := &Auth{
+		ID:       source.ID,
+		Provider: source.Provider,
+		Metadata: metadata,
+	}
+	RestorePersistedRuntimeState(restored, time.Now())
+
+	if restored.LastError != nil {
+		t.Fatalf("restored.LastError = %#v, want nil", restored.LastError)
+	}
+	if restored.FailureHTTPStatus != 401 {
+		t.Fatalf("restored.FailureHTTPStatus = %d, want 401", restored.FailureHTTPStatus)
+	}
+	if restored.Status != StatusError {
+		t.Fatalf("restored.Status = %q, want %q", restored.Status, StatusError)
+	}
+	if restored.StatusMessage != "unauthorized" {
+		t.Fatalf("restored.StatusMessage = %q, want %q", restored.StatusMessage, "unauthorized")
+	}
+	if !restored.Unavailable {
+		t.Fatal("restored.Unavailable = false, want true")
+	}
+	if !restored.NextRetryAfter.IsZero() {
+		t.Fatalf("restored.NextRetryAfter = %v, want zero for terminal unauthorized", restored.NextRetryAfter)
+	}
+	if !hasUnauthorizedAuthFailure(restored) {
+		t.Fatal("expected restored terminal unauthorized state to stop refresh scheduling")
+	}
+}
+
+func TestMetadataWithPersistedRuntimeState_PersistsTerminalRefreshErrorCodeWithoutFullLastError(t *testing.T) {
+	t.Parallel()
+
+	source := &Auth{
+		ID:                "terminal-refresh-code",
+		Provider:          "codex",
+		Status:            StatusError,
+		StatusMessage:     "unauthorized",
+		Unavailable:       true,
+		FailureHTTPStatus: 401,
+		LastError: &Error{
+			Code:       codexauth.RefreshTokenReusedErrorCode,
+			Message:    "token refresh failed with status 401: refresh_token_reused",
+			HTTPStatus: 401,
+		},
+		Metadata: map[string]any{
+			"type":  "codex",
+			"email": "user@example.com",
+		},
+	}
+
+	metadata := MetadataWithPersistedRuntimeState(source)
+	encoded, err := json.Marshal(metadata)
+	if err != nil {
+		t.Fatalf("Marshal() error = %v", err)
+	}
+	if !jsonContainsField(encoded, "last_error_code") {
+		t.Fatalf("persisted runtime state should contain last_error_code: %s", string(encoded))
+	}
+	if jsonContainsField(encoded, "last_error") {
+		t.Fatalf("persisted runtime state should not contain full last_error: %s", string(encoded))
+	}
+
+	restored := &Auth{
+		ID:       source.ID,
+		Provider: source.Provider,
+		Metadata: metadata,
+	}
+	RestorePersistedRuntimeState(restored, time.Now())
+
+	if restored.LastError == nil {
+		t.Fatal("expected restored.LastError to keep terminal refresh code")
+	}
+	if restored.LastError.Code != codexauth.RefreshTokenReusedErrorCode {
+		t.Fatalf("restored.LastError.Code = %q, want %q", restored.LastError.Code, codexauth.RefreshTokenReusedErrorCode)
+	}
+	if restored.LastError.HTTPStatus != 401 {
+		t.Fatalf("restored.LastError.HTTPStatus = %d, want 401", restored.LastError.HTTPStatus)
+	}
+	if !hasUnauthorizedAuthFailure(restored) {
+		t.Fatal("expected restored terminal refresh code to keep unauthorized semantics")
 	}
 }
 

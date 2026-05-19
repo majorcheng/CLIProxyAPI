@@ -99,6 +99,9 @@ func BuildConfigChangeDetails(oldCfg, newCfg *config.Config) []string {
 	if oldCfg.Routing.PriorityZeroStrategy != newCfg.Routing.PriorityZeroStrategy {
 		changes = append(changes, fmt.Sprintf("routing.priority-zero-strategy: %s -> %s", oldCfg.Routing.PriorityZeroStrategy, newCfg.Routing.PriorityZeroStrategy))
 	}
+	if !reflect.DeepEqual(oldCfg.Payload, newCfg.Payload) {
+		changes = appendPayloadConfigChanges(changes, oldCfg.Payload, newCfg.Payload)
+	}
 
 	// API keys (redacted) and counts
 	if len(oldCfg.APIKeys) != len(newCfg.APIKeys) {
@@ -404,6 +407,30 @@ func summarizeClientAPIKeys(entries []config.ClientAPIKey) []string {
 		return nil
 	}
 	return out
+}
+
+// appendPayloadConfigChanges 只输出规则数量变化，避免在热加载日志中泄露 payload 细节。
+func appendPayloadConfigChanges(changes []string, oldPayload, newPayload config.PayloadConfig) []string {
+	changes = appendPayloadRuleChanges(changes, "default", oldPayload.Default, newPayload.Default)
+	changes = appendPayloadRuleChanges(changes, "default-raw", oldPayload.DefaultRaw, newPayload.DefaultRaw)
+	changes = appendPayloadRuleChanges(changes, "override", oldPayload.Override, newPayload.Override)
+	changes = appendPayloadRuleChanges(changes, "override-raw", oldPayload.OverrideRaw, newPayload.OverrideRaw)
+	changes = appendPayloadFilterRuleChanges(changes, "filter", oldPayload.Filter, newPayload.Filter)
+	return changes
+}
+
+func appendPayloadRuleChanges(changes []string, section string, oldRules, newRules []config.PayloadRule) []string {
+	if reflect.DeepEqual(oldRules, newRules) {
+		return changes
+	}
+	return append(changes, fmt.Sprintf("payload.%s: updated (%d -> %d rules)", section, len(oldRules), len(newRules)))
+}
+
+func appendPayloadFilterRuleChanges(changes []string, section string, oldRules, newRules []config.PayloadFilterRule) []string {
+	if reflect.DeepEqual(oldRules, newRules) {
+		return changes
+	}
+	return append(changes, fmt.Sprintf("payload.%s: updated (%d -> %d rules)", section, len(oldRules), len(newRules)))
 }
 
 func equalStringSet(a, b []string) bool {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
+	"net/http"
 	"testing"
 	"time"
 
@@ -217,6 +218,59 @@ func TestManagerShouldRefresh_DisabledAuthStillEvaluatesRefresh(t *testing.T) {
 	}
 }
 
+func TestManagerShouldRefresh_UnauthorizedFailureStopsRefresh(t *testing.T) {
+	manager := NewManager(nil, nil, nil)
+	now := time.Date(2026, 4, 1, 12, 0, 0, 0, time.UTC)
+	tests := []struct {
+		name string
+		auth *Auth
+	}{
+		{
+			name: "last error",
+			auth: &Auth{
+				ID:              "unauthorized-refresh",
+				Provider:        "claude",
+				Runtime:         staticRefreshLeadRuntime(time.Hour),
+				LastRefreshedAt: now.Add(-2 * time.Hour),
+				LastError: &Error{
+					Code:       "unauthorized",
+					Message:    "token refresh failed with status 401",
+					HTTPStatus: http.StatusUnauthorized,
+				},
+				Metadata: map[string]any{
+					"refresh_token": "refresh-token",
+					"email":         "unauthorized@example.com",
+				},
+			},
+		},
+		{
+			name: "restored runtime state",
+			auth: &Auth{
+				ID:                "restored-unauthorized-refresh",
+				Provider:          "claude",
+				Runtime:           staticRefreshLeadRuntime(time.Hour),
+				LastRefreshedAt:   now.Add(-2 * time.Hour),
+				Status:            StatusError,
+				StatusMessage:     "unauthorized",
+				Unavailable:       true,
+				FailureHTTPStatus: http.StatusUnauthorized,
+				Metadata: map[string]any{
+					"refresh_token": "refresh-token",
+					"email":         "unauthorized@example.com",
+				},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := manager.shouldRefresh(tt.auth, now); got {
+				t.Fatal("shouldRefresh() = true, want unauthorized auth to stop refresh attempts")
+			}
+		})
+	}
+}
+
 func TestManagerMarkRefreshPending_AllowsDisabledAuth(t *testing.T) {
 	manager := NewManager(nil, nil, nil)
 	now := time.Date(2026, 4, 1, 12, 0, 0, 0, time.UTC)
@@ -323,6 +377,29 @@ func TestManagerMarkRefreshPending_SkipsPendingDeleteAuth(t *testing.T) {
 
 	if ok := manager.markRefreshPending("pending-delete-refresh", now); ok {
 		t.Fatal("markRefreshPending() = true, want pending-delete auth skipped")
+	}
+}
+
+func TestManagerMarkRefreshPending_SkipsUnauthorizedAuth(t *testing.T) {
+	manager := NewManager(nil, nil, nil)
+	now := time.Date(2026, 4, 1, 12, 0, 0, 0, time.UTC)
+	manager.mu.Lock()
+	manager.auths["unauthorized-refresh"] = &Auth{
+		ID:       "unauthorized-refresh",
+		Provider: "claude",
+		LastError: &Error{
+			Code:       "unauthorized",
+			Message:    "token refresh failed with status 401",
+			HTTPStatus: http.StatusUnauthorized,
+		},
+		Metadata: map[string]any{
+			"refresh_token": "refresh-token",
+		},
+	}
+	manager.mu.Unlock()
+
+	if ok := manager.markRefreshPending("unauthorized-refresh", now); ok {
+		t.Fatal("markRefreshPending() = true, want unauthorized auth skipped")
 	}
 }
 

@@ -545,6 +545,7 @@ func (h *BaseAPIHandler) GetContextWithCancel(handler interfaces.APIHandler, c *
 	baseCtx, cancel := context.WithCancel(parentCtx)
 	baseCtx = logging.WithEndpoint(baseCtx, requestEndpointFromGin(c))
 	baseCtx = logging.WithResponseStatusHolder(baseCtx)
+	baseCtx = logging.WithResponseHeadersHolder(baseCtx)
 	baseCtx = internalusage.WithRequestMetadataFromGin(baseCtx, c)
 	if requestCtx != nil && requestCtx != parentCtx {
 		cancelCtx := baseCtx

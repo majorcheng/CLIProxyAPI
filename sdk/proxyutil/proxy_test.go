@@ -1,7 +1,13 @@
 package proxyutil
 
 import (
+	"bufio"
+	"encoding/base64"
+	"fmt"
+	"io"
+	"net"
 	"net/http"
+	"strings"
 	"testing"
 )
 
@@ -158,4 +164,90 @@ func TestBuildHTTPTransportSOCKS5HProxy(t *testing.T) {
 	if transport.DialContext == nil {
 		t.Fatal("expected SOCKS5H transport to have custom DialContext")
 	}
+}
+
+func TestBuildDialerHTTPProxyUsesConnect(t *testing.T) {
+	listener, errListen := net.Listen("tcp", "127.0.0.1:0")
+	if errListen != nil {
+		t.Fatalf("Listen error: %v", errListen)
+	}
+	defer listener.Close()
+
+	errCh := make(chan error, 1)
+	go serveSingleConnectProxy(listener, errCh)
+
+	rawProxy := "http://user:pass@" + listener.Addr().String()
+	dialer, mode, errBuild := BuildDialer(rawProxy)
+	if errBuild != nil {
+		t.Fatalf("BuildDialer returned error: %v", errBuild)
+	}
+	if mode != ModeProxy {
+		t.Fatalf("mode = %d, want %d", mode, ModeProxy)
+	}
+
+	conn, errDial := dialer.Dial("tcp", "target.example:443")
+	if errDial != nil {
+		t.Fatalf("Dial returned error: %v", errDial)
+	}
+	defer conn.Close()
+
+	buf := make([]byte, len("tunnel-ok"))
+	if _, errRead := io.ReadFull(conn, buf); errRead != nil {
+		t.Fatalf("Read tunnel payload error: %v", errRead)
+	}
+	if string(buf) != "tunnel-ok" {
+		t.Fatalf("tunnel payload = %q, want tunnel-ok", string(buf))
+	}
+	if errServer := <-errCh; errServer != nil {
+		t.Fatalf("proxy server error: %v", errServer)
+	}
+}
+
+func TestParseErrorDoesNotLeakProxyCredentials(t *testing.T) {
+	_, errParse := Parse("http://user:secret@%zz")
+	if errParse == nil {
+		t.Fatal("expected parse error")
+	}
+	if strings.Contains(errParse.Error(), "secret") {
+		t.Fatalf("parse error leaked credential: %v", errParse)
+	}
+}
+
+func TestRedactRemovesProxyCredentialsAndPath(t *testing.T) {
+	got := Redact("http://user:secret@proxy.example.com:8080/hidden/path?token=abc")
+	want := "http://redacted@proxy.example.com:8080"
+	if got != want {
+		t.Fatalf("Redact() = %q, want %q", got, want)
+	}
+}
+
+// serveSingleConnectProxy 接收一次 CONNECT 请求，并把后续字节作为隧道数据留给客户端读取。
+func serveSingleConnectProxy(listener net.Listener, errCh chan<- error) {
+	conn, errAccept := listener.Accept()
+	if errAccept != nil {
+		errCh <- errAccept
+		return
+	}
+	defer conn.Close()
+
+	req, errRead := http.ReadRequest(bufio.NewReader(conn))
+	if errRead != nil {
+		errCh <- errRead
+		return
+	}
+	if req.Method != http.MethodConnect {
+		errCh <- fmt.Errorf("method = %s, want CONNECT", req.Method)
+		return
+	}
+	if req.Host != "target.example:443" {
+		errCh <- fmt.Errorf("host = %s, want target.example:443", req.Host)
+		return
+	}
+	wantAuth := "Basic " + base64.StdEncoding.EncodeToString([]byte("user:pass"))
+	if gotAuth := req.Header.Get("Proxy-Authorization"); gotAuth != wantAuth {
+		errCh <- fmt.Errorf("Proxy-Authorization = %q, want %q", gotAuth, wantAuth)
+		return
+	}
+	_, errWrite := io.WriteString(conn, "HTTP/1.1 200 Connection Established\r\n\r\ntunnel-ok")
+	errCh <- errWrite
 }

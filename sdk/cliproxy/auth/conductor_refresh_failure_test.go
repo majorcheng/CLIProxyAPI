@@ -157,7 +157,6 @@ func TestManagerRefreshAuth_PersistsTerminalRefresh401ForMaintenance(t *testing.
 		t.Fatalf("register auth: %v", err)
 	}
 
-	started := time.Now()
 	manager.refreshAuth(ctx, auth.ID)
 
 	updated, ok := manager.GetByID(auth.ID)
@@ -182,14 +181,32 @@ func TestManagerRefreshAuth_PersistsTerminalRefresh401ForMaintenance(t *testing.
 	if !strings.Contains(updated.LastError.Message, "status 401") {
 		t.Fatalf("expected LastError.Message to preserve refresh failure details, got %q", updated.LastError.Message)
 	}
-	if updated.Status != StatusActive {
-		t.Fatalf("expected auth status to remain active, got %q", updated.Status)
+	if updated.Status != StatusError {
+		t.Fatalf("expected auth status to record terminal unauthorized, got %q", updated.Status)
 	}
-	if updated.Unavailable {
-		t.Fatal("expected auth to remain schedulable until maintenance handles deletion")
+	if !updated.Unavailable {
+		t.Fatal("expected terminal unauthorized refresh failure to mark auth unavailable")
 	}
-	if updated.NextRefreshAfter.IsZero() || !updated.NextRefreshAfter.After(started) {
-		t.Fatalf("expected NextRefreshAfter to be scheduled after refresh failure, got %v", updated.NextRefreshAfter)
+	if !updated.NextRefreshAfter.IsZero() {
+		t.Fatalf("expected NextRefreshAfter to stay zero after terminal unauthorized, got %v", updated.NextRefreshAfter)
+	}
+	if !updated.NextRetryAfter.IsZero() {
+		t.Fatalf("expected NextRetryAfter to stay zero for terminal unauthorized, got %v", updated.NextRetryAfter)
+	}
+	if updated.FailureHTTPStatus != http.StatusUnauthorized {
+		t.Fatalf("expected FailureHTTPStatus = 401, got %d", updated.FailureHTTPStatus)
+	}
+	if !hasUnauthorizedAuthFailure(updated) {
+		t.Fatal("expected terminal unauthorized refresh failure to be recognized from persisted auth state")
+	}
+	if manager.shouldRefresh(updated, time.Now()) {
+		t.Fatal("expected terminal unauthorized refresh failure to stop auto-refresh decisions")
+	}
+	if next, ok := nextRefreshCheckAt(time.Now(), updated, time.Second); ok {
+		t.Fatalf("expected terminal unauthorized refresh failure to be unscheduled, got next=%s", next)
+	}
+	if blocked, reason, next := isAuthBlockedForModel(updated, "gpt-5.4", time.Now()); !blocked || reason != blockReasonOther || !next.IsZero() {
+		t.Fatalf("expected terminal unauthorized auth to be blocked from selection, blocked=%v reason=%v next=%v", blocked, reason, next)
 	}
 	if CodexInitialRefreshPending(updated) {
 		t.Fatal("expected terminal initial refresh failure to clear pending flag")
@@ -208,6 +225,25 @@ func TestManagerRefreshAuth_PersistsTerminalRefresh401ForMaintenance(t *testing.
 			}
 			if got, ok := last.Metadata["priority"].(int); !ok || got != 5 {
 				t.Fatalf("expected persisted metadata priority 5 after RT 401 failure, got %#v", last.Metadata["priority"])
+			}
+			metadata := MetadataWithPersistedRuntimeState(last)
+			restored := &Auth{
+				ID:       last.ID,
+				Provider: last.Provider,
+				Metadata: metadata,
+			}
+			RestorePersistedRuntimeState(restored, time.Now())
+			if restored.LastError == nil {
+				t.Fatalf("expected restored runtime state to keep terminal refresh code: %#v", restored)
+			}
+			if restored.LastError.Code != codexauth.RefreshUnauthorizedErrorCode {
+				t.Fatalf("expected restored LastError.Code = %q, got %q", codexauth.RefreshUnauthorizedErrorCode, restored.LastError.Code)
+			}
+			if !hasUnauthorizedAuthFailure(restored) {
+				t.Fatalf("expected restored persisted runtime state to remain unauthorized: %#v", restored)
+			}
+			if manager.shouldRefresh(restored, time.Now()) {
+				t.Fatal("expected restored unauthorized runtime state to stop auto-refresh decisions")
 			}
 			break
 		}

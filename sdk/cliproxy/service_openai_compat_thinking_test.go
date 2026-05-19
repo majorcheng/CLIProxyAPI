@@ -98,6 +98,47 @@ func TestRegisterModelsForAuth_OpenAICompatibility_ExplicitThinkingEnablesManage
 	}
 }
 
+func TestRegisterModelsForAuth_OpenAICompatibility_ImageModelUsesImageType(t *testing.T) {
+	modelID := "compat-image-" + t.Name()
+	authID := "auth-" + t.Name()
+	service := &Service{
+		cfg: &config.Config{
+			OpenAICompatibility: []config.OpenAICompatibility{{
+				Name: "compat-image",
+				Models: []config.OpenAICompatibilityModel{{
+					Name:  "upstream-image",
+					Alias: modelID,
+					Image: true,
+				}},
+			}},
+		},
+	}
+	auth := &coreauth.Auth{
+		ID:       authID,
+		Provider: "openai-compatibility",
+		Status:   coreauth.StatusActive,
+		Attributes: map[string]string{
+			"compat_name": "compat-image",
+		},
+	}
+
+	reg := GlobalModelRegistry()
+	reg.UnregisterClient(auth.ID)
+	t.Cleanup(func() {
+		reg.UnregisterClient(auth.ID)
+	})
+
+	service.registerModelsForAuth(auth)
+
+	got := registry.LookupModelInfo(modelID, "compat-image")
+	if got == nil {
+		t.Fatalf("expected image model %q to be registered", modelID)
+	}
+	if got.Type != registry.OpenAIImageModelType {
+		t.Fatalf("model type = %q, want %q", got.Type, registry.OpenAIImageModelType)
+	}
+}
+
 func TestRegisterModelsForAuth_OpenAICompatibility_DisabledProviderUnregistersModels(t *testing.T) {
 	modelID := "compat-disabled-" + t.Name()
 	authID := "auth-" + t.Name()

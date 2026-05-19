@@ -397,6 +397,18 @@ type PayloadModelRule struct {
 	Name string `yaml:"name" json:"name"`
 	// Protocol restricts the rule to a specific translator format (e.g., "gemini", "responses").
 	Protocol string `yaml:"protocol" json:"protocol"`
+	// FromProtocol 限制客户端入站协议；用于区分同一目标协议下来自 Claude/OpenAI/Gemini 的请求。
+	FromProtocol string `yaml:"from-protocol,omitempty" json:"from-protocol,omitempty"`
+	// Headers 要求入站 header 命中通配模式；header 名大小写不敏感。
+	Headers map[string]string `yaml:"headers,omitempty" json:"headers,omitempty"`
+	// Match 要求 payload 路径存在且值相等；所有条件均满足才命中。
+	Match []map[string]any `yaml:"match,omitempty" json:"match,omitempty"`
+	// NotMatch 要求 payload 路径不存在或值不相等；任一相等都会跳过规则。
+	NotMatch []map[string]any `yaml:"not-match,omitempty" json:"not-match,omitempty"`
+	// Exist 要求 payload 路径存在且不是 null。
+	Exist []string `yaml:"exist,omitempty" json:"exist,omitempty"`
+	// NotExist 要求 payload 路径不存在或为 null。
+	NotExist []string `yaml:"not-exist,omitempty" json:"not-exist,omitempty"`
 }
 
 // CloakConfig configures request cloaking for non-Claude-Code clients.
@@ -608,6 +620,9 @@ type OpenAICompatibilityModel struct {
 
 	// Alias is the model name alias that clients will use to reference this model.
 	Alias string `yaml:"alias" json:"alias"`
+
+	// Image 表示该 OpenAI-compatible 模型应注册为 Images API 专用模型。
+	Image bool `yaml:"image,omitempty" json:"image,omitempty"`
 
 	// Thinking configures the thinking/reasoning capability for this model.
 	// If nil, the model keeps legacy passthrough behavior and does not advertise managed thinking support.

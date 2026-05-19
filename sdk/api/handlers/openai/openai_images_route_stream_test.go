@@ -25,6 +25,9 @@ type imageRouteExecutorCall struct {
 	RequestedModel string
 	SelectionModel string
 	DisallowFree   bool
+	SourceFormat   string
+	RequestPath    string
+	Payload        string
 }
 
 type imageRouteCaptureExecutor struct {
@@ -35,25 +38,35 @@ type imageRouteCaptureExecutor struct {
 
 func (e *imageRouteCaptureExecutor) Identifier() string { return e.id }
 
-func (e *imageRouteCaptureExecutor) Execute(context.Context, *coreauth.Auth, coreexecutor.Request, coreexecutor.Options) (coreexecutor.Response, error) {
-	return coreexecutor.Response{}, errors.New("not implemented")
+func (e *imageRouteCaptureExecutor) Execute(_ context.Context, auth *coreauth.Auth, req coreexecutor.Request, opts coreexecutor.Options) (coreexecutor.Response, error) {
+	e.recordCall(auth, req, opts)
+	return coreexecutor.Response{
+		Payload: []byte(`{"created":1,"data":[{"url":"https://img.example/out.png"}]}`),
+	}, nil
 }
 
 func (e *imageRouteCaptureExecutor) ExecuteStream(_ context.Context, auth *coreauth.Auth, req coreexecutor.Request, opts coreexecutor.Options) (*coreexecutor.StreamResult, error) {
+	e.recordCall(auth, req, opts)
+	ch := make(chan coreexecutor.StreamChunk, 1)
+	ch <- coreexecutor.StreamChunk{Payload: []byte("data: {\"type\":\"response.completed\",\"response\":{\"created_at\":1700000000,\"output\":[{\"type\":\"image_generation_call\",\"result\":\"aGVsbG8=\",\"output_format\":\"png\"}]}}\n\n")}
+	close(ch)
+	return &coreexecutor.StreamResult{Chunks: ch}, nil
+}
+
+// recordCall 保存 executor 入参，供路由测试断言调度模型、执行模型与入口协议。
+func (e *imageRouteCaptureExecutor) recordCall(auth *coreauth.Auth, req coreexecutor.Request, opts coreexecutor.Options) {
 	e.mu.Lock()
+	defer e.mu.Unlock()
 	e.calls = append(e.calls, imageRouteExecutorCall{
 		AuthID:         auth.ID,
 		Model:          req.Model,
 		RequestedModel: metadataString(opts.Metadata, coreexecutor.RequestedModelMetadataKey),
 		SelectionModel: metadataString(opts.Metadata, coreexecutor.SelectionModelMetadataKey),
 		DisallowFree:   metadataBool(opts.Metadata, coreexecutor.DisallowFreeAuthMetadataKey),
+		SourceFormat:   opts.SourceFormat.String(),
+		RequestPath:    metadataString(opts.Metadata, coreexecutor.RequestPathMetadataKey),
+		Payload:        string(req.Payload),
 	})
-	e.mu.Unlock()
-
-	ch := make(chan coreexecutor.StreamChunk, 1)
-	ch <- coreexecutor.StreamChunk{Payload: []byte("data: {\"type\":\"response.completed\",\"response\":{\"created_at\":1700000000,\"output\":[{\"type\":\"image_generation_call\",\"result\":\"aGVsbG8=\",\"output_format\":\"png\"}]}}\n\n")}
-	close(ch)
-	return &coreexecutor.StreamResult{Chunks: ch}, nil
 }
 
 func (e *imageRouteCaptureExecutor) Refresh(ctx context.Context, auth *coreauth.Auth) (*coreauth.Auth, error) {
@@ -225,6 +238,52 @@ func TestImagesGenerations_WithoutImageModelProviderReturnsError(t *testing.T) {
 	}
 }
 
+func TestImagesGenerations_OpenAICompatImageModelBypassesLocalValidation(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	manager := coreauth.NewManager(nil, nil, nil)
+	compatExecutor := &imageRouteCaptureExecutor{id: "compat-image-provider"}
+	manager.RegisterExecutor(compatExecutor)
+
+	registerImageTestAuthWithModelType(t, manager, "auth-compat-image", "compat-image-provider", "compat-image-model", registry.OpenAIImageModelType)
+
+	base := handlers.NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, manager)
+	h := NewOpenAIAPIHandler(base)
+	router := gin.New()
+	router.POST("/v1/images/generations", h.ImagesGenerations)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/images/generations", strings.NewReader(`{"prompt":"draw a cat","model":"compat-image-model","n":2}`))
+	req.Header.Set("Content-Type", "application/json")
+	resp := httptest.NewRecorder()
+	router.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d, body=%s", resp.Code, http.StatusOK, resp.Body.String())
+	}
+	if got := gjson.Get(resp.Body.String(), "data.0.url").String(); got != "https://img.example/out.png" {
+		t.Fatalf("data.0.url = %q, want raw compat image URL", got)
+	}
+
+	calls := compatExecutor.Calls()
+	if len(calls) != 1 {
+		t.Fatalf("compat executor calls = %d, want 1", len(calls))
+	}
+	if calls[0].AuthID != "auth-compat-image" {
+		t.Fatalf("selected auth = %q, want auth-compat-image", calls[0].AuthID)
+	}
+	if calls[0].Model != "compat-image-model" {
+		t.Fatalf("request model = %q, want compat-image-model", calls[0].Model)
+	}
+	if calls[0].SourceFormat != "openai-image" {
+		t.Fatalf("source format = %q, want openai-image", calls[0].SourceFormat)
+	}
+	if calls[0].RequestPath != "/v1/images/generations" {
+		t.Fatalf("request path = %q, want /v1/images/generations", calls[0].RequestPath)
+	}
+	if got := gjson.Get(calls[0].Payload, "n").Int(); got != 2 {
+		t.Fatalf("payload n = %d, want 2; payload=%s", got, calls[0].Payload)
+	}
+}
+
 func TestStartImagesStream_ClosedBeforeFirstChunkReturnsJSON502(t *testing.T) {
 	h, c, rec, flusher := newImageStreamTestHarness(t)
 	data := make(chan []byte)
@@ -310,6 +369,21 @@ func registerImageTestAuthWithAttributes(t *testing.T, manager *coreauth.Manager
 		infos = append(infos, &registry.ModelInfo{ID: model})
 	}
 	registry.GetGlobalRegistry().RegisterClient(authID, provider, infos)
+	t.Cleanup(func() {
+		registry.GetGlobalRegistry().UnregisterClient(authID)
+	})
+}
+
+func registerImageTestAuthWithModelType(t *testing.T, manager *coreauth.Manager, authID, provider string, model string, modelType string) {
+	t.Helper()
+	auth := &coreauth.Auth{ID: authID, Provider: provider, Status: coreauth.StatusActive}
+	if _, err := manager.Register(context.Background(), auth); err != nil {
+		t.Fatalf("Register(%s): %v", authID, err)
+	}
+	registry.GetGlobalRegistry().RegisterClient(authID, provider, []*registry.ModelInfo{{
+		ID:   model,
+		Type: modelType,
+	}})
 	t.Cleanup(func() {
 		registry.GetGlobalRegistry().UnregisterClient(authID)
 	})

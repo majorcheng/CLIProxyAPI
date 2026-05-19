@@ -2582,12 +2582,16 @@ func (s *Service) registerModelsForAuth(a *coreauth.Auth) {
 						}
 						thinking := m.Thinking
 						userDefined := thinking == nil
+						modelType := "openai-compatibility"
+						if m.Image {
+							modelType = registry.OpenAIImageModelType
+						}
 						ms = append(ms, &ModelInfo{
 							ID:          modelID,
 							Object:      "model",
 							Created:     time.Now().Unix(),
 							OwnedBy:     compat.Name,
-							Type:        "openai-compatibility",
+							Type:        modelType,
 							DisplayName: modelID,
 							UserDefined: userDefined,
 							Thinking:    thinking,

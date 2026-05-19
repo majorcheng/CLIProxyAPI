@@ -29,7 +29,7 @@ func rejectUnsupportedImagesModel(c *gin.Context, endpointPath string, model str
 		return false
 	}
 	writeInvalidRequestError(c, fmt.Sprintf(
-		"Invalid request: model %q is not supported for %s (only %s is supported)",
+		"Invalid request: model %q is not supported for %s (only %s or configured OpenAI-compatible image models are supported)",
 		model,
 		endpointPath,
 		defaultImagesToolModel,
@@ -46,7 +46,12 @@ func (h *OpenAIAPIHandler) ImagesGenerations(c *gin.Context) {
 	if !ok {
 		return
 	}
-	if rejectUnsupportedImagesModel(c, imagesGenerationsPath, gjson.GetBytes(rawJSON, "model").String()) {
+	imageModel := normalizedImagesModelFromRaw(rawJSON)
+	if rejectUnsupportedImagesModel(c, imagesGenerationsPath, imageModel) {
+		return
+	}
+	if isOpenAICompatImagesModel(imageModel) {
+		h.executeOpenAICompatImagesJSON(c, rawJSON, imageModel, gjson.GetBytes(rawJSON, "stream").Bool())
 		return
 	}
 	payload, err := decodeImagesGenerationsRequest(rawJSON)
@@ -91,7 +96,12 @@ func (h *OpenAIAPIHandler) imagesEditsFromJSON(c *gin.Context) {
 	if !ok {
 		return
 	}
-	if rejectUnsupportedImagesModel(c, imagesEditsPath, gjson.GetBytes(rawJSON, "model").String()) {
+	imageModel := normalizedImagesModelFromRaw(rawJSON)
+	if rejectUnsupportedImagesModel(c, imagesEditsPath, imageModel) {
+		return
+	}
+	if isOpenAICompatImagesModel(imageModel) {
+		h.executeOpenAICompatImagesJSON(c, rawJSON, imageModel, gjson.GetBytes(rawJSON, "stream").Bool())
 		return
 	}
 	payload, err := decodeImagesEditsJSONRequest(rawJSON)
@@ -109,7 +119,23 @@ func (h *OpenAIAPIHandler) imagesEditsFromMultipart(c *gin.Context) {
 		writeInvalidRequestError(c, err.Error())
 		return
 	}
-	if rejectUnsupportedImagesModel(c, imagesEditsPath, firstMultipartFormValue(form, "model")) {
+	imageModel := normalizedImagesModelFromMultipart(form)
+	if rejectUnsupportedImagesModel(c, imagesEditsPath, imageModel) {
+		return
+	}
+	if isOpenAICompatImagesModel(imageModel) {
+		stream, errParse := parseOptionalBoolField(firstMultipartFormValue(form, "stream"), "stream", false)
+		if errParse != nil {
+			writeInvalidRequestError(c, errParse.Error())
+			return
+		}
+		body, contentType, errBuild := buildOpenAICompatImagesMultipartRequest(form, imageModel, stream)
+		if errBuild != nil {
+			writeInvalidRequestError(c, fmt.Sprintf("Invalid request: %v", errBuild))
+			return
+		}
+		c.Request.Header.Set("Content-Type", contentType)
+		h.executeOpenAICompatImagesRaw(c, body, imageModel, stream)
 		return
 	}
 	payload, err := decodeImagesEditsMultipartRequest(c)

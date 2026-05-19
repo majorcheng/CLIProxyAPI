@@ -7,8 +7,8 @@ import (
 	"github.com/tidwall/gjson"
 )
 
-func TestConvertGeminiRequestToAntigravity_PreserveValidSignature(t *testing.T) {
-	// Valid signature on functionCall should be preserved
+func TestConvertGeminiRequestToAntigravity_ReplacesExistingSignatureForNonClaudeModel(t *testing.T) {
+	// 非 Claude Gemini 模型的 functionCall 统一写入 skip sentinel，避免上游校验旧签名。
 	validSignature := "abc123validSignature1234567890123456789012345678901234567890"
 	inputJSON := []byte(fmt.Sprintf(`{
 		"model": "gemini-3-pro-preview",
@@ -25,15 +25,16 @@ func TestConvertGeminiRequestToAntigravity_PreserveValidSignature(t *testing.T) 
 	output := ConvertGeminiRequestToAntigravity("gemini-3-pro-preview", inputJSON, false)
 	outputStr := string(output)
 
-	// Check that valid thoughtSignature is preserved
+	// Check that existing thoughtSignature is replaced by skip sentinel
 	parts := gjson.Get(outputStr, "request.contents.0.parts").Array()
 	if len(parts) != 1 {
 		t.Fatalf("Expected 1 part, got %d", len(parts))
 	}
 
 	sig := parts[0].Get("thoughtSignature").String()
-	if sig != validSignature {
-		t.Errorf("Expected thoughtSignature '%s', got '%s'", validSignature, sig)
+	expectedSig := "skip_thought_signature_validator"
+	if sig != expectedSig {
+		t.Errorf("Expected thoughtSignature '%s', got '%s'", expectedSig, sig)
 	}
 }
 

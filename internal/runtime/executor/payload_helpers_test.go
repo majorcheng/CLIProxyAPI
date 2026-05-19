@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"net/http"
 	"testing"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
@@ -162,6 +163,81 @@ func TestApplyPayloadConfigWithRoot_DisableImageGenerationPayloadOverrideCannotR
 	if choice := gjson.GetBytes(out, "tool_choice"); choice.Exists() {
 		t.Fatalf("tool_choice = %s，期望最终图片禁用清理删除 payload override 写回的 image_generation", choice.Raw)
 	}
+}
+
+func TestApplyPayloadConfigWithRequest_ModelRuleConditionsMatch(t *testing.T) {
+	cfg := payloadConditionTestConfig()
+	headers := http.Header{"X-Client": []string{"cli-pro"}}
+	payload := []byte(`{"mode":"json","temperature":1,"messages":[{"role":"user","content":"hi"}]}`)
+
+	out := applyPayloadConfigWithRequest(cfg, "gpt-5.4", "openai-response", "claude", "", payload, nil, "", "", headers)
+
+	if !gjson.GetBytes(out, "enabled").Bool() {
+		t.Fatalf("enabled 未写入，期望命中 from/header/match/exist/not-exist 条件：%s", string(out))
+	}
+}
+
+func TestApplyPayloadConfigWithRequest_ModelRuleConditionsRejectMismatch(t *testing.T) {
+	cfg := payloadConditionTestConfig()
+	tests := []struct {
+		name         string
+		fromProtocol string
+		headers      http.Header
+		payload      string
+	}{
+		{
+			name:         "来源协议不匹配",
+			fromProtocol: "openai",
+			headers:      http.Header{"X-Client": []string{"cli-pro"}},
+			payload:      `{"mode":"json","temperature":1,"messages":[{"role":"user","content":"hi"}]}`,
+		},
+		{
+			name:         "header 不匹配",
+			fromProtocol: "claude",
+			headers:      http.Header{"X-Client": []string{"web"}},
+			payload:      `{"mode":"json","temperature":1,"messages":[{"role":"user","content":"hi"}]}`,
+		},
+		{
+			name:         "match 条件不匹配",
+			fromProtocol: "claude",
+			headers:      http.Header{"X-Client": []string{"cli-pro"}},
+			payload:      `{"mode":"text","temperature":1,"messages":[{"role":"user","content":"hi"}]}`,
+		},
+		{
+			name:         "not-exist 条件不匹配",
+			fromProtocol: "claude",
+			headers:      http.Header{"X-Client": []string{"cli-pro"}},
+			payload:      `{"mode":"json","temperature":1,"blocked":true,"messages":[{"role":"user","content":"hi"}]}`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			out := applyPayloadConfigWithRequest(cfg, "gpt-5.4", "openai-response", tt.fromProtocol, "", []byte(tt.payload), nil, "", "", tt.headers)
+			if got := gjson.GetBytes(out, "enabled"); got.Exists() {
+				t.Fatalf("enabled = %s，期望条件不匹配时不写入：%s", got.Raw, string(out))
+			}
+		})
+	}
+}
+
+// payloadConditionTestConfig 返回覆盖所有新增匹配条件的 payload 规则。
+func payloadConditionTestConfig() *config.Config {
+	return &config.Config{Payload: config.PayloadConfig{
+		Override: []config.PayloadRule{{
+			Models: []config.PayloadModelRule{{
+				Name:         "gpt-*",
+				Protocol:     "openai-response",
+				FromProtocol: "claude",
+				Headers:      map[string]string{"X-Client": "cli-*"},
+				Match:        []map[string]any{{"mode": "json"}},
+				NotMatch:     []map[string]any{{"temperature": float64(2)}},
+				Exist:        []string{`messages.#(role=="user").content`},
+				NotExist:     []string{"blocked"},
+			}},
+			Params: map[string]any{"enabled": true},
+		}},
+	}}
 }
 
 // assertToolTypeCount 统计指定 tools 路径下的工具类型数量，避免测试依赖数组顺序。

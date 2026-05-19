@@ -2,6 +2,7 @@ package usage
 
 import (
 	"context"
+	"net/http"
 	"sync"
 	"time"
 
@@ -21,6 +22,8 @@ type Record struct {
 	Latency     time.Duration
 	Failed      bool
 	Detail      Detail
+	// ResponseHeaders 保存上游响应头副本，供 usage 插件做诊断和扩展统计。
+	ResponseHeaders http.Header
 }
 
 // Detail holds the token usage breakdown.

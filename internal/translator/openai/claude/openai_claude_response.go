@@ -9,6 +9,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
@@ -26,6 +27,8 @@ type ConvertOpenAIResponseToAnthropicParams struct {
 	Model       string
 	CreatedAt   int64
 	ToolNameMap map[string]string
+	// SawToolCall 只在真正输出 tool_use content_block_start 后置位；
+	// 不能仅凭上游 tool_calls 字段存在就把 stop_reason 改成 tool_use。
 	SawToolCall bool
 	// Content accumulator for streaming
 	ContentAccumulator strings.Builder
@@ -60,6 +63,8 @@ type ToolCallAccumulator struct {
 	ID        string
 	Name      string
 	Arguments strings.Builder
+	// StartEmitted 标记当前工具下标是否已向客户端声明 content_block_start。
+	StartEmitted bool
 }
 
 // ConvertOpenAIResponseToClaude converts OpenAI streaming response format to Anthropic API format.
@@ -215,9 +220,7 @@ func convertOpenAIStreamingChunkToAnthropic(rawJSON []byte, param *ConvertOpenAI
 			}
 
 			toolCalls.ForEach(func(_, toolCall gjson.Result) bool {
-				param.SawToolCall = true
 				index := int(toolCall.Get("index").Int())
-				blockIndex := param.toolContentBlockIndex(index)
 
 				// Initialize accumulator if needed
 				if _, exists := param.ToolCallsAccumulator[index]; !exists {
@@ -226,26 +229,20 @@ func convertOpenAIStreamingChunkToAnthropic(rawJSON []byte, param *ConvertOpenAI
 
 				accumulator := param.ToolCallsAccumulator[index]
 
-				// Handle tool call ID
-				if id := toolCall.Get("id"); id.Exists() {
-					accumulator.ID = id.String()
+				// 只接受 JSON 字符串且非空的 id，避免 malformed 字段覆盖已收集 ID。
+				if id := toolCall.Get("id"); id.Exists() && id.Type == gjson.String {
+					if idStr := id.String(); idStr != "" {
+						accumulator.ID = idStr
+					}
 				}
 
-				// Handle function name
+				// Handle function name and arguments
 				if function := toolCall.Get("function"); function.Exists() {
-					if name := function.Get("name"); name.Exists() && name.String() != "" {
-						accumulator.Name = util.MapToolName(param.ToolNameMap, name.String())
-
-						stopThinkingContentBlock(param, &results)
-
-						stopTextContentBlock(param, &results)
-
-						// Send content_block_start for tool_use
-						contentBlockStartJSON := `{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"","name":"","input":{}}}`
-						contentBlockStartJSON, _ = sjson.Set(contentBlockStartJSON, "index", blockIndex)
-						contentBlockStartJSON, _ = sjson.Set(contentBlockStartJSON, "content_block.id", util.SanitizeClaudeToolID(accumulator.ID))
-						contentBlockStartJSON, _ = sjson.Set(contentBlockStartJSON, "content_block.name", accumulator.Name)
-						results = append(results, "event: content_block_start\ndata: "+contentBlockStartJSON+"\n\n")
+					// 工具块已经声明后不再改名，避免后续空 name 或重复 name 与已输出内容漂移。
+					if !accumulator.StartEmitted {
+						if name := function.Get("name"); name.Exists() && name.Type == gjson.String && name.String() != "" {
+							accumulator.Name = util.MapToolName(param.ToolNameMap, name.String())
+						}
 					}
 
 					// Handle function arguments
@@ -257,6 +254,11 @@ func convertOpenAIStreamingChunkToAnthropic(rawJSON []byte, param *ConvertOpenAI
 					}
 				}
 
+				// id 和 name 可能分散在不同 chunk；每次增量后都重新检查能否声明工具块。
+				if !accumulator.StartEmitted && accumulator.Name != "" && accumulator.ID != "" && !param.ContentBlocksStopped {
+					emitToolUseStart(param, index, accumulator, &results)
+				}
+
 				return true
 			})
 		}
@@ -265,9 +267,12 @@ func convertOpenAIStreamingChunkToAnthropic(rawJSON []byte, param *ConvertOpenAI
 	// Handle finish_reason (but don't send message_delta/message_stop yet)
 	if finishReason := root.Get("choices.0.finish_reason"); finishReason.Exists() && finishReason.String() != "" {
 		reason := finishReason.String()
-		if param.SawToolCall {
+		switch {
+		case param.SawToolCall:
 			param.FinishReason = "tool_calls"
-		} else {
+		case reason == "tool_calls":
+			param.FinishReason = "stop"
+		default:
 			param.FinishReason = reason
 		}
 
@@ -285,8 +290,16 @@ func convertOpenAIStreamingChunkToAnthropic(rawJSON []byte, param *ConvertOpenAI
 
 		// Send content_block_stop for any tool calls
 		if !param.ContentBlocksStopped {
-			for index := range param.ToolCallsAccumulator {
+			for _, index := range toolCallAccumulatorIndexes(param.ToolCallsAccumulator) {
 				accumulator := param.ToolCallsAccumulator[index]
+				if !accumulator.StartEmitted {
+					// 有 name 但上游始终没给 id 时，仍延迟声明一个合成 id；
+					// 完全没有 name 的半截工具调用不输出，避免空 tool_use。
+					if accumulator.Name == "" {
+						continue
+					}
+					emitToolUseStart(param, index, accumulator, &results)
+				}
 				blockIndex := param.toolContentBlockIndex(index)
 
 				// Send complete input_json_delta with all accumulated arguments
@@ -349,8 +362,15 @@ func convertOpenAIDoneToAnthropic(param *ConvertOpenAIResponseToAnthropicParams)
 	stopTextContentBlock(param, &results)
 
 	if !param.ContentBlocksStopped {
-		for index := range param.ToolCallsAccumulator {
+		for _, index := range toolCallAccumulatorIndexes(param.ToolCallsAccumulator) {
 			accumulator := param.ToolCallsAccumulator[index]
+			if !accumulator.StartEmitted {
+				// [DONE] 路径与 finish_reason 路径保持一致：有 name 才补发 tool_use。
+				if accumulator.Name == "" {
+					continue
+				}
+				emitToolUseStart(param, index, accumulator, &results)
+			}
 			blockIndex := param.toolContentBlockIndex(index)
 
 			if accumulator.Arguments.Len() > 0 {
@@ -541,6 +561,29 @@ func stopTextContentBlock(param *ConvertOpenAIResponseToAnthropicParams, results
 	*results = append(*results, "event: content_block_stop\ndata: "+contentBlockStopJSON+"\n\n")
 	param.TextContentBlockStarted = false
 	param.TextContentBlockIndex = -1
+}
+
+func emitToolUseStart(param *ConvertOpenAIResponseToAnthropicParams, openAIToolIndex int, accumulator *ToolCallAccumulator, results *[]string) {
+	stopThinkingContentBlock(param, results)
+	stopTextContentBlock(param, results)
+
+	blockIndex := param.toolContentBlockIndex(openAIToolIndex)
+	contentBlockStartJSON := `{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"","name":"","input":{}}}`
+	contentBlockStartJSON, _ = sjson.Set(contentBlockStartJSON, "index", blockIndex)
+	contentBlockStartJSON, _ = sjson.Set(contentBlockStartJSON, "content_block.id", util.SanitizeClaudeToolID(accumulator.ID))
+	contentBlockStartJSON, _ = sjson.Set(contentBlockStartJSON, "content_block.name", accumulator.Name)
+	*results = append(*results, "event: content_block_start\ndata: "+contentBlockStartJSON+"\n\n")
+	accumulator.StartEmitted = true
+	param.SawToolCall = true
+}
+
+func toolCallAccumulatorIndexes(accumulators map[int]*ToolCallAccumulator) []int {
+	indexes := make([]int, 0, len(accumulators))
+	for index := range accumulators {
+		indexes = append(indexes, index)
+	}
+	sort.Ints(indexes)
+	return indexes
 }
 
 // ConvertOpenAIResponseToClaudeNonStream converts a non-streaming OpenAI response to a non-streaming Anthropic response.

@@ -65,7 +65,7 @@ func newProxyAwareHTTPClient(ctx context.Context, cfg *config.Config, auth *clip
 			return newProxyHTTPClient(transport, timeout)
 		}
 		// If proxy setup failed, fall through to context RoundTripper.
-		log.Debugf("failed to setup proxy from URL: %s, falling back to context transport", proxyURL)
+		log.Debugf("failed to setup proxy from URL: %s, falling back to context transport", proxyutil.Redact(proxyURL))
 	}
 
 	if contextTransport != nil {

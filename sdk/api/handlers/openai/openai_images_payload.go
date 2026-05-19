@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/gin-gonic/gin"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	apihandlers "github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers"
 )
 
@@ -255,9 +256,20 @@ func isSupportedImagesToolModel(model string) bool {
 		return true
 	}
 	if idx := strings.LastIndex(trimmed, "/"); idx > 0 && idx < len(trimmed)-1 {
-		return strings.EqualFold(strings.TrimSpace(trimmed[idx+1:]), defaultImagesToolModel)
+		if strings.EqualFold(strings.TrimSpace(trimmed[idx+1:]), defaultImagesToolModel) {
+			return true
+		}
 	}
-	return false
+	return isOpenAICompatImagesModel(trimmed)
+}
+
+func isOpenAICompatImagesModel(model string) bool {
+	model = strings.TrimSpace(model)
+	if model == "" {
+		return false
+	}
+	info := registry.LookupModelInfo(model)
+	return info != nil && info.Type == registry.OpenAIImageModelType
 }
 
 // collectImageURLs 提取 JSON 模式下的输入图片 URL，并拒绝 file_id。

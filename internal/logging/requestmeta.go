@@ -2,14 +2,22 @@ package logging
 
 import (
 	"context"
+	"net/http"
+	"sync"
 	"sync/atomic"
 )
 
 type endpointKey struct{}
 type responseStatusKey struct{}
+type responseHeadersKey struct{}
 
 type responseStatusHolder struct {
 	status atomic.Int32
+}
+
+type responseHeadersHolder struct {
+	mu      sync.RWMutex
+	headers http.Header
 }
 
 // WithEndpoint 将稳定的入站端点快照写入 context，避免异步统计读取已复用的 Gin context。
@@ -43,6 +51,17 @@ func WithResponseStatusHolder(ctx context.Context) context.Context {
 	return context.WithValue(ctx, responseStatusKey{}, &responseStatusHolder{})
 }
 
+// WithResponseHeadersHolder 为请求创建可后置写入的上游响应头 holder。
+func WithResponseHeadersHolder(ctx context.Context) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if holder, ok := ctx.Value(responseHeadersKey{}).(*responseHeadersHolder); ok && holder != nil {
+		return ctx
+	}
+	return context.WithValue(ctx, responseHeadersKey{}, &responseHeadersHolder{})
+}
+
 // SetResponseStatus 在响应结束时记录最终 HTTP 状态，供异步 usage 插件读取。
 func SetResponseStatus(ctx context.Context, status int) {
 	if ctx == nil || status <= 0 {
@@ -55,6 +74,20 @@ func SetResponseStatus(ctx context.Context, status int) {
 	holder.status.Store(int32(status))
 }
 
+// SetResponseHeaders 记录最近一次上游响应头，供异步 usage 插件读取。
+func SetResponseHeaders(ctx context.Context, headers http.Header) {
+	if ctx == nil {
+		return
+	}
+	holder, ok := ctx.Value(responseHeadersKey{}).(*responseHeadersHolder)
+	if !ok || holder == nil {
+		return
+	}
+	holder.mu.Lock()
+	defer holder.mu.Unlock()
+	holder.headers = cloneHTTPHeader(headers)
+}
+
 // GetResponseStatus 返回已记录的最终 HTTP 状态；0 表示尚未记录。
 func GetResponseStatus(ctx context.Context) int {
 	if ctx == nil {
@@ -65,4 +98,25 @@ func GetResponseStatus(ctx context.Context) int {
 		return 0
 	}
 	return int(holder.status.Load())
+}
+
+// GetResponseHeaders 返回已记录的上游响应头副本。
+func GetResponseHeaders(ctx context.Context) http.Header {
+	if ctx == nil {
+		return nil
+	}
+	holder, ok := ctx.Value(responseHeadersKey{}).(*responseHeadersHolder)
+	if !ok || holder == nil {
+		return nil
+	}
+	holder.mu.RLock()
+	defer holder.mu.RUnlock()
+	return cloneHTTPHeader(holder.headers)
+}
+
+func cloneHTTPHeader(headers http.Header) http.Header {
+	if len(headers) == 0 {
+		return nil
+	}
+	return headers.Clone()
 }

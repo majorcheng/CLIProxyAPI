@@ -14,6 +14,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	. "github.com/router-for-me/CLIProxyAPI/v7/internal/constant"
@@ -257,6 +259,15 @@ func (h *ClaudeCodeAPIHandler) handleStreamingResponse(c *gin.Context, rawJSON [
 			return
 		case chunk, ok := <-dataChan:
 			if !ok {
+				if errMsg, okPendingErr := pendingClaudeStreamError(errChan); okPendingErr {
+					h.WriteErrorResponse(c, errMsg)
+					if errMsg != nil {
+						cliCancel(errMsg.Error)
+					} else {
+						cliCancel(nil)
+					}
+					return
+				}
 				// Stream closed without data? Send DONE or just headers.
 				setSSEHeaders()
 				handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
@@ -279,6 +290,19 @@ func (h *ClaudeCodeAPIHandler) handleStreamingResponse(c *gin.Context, rawJSON [
 			h.forwardClaudeStream(c, flusher, func(err error) { cliCancel(err) }, dataChan, errChan)
 			return
 		}
+	}
+}
+
+// pendingClaudeStreamError 在 dataChan 已关闭时尝试读取已缓冲的上游错误，避免误返回空 SSE。
+func pendingClaudeStreamError(errs <-chan *interfaces.ErrorMessage) (*interfaces.ErrorMessage, bool) {
+	if errs == nil {
+		return nil, false
+	}
+	select {
+	case errMsg, ok := <-errs:
+		return errMsg, ok
+	default:
+		return nil, false
 	}
 }
 
@@ -317,11 +341,180 @@ type claudeErrorResponse struct {
 }
 
 func (h *ClaudeCodeAPIHandler) toClaudeError(msg *interfaces.ErrorMessage) claudeErrorResponse {
+	status := http.StatusInternalServerError
+	errText := http.StatusText(status)
+	if msg != nil {
+		if msg.StatusCode > 0 {
+			status = msg.StatusCode
+			errText = http.StatusText(status)
+		}
+		if msg.Error != nil {
+			if value := strings.TrimSpace(msg.Error.Error()); value != "" {
+				errText = value
+			}
+		}
+	}
+	errType, message := claudeErrorDetailFromText(status, errText)
 	return claudeErrorResponse{
 		Type: "error",
 		Error: claudeErrorDetail{
-			Type:    "api_error",
-			Message: msg.Error.Error(),
+			Type:    errType,
+			Message: message,
 		},
 	}
+}
+
+// WriteErrorResponse 用 Claude API 兼容 envelope 返回上游错误，避免 Codex/OpenAI 错误体直出。
+func (h *ClaudeCodeAPIHandler) WriteErrorResponse(c *gin.Context, msg *interfaces.ErrorMessage) {
+	status, _ := claudeErrorStatusAndText(msg)
+	if msg != nil && msg.Addon != nil && handlers.PassthroughHeadersEnabled(h.Cfg) {
+		for key, values := range msg.Addon {
+			if len(values) == 0 {
+				continue
+			}
+			c.Writer.Header().Del(key)
+			for _, value := range values {
+				c.Writer.Header().Add(key, value)
+			}
+		}
+	}
+
+	body, err := json.Marshal(h.toClaudeError(msg))
+	if err != nil {
+		body = []byte(`{"type":"error","error":{"type":"api_error","message":"Internal Server Error"}}`)
+	}
+	appendClaudeAPIResponse(c, body)
+	if !c.Writer.Written() {
+		c.Writer.Header().Set("Content-Type", "application/json")
+	}
+	c.Status(status)
+	_, _ = c.Writer.Write(body)
+}
+
+// claudeErrorStatusAndText 统一解析状态码和错误文本，nil 错误时保留 500 默认值。
+func claudeErrorStatusAndText(msg *interfaces.ErrorMessage) (int, string) {
+	status := http.StatusInternalServerError
+	errText := http.StatusText(status)
+	if msg != nil && msg.StatusCode > 0 {
+		status = msg.StatusCode
+		errText = http.StatusText(status)
+	}
+	if msg != nil && msg.Error != nil {
+		if value := strings.TrimSpace(msg.Error.Error()); value != "" {
+			errText = value
+		}
+	}
+	return status, errText
+}
+
+// claudeErrorDetailFromText 尽量从 JSON 错误体中恢复 Claude error.type/message。
+func claudeErrorDetailFromText(status int, errText string) (string, string) {
+	message := strings.TrimSpace(errText)
+	if message == "" {
+		message = http.StatusText(status)
+	}
+	errType := claudeErrorTypeFromStatus(status)
+	if payloadType, payloadMessage, ok := claudeErrorPayloadDetail(message); ok {
+		if payloadType != "" {
+			errType = payloadType
+		}
+		if payloadMessage != "" {
+			message = payloadMessage
+		}
+	}
+	return errType, message
+}
+
+// claudeErrorPayloadDetail 解析 OpenAI/Claude 常见 JSON 错误 envelope。
+func claudeErrorPayloadDetail(message string) (string, string, bool) {
+	if !json.Valid([]byte(message)) {
+		return "", "", false
+	}
+	var payload map[string]any
+	if err := json.Unmarshal([]byte(message), &payload); err != nil {
+		return "", "", false
+	}
+	if errorPayload, ok := payload["error"].(map[string]any); ok {
+		return stringMapValue(errorPayload, "type"), firstStringMapValue(errorPayload, "message", "code"), true
+	}
+	return nonEnvelopeClaudeErrorPayload(payload)
+}
+
+// nonEnvelopeClaudeErrorPayload 兼容没有 error 字段包裹的上游 JSON 错误。
+func nonEnvelopeClaudeErrorPayload(payload map[string]any) (string, string, bool) {
+	payloadType := stringMapValue(payload, "type")
+	if payloadType == "error" {
+		payloadType = ""
+	}
+	return payloadType, stringMapValue(payload, "message"), true
+}
+
+// claudeErrorTypeFromStatus 将 HTTP 状态码映射到 Claude API 常见错误类型。
+func claudeErrorTypeFromStatus(status int) string {
+	switch status {
+	case http.StatusUnauthorized:
+		return "authentication_error"
+	case http.StatusPaymentRequired:
+		return "billing_error"
+	case http.StatusForbidden:
+		return "permission_error"
+	case http.StatusNotFound:
+		return "not_found_error"
+	case http.StatusRequestEntityTooLarge:
+		return "request_too_large"
+	case http.StatusTooManyRequests:
+		return "rate_limit_error"
+	case http.StatusGatewayTimeout:
+		return "timeout_error"
+	case 529:
+		return "overloaded_error"
+	default:
+		if status >= http.StatusInternalServerError {
+			return "api_error"
+		}
+		return "invalid_request_error"
+	}
+}
+
+// appendClaudeAPIResponse 保存错误响应体，确保后续日志/用量链路能记录实际返回内容。
+func appendClaudeAPIResponse(c *gin.Context, data []byte) {
+	if c == nil || len(data) == 0 {
+		return
+	}
+	if _, exists := c.Get("API_RESPONSE_TIMESTAMP"); !exists {
+		c.Set("API_RESPONSE_TIMESTAMP", time.Now())
+	}
+	if existing, exists := c.Get("API_RESPONSE"); exists {
+		if existingBytes, ok := existing.([]byte); ok && len(existingBytes) > 0 {
+			c.Set("API_RESPONSE", appendClaudeAPIResponseBytes(existingBytes, data))
+			return
+		}
+	}
+	c.Set("API_RESPONSE", bytes.Clone(data))
+}
+
+// appendClaudeAPIResponseBytes 追加多段响应体时补一个换行，避免日志中 JSON 粘连。
+func appendClaudeAPIResponseBytes(existingBytes []byte, data []byte) []byte {
+	combined := make([]byte, 0, len(existingBytes)+len(data)+1)
+	combined = append(combined, existingBytes...)
+	if existingBytes[len(existingBytes)-1] != '\n' {
+		combined = append(combined, '\n')
+	}
+	return append(combined, data...)
+}
+
+// stringMapValue 读取 JSON map 字符串字段并去掉空白。
+func stringMapValue(payload map[string]any, key string) string {
+	value, _ := payload[key].(string)
+	return strings.TrimSpace(value)
+}
+
+// firstStringMapValue 按优先级返回第一个非空字符串字段。
+func firstStringMapValue(payload map[string]any, keys ...string) string {
+	for _, key := range keys {
+		if value := stringMapValue(payload, key); value != "" {
+			return value
+		}
+	}
+	return ""
 }

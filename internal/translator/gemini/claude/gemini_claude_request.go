@@ -78,13 +78,20 @@ func ConvertClaudeRequestToGemini(modelName string, inputRawJSON []byte, _ bool)
 			contentJSON, _ = sjson.Set(contentJSON, "role", role)
 
 			contentsResult := messageResult.Get("content")
+			// Gemini 不接受空 parts；只有真正保留 part 后才追加整条 message。
+			hasContentParts := false
 			if contentsResult.IsArray() {
 				contentsResult.ForEach(func(_, contentResult gjson.Result) bool {
 					switch contentResult.Get("type").String() {
 					case "text":
+						text := contentResult.Get("text").String()
+						if text == "" {
+							return true
+						}
 						part := `{"text":""}`
-						part, _ = sjson.Set(part, "text", contentResult.Get("text").String())
+						part, _ = sjson.Set(part, "text", text)
 						contentJSON, _ = sjson.SetRaw(contentJSON, "parts.-1", part)
+						hasContentParts = true
 
 					case "tool_use":
 						functionName := contentResult.Get("name").String()
@@ -102,6 +109,7 @@ func ConvertClaudeRequestToGemini(modelName string, inputRawJSON []byte, _ bool)
 							part, _ = sjson.Set(part, "functionCall.name", functionName)
 							part, _ = sjson.SetRaw(part, "functionCall.args", functionArgs)
 							contentJSON, _ = sjson.SetRaw(contentJSON, "parts.-1", part)
+							hasContentParts = true
 						}
 
 					case "tool_result":
@@ -119,6 +127,7 @@ func ConvertClaudeRequestToGemini(modelName string, inputRawJSON []byte, _ bool)
 						part, _ = sjson.Set(part, "functionResponse.name", funcName)
 						part, _ = sjson.Set(part, "functionResponse.response.result", responseData)
 						contentJSON, _ = sjson.SetRaw(contentJSON, "parts.-1", part)
+						hasContentParts = true
 
 					case "image":
 						source := contentResult.Get("source")
@@ -134,11 +143,17 @@ func ConvertClaudeRequestToGemini(modelName string, inputRawJSON []byte, _ bool)
 						part, _ = sjson.Set(part, "inline_data.mime_type", mimeType)
 						part, _ = sjson.Set(part, "inline_data.data", data)
 						contentJSON, _ = sjson.SetRaw(contentJSON, "parts.-1", part)
+						hasContentParts = true
 					}
 					return true
 				})
-				out, _ = sjson.SetRaw(out, "contents.-1", contentJSON)
+				if hasContentParts {
+					out, _ = sjson.SetRaw(out, "contents.-1", contentJSON)
+				}
 			} else if contentsResult.Type == gjson.String {
+				if contentsResult.String() == "" {
+					return true
+				}
 				part := `{"text":""}`
 				part, _ = sjson.Set(part, "text", contentsResult.String())
 				contentJSON, _ = sjson.SetRaw(contentJSON, "parts.-1", part)

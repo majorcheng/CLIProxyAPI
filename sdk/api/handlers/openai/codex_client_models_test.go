@@ -1,6 +1,11 @@
 package openai
 
-import "testing"
+import (
+	"reflect"
+	"testing"
+
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
+)
 
 func TestCodexClientModelsResponseUsesTemplateAndCustomMetadata(t *testing.T) {
 	resp := CodexClientModelsResponse([]map[string]any{
@@ -23,6 +28,45 @@ func TestCodexClientModelsResponseUsesTemplateAndCustomMetadata(t *testing.T) {
 	assertCodexClientTemplateModelForTest(t, models)
 	assertCodexClientCustomModelForTest(t, models)
 	assertCodexClientHiddenImageModelForTest(t, models)
+}
+
+func TestApplyCodexClientThinkingMetadataKeepsOnlySupportedReasoningLevels(t *testing.T) {
+	entry := map[string]any{}
+	applyCodexClientThinkingMetadata(entry, &registry.ThinkingSupport{
+		Levels: []string{"none", "minimal", "low", "medium", "unsupported", "high", "xhigh"},
+	})
+	sanitizeCodexClientReasoningMetadata(entry)
+
+	levels := codexClientReasoningLevelsForTest(t, entry)
+	want := []string{"none", "low", "medium", "high", "xhigh"}
+	if !reflect.DeepEqual(levels, want) {
+		t.Fatalf("reasoning levels = %#v, want %#v", levels, want)
+	}
+	if got, _ := entry["default_reasoning_level"].(string); got != "medium" {
+		t.Fatalf("default_reasoning_level = %q, want medium", got)
+	}
+}
+
+func TestSanitizeCodexClientReasoningMetadataFallsBackToFirstAllowedLevel(t *testing.T) {
+	entry := map[string]any{
+		"default_reasoning_level": "minimal",
+		"supported_reasoning_levels": []any{
+			map[string]any{"effort": "minimal"},
+			map[string]any{"effort": "none"},
+			map[string]any{"effort": "low"},
+		},
+	}
+
+	sanitizeCodexClientReasoningMetadata(entry)
+
+	levels := codexClientReasoningLevelsForTest(t, entry)
+	want := []string{"none", "low"}
+	if !reflect.DeepEqual(levels, want) {
+		t.Fatalf("reasoning levels = %#v, want %#v", levels, want)
+	}
+	if got, _ := entry["default_reasoning_level"].(string); got != "none" {
+		t.Fatalf("default_reasoning_level = %q, want none", got)
+	}
 }
 
 func assertCodexClientTemplateModelForTest(t *testing.T, models []map[string]any) {
@@ -83,6 +127,23 @@ func findCodexClientModelForTest(models []map[string]any, slug string) map[strin
 		}
 	}
 	return nil
+}
+
+func codexClientReasoningLevelsForTest(t *testing.T, entry map[string]any) []string {
+	t.Helper()
+	rawLevels, ok := entry["supported_reasoning_levels"].([]any)
+	if !ok {
+		t.Fatalf("supported_reasoning_levels = %#v, want []any", entry["supported_reasoning_levels"])
+	}
+	levels := make([]string, 0, len(rawLevels))
+	for _, rawLevel := range rawLevels {
+		levelEntry, ok := rawLevel.(map[string]any)
+		if !ok {
+			t.Fatalf("reasoning level entry = %#v, want map[string]any", rawLevel)
+		}
+		levels = append(levels, stringModelValue(levelEntry, "effort"))
+	}
+	return levels
 }
 
 func intCodexClientModelValueForTest(value any) int {

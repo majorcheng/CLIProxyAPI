@@ -71,6 +71,98 @@ func patchCodexCompletedOutput(eventData []byte, outputItemsByIndex map[int64][]
 	return completedDataPatched
 }
 
+// codexTerminalStreamContextLengthErr 将 Codex SSE 里的终态上下文长度错误转成稳定 statusErr。
+func codexTerminalStreamContextLengthErr(eventData []byte) (statusErr, bool) {
+	body := codexTerminalStreamErrorBody(eventData)
+	if len(body) == 0 || !codexTerminalErrorIsContextLength(body) {
+		return statusErr{}, false
+	}
+	return newCodexStatusErr(http.StatusBadRequest, body), true
+}
+
+// codexTerminalStreamErrorBody 从 Codex 终态 SSE 事件里提取统一 OpenAI 风格错误体。
+func codexTerminalStreamErrorBody(eventData []byte) []byte {
+	switch gjson.GetBytes(eventData, "type").String() {
+	case "error":
+		if body := codexTerminalErrorBody(eventData, "error"); len(body) > 0 {
+			return body
+		}
+		return codexTerminalTopLevelErrorBody(eventData)
+	case "response.failed":
+		if body := codexTerminalErrorBody(eventData, "response.error"); len(body) > 0 {
+			return body
+		}
+		return codexTerminalErrorBody(eventData, "error")
+	default:
+		return nil
+	}
+}
+
+// codexTerminalErrorBody 将指定错误字段包装成下游已有错误处理可识别的结构。
+func codexTerminalErrorBody(eventData []byte, path string) []byte {
+	errorResult := gjson.GetBytes(eventData, path)
+	if !errorResult.Exists() {
+		return nil
+	}
+	body := []byte(`{"error":{}}`)
+	if errorResult.Type == gjson.JSON {
+		body, _ = sjson.SetRawBytes(body, "error", []byte(errorResult.Raw))
+	} else if message := strings.TrimSpace(errorResult.String()); message != "" {
+		body, _ = sjson.SetBytes(body, "error.message", message)
+	}
+	return codexTerminalErrorBodyWithMessageFallback(body, eventData)
+}
+
+// codexTerminalErrorBodyWithMessageFallback 在上游只给 code/type 时补齐 message，避免客户端收到空错误。
+func codexTerminalErrorBodyWithMessageFallback(body []byte, eventData []byte) []byte {
+	if strings.TrimSpace(gjson.GetBytes(body, "error.message").String()) != "" {
+		return body
+	}
+	for _, path := range []string{"response.error.message", "response.error.code", "response.error.type"} {
+		if message := strings.TrimSpace(gjson.GetBytes(eventData, path).String()); message != "" {
+			body, _ = sjson.SetBytes(body, "error.message", message)
+			return body
+		}
+	}
+	for _, path := range []string{"error.code", "error.type"} {
+		if message := strings.TrimSpace(gjson.GetBytes(body, path).String()); message != "" {
+			body, _ = sjson.SetBytes(body, "error.message", message)
+			return body
+		}
+	}
+	return body
+}
+
+// codexTerminalTopLevelErrorBody 兼容 type=error 但错误字段位于事件顶层的 Codex SSE 形态。
+func codexTerminalTopLevelErrorBody(eventData []byte) []byte {
+	body := []byte(`{"error":{}}`)
+	keys := map[string]string{"message": "message", "code": "code", "type": "error_type", "param": "param"}
+	hasValue := false
+	for target, source := range keys {
+		value := strings.TrimSpace(gjson.GetBytes(eventData, source).String())
+		if value == "" {
+			continue
+		}
+		body, _ = sjson.SetBytes(body, "error."+target, value)
+		hasValue = true
+	}
+	if !hasValue {
+		return nil
+	}
+	return codexTerminalErrorBodyWithMessageFallback(body, eventData)
+}
+
+// codexTerminalErrorIsContextLength 判断错误体是否属于上下文长度超限，便于稳定映射为 400。
+func codexTerminalErrorIsContextLength(body []byte) bool {
+	errorCode := strings.ToLower(strings.TrimSpace(gjson.GetBytes(body, "error.code").String()))
+	message := strings.ToLower(strings.TrimSpace(gjson.GetBytes(body, "error.message").String()))
+	return errorCode == "context_length_exceeded" ||
+		errorCode == "context_too_large" ||
+		strings.Contains(message, "context window") ||
+		strings.Contains(message, "context length") ||
+		strings.Contains(message, "too many tokens")
+}
+
 // orderedCodexOutputItems 按 output_index 排序，并把缺少 index 的 item 追加到尾部。
 func orderedCodexOutputItems(outputItemsByIndex map[int64][]byte, outputItemsFallback [][]byte) [][]byte {
 	indexes := make([]int64, 0, len(outputItemsByIndex))
@@ -420,6 +512,14 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 
 			if bytes.HasPrefix(line, dataTag) {
 				data := bytes.TrimSpace(line[5:])
+				if streamErr, ok := codexTerminalStreamContextLengthErr(data); ok {
+					recordAPIResponseError(ctx, e.cfg, streamErr)
+					reporter.publishFailure(ctx)
+					if !sendStreamChunk(ctx, out, cliproxyexecutor.StreamChunk{Err: streamErr}) {
+						return
+					}
+					return
+				}
 				switch gjson.GetBytes(data, "type").String() {
 				case "response.output_item.done":
 					collectCodexOutputItemDone(data, outputItemsByIndex, &outputItemsFallback)
@@ -675,6 +775,9 @@ func readCodexCompletedEvent(ctx context.Context, cfg *config.Config, body io.Re
 			appendAPIResponseChunk(ctx, cfg, line)
 			if bytes.HasPrefix(line, dataTag) {
 				data := bytes.TrimSpace(line[len(dataTag):])
+				if streamErr, ok := codexTerminalStreamContextLengthErr(data); ok {
+					return nil, streamErr
+				}
 				switch gjson.GetBytes(data, "type").String() {
 				case "response.output_item.done":
 					collectCodexOutputItemDone(data, outputItemsByIndex, &outputItemsFallback)

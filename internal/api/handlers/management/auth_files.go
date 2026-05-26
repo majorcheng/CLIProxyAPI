@@ -428,6 +428,18 @@ func (h *Handler) listAuthFilesFromDisk(c *gin.Context) {
 				fileData["note"] = trimmed
 			}
 		}
+		if wv := gjson.GetBytes(data, "websockets"); wv.Exists() {
+			switch wv.Type {
+			case gjson.True:
+				fileData["websockets"] = true
+			case gjson.False:
+				fileData["websockets"] = false
+			case gjson.String:
+				if parsed, errParse := strconv.ParseBool(strings.TrimSpace(wv.String())); errParse == nil {
+					fileData["websockets"] = parsed
+				}
+			}
+		}
 
 		files = append(files, fileData)
 	}
@@ -569,6 +581,9 @@ func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
 				entry["note"] = trimmed
 			}
 		}
+	}
+	if websockets, ok := authWebsocketsValue(auth); ok {
+		entry["websockets"] = websockets
 	}
 	return entry
 }
@@ -1362,6 +1377,9 @@ func (h *Handler) buildAuthFromFileData(path string, data []byte) (*coreauth.Aut
 	if planType := codexPlanTypeFromMetadata(metadata); planType != "" {
 		attr["plan_type"] = planType
 	}
+	if websockets, ok := authFileBoolValue(metadata["websockets"]); ok {
+		attr["websockets"] = strconv.FormatBool(websockets)
+	}
 	auth := &coreauth.Auth{
 		ID:         authID,
 		Provider:   provider,
@@ -1473,100 +1491,6 @@ func (h *Handler) PatchAuthFileStatus(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{"status": "ok", "disabled": *req.Disabled})
-}
-
-// PatchAuthFileFields updates editable fields (prefix, proxy_url, priority, note) of an auth file.
-func (h *Handler) PatchAuthFileFields(c *gin.Context) {
-	manager := h.requireAuthManager(c)
-	if manager == nil {
-		return
-	}
-
-	var req struct {
-		Name     string  `json:"name"`
-		Prefix   *string `json:"prefix"`
-		ProxyURL *string `json:"proxy_url"`
-		Priority *int    `json:"priority"`
-		Note     *string `json:"note"`
-	}
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
-		return
-	}
-
-	name := strings.TrimSpace(req.Name)
-	if name == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "name is required"})
-		return
-	}
-
-	ctx := c.Request.Context()
-
-	// Find auth by name or ID
-	var targetAuth *coreauth.Auth
-	if auth, ok := manager.GetByID(name); ok {
-		targetAuth = auth
-	} else if auth, ok := manager.FindByFileName(name); ok {
-		targetAuth = auth
-	}
-
-	if targetAuth == nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "auth file not found"})
-		return
-	}
-
-	changed := false
-	if req.Prefix != nil {
-		targetAuth.Prefix = *req.Prefix
-		changed = true
-	}
-	if req.ProxyURL != nil {
-		targetAuth.ProxyURL = *req.ProxyURL
-		changed = true
-	}
-	if req.Priority != nil || req.Note != nil {
-		if targetAuth.Metadata == nil {
-			targetAuth.Metadata = make(map[string]any)
-		}
-		if targetAuth.Attributes == nil {
-			targetAuth.Attributes = make(map[string]string)
-		}
-
-		if req.Priority != nil {
-			if *req.Priority == 0 {
-				delete(targetAuth.Metadata, "priority")
-				delete(targetAuth.Attributes, "priority")
-			} else {
-				targetAuth.Metadata["priority"] = *req.Priority
-				targetAuth.Attributes["priority"] = strconv.Itoa(*req.Priority)
-			}
-		}
-		if req.Note != nil {
-			trimmedNote := strings.TrimSpace(*req.Note)
-			if trimmedNote == "" {
-				delete(targetAuth.Metadata, "note")
-				delete(targetAuth.Attributes, "note")
-			} else {
-				targetAuth.Metadata["note"] = trimmedNote
-				targetAuth.Attributes["note"] = trimmedNote
-			}
-		}
-		changed = true
-	}
-
-	if !changed {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "no fields to update"})
-		return
-	}
-
-	targetAuth.UpdatedAt = time.Now()
-
-	if _, err := manager.Update(ctx, targetAuth); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to update auth: %v", err)})
-		return
-	}
-
-	c.JSON(http.StatusOK, gin.H{"status": "ok"})
 }
 
 func (h *Handler) disableAuth(ctx context.Context, id string) {

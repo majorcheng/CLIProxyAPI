@@ -126,3 +126,33 @@ func TestConvertOpenAIChatCompletionsResponseToOpenAIResponses_ResponseCompleted
 	}
 }
 
+func TestConvertOpenAIChatCompletionsResponseToOpenAIResponses_ReasoningDoneUsesSummaryArrayPath(t *testing.T) {
+	t.Parallel()
+
+	request := []byte(`{"model":"gpt-5.4"}`)
+	lines := []string{
+		`data: {"id":"resp_reasoning_summary","object":"chat.completion.chunk","created":1773896263,"model":"model","choices":[{"index":0,"delta":{"role":"assistant","reasoning_content":"internal "},"finish_reason":null}]}`,
+		`data: {"id":"resp_reasoning_summary","object":"chat.completion.chunk","created":1773896263,"model":"model","choices":[{"index":0,"delta":{"content":"answer"},"finish_reason":null}]}`,
+	}
+
+	var param any
+	var reasoningDone gjson.Result
+	for _, line := range lines {
+		for _, chunk := range ConvertOpenAIChatCompletionsResponseToOpenAIResponses(context.Background(), "model", request, request, []byte(line), &param) {
+			event, data := parseOpenAIResponsesSSEEvent(t, chunk)
+			if event == "response.output_item.done" && data.Get("item.type").String() == "reasoning" {
+				reasoningDone = data
+			}
+		}
+	}
+
+	if !reasoningDone.Exists() {
+		t.Fatal("expected reasoning output_item.done event")
+	}
+	if got := reasoningDone.Get("item.summary.0.text").String(); got != "internal " {
+		t.Fatalf("item.summary.0.text = %q, want %q", got, "internal ")
+	}
+	if reasoningDone.Get("item.summary.text").Exists() {
+		t.Fatalf("item.summary.text should not exist: %s", reasoningDone.Raw)
+	}
+}

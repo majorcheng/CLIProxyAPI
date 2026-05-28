@@ -80,7 +80,7 @@ func TestRegisterModelsForAuth_CodexFreeIgnoresExcludedModels(t *testing.T) {
 		Attributes: map[string]string{
 			"auth_kind":       "oauth",
 			"plan_type":       "free",
-			"excluded_models": "gpt-5.4",
+			"excluded_models": "gpt-5.5",
 		},
 	}
 
@@ -99,8 +99,8 @@ func TestRegisterModelsForAuth_CodexFreeIgnoresExcludedModels(t *testing.T) {
 		}
 		seen[strings.TrimSpace(model.ID)] = true
 	}
-	if !seen["gpt-5.4"] {
-		t.Fatal("expected Codex free auth to keep per-account excluded model gpt-5.4")
+	if !seen["gpt-5.5"] {
+		t.Fatal("expected Codex free auth to keep per-account excluded model gpt-5.5")
 	}
 	if !seen["gpt-5.4-mini"] {
 		t.Fatal("expected Codex free auth to keep global excluded model gpt-5.4-mini")

@@ -167,6 +167,20 @@ func ConvertOpenAIResponsesRequestToClaude(modelName string, inputRawJSON []byte
 		}
 	}
 
+	// pendingReasoningParts 暂存 Responses reasoning，直到可以和后续 assistant 内容合并。
+	var pendingReasoningParts []string
+	flushPendingReasoning := func() {
+		if len(pendingReasoningParts) == 0 {
+			return
+		}
+		asst := `{"role":"assistant","content":[]}`
+		for _, partJSON := range pendingReasoningParts {
+			asst, _ = sjson.SetRaw(asst, "content.-1", partJSON)
+		}
+		out, _ = sjson.SetRaw(out, "messages.-1", asst)
+		pendingReasoningParts = nil
+	}
+
 	// input array processing
 	if input := root.Get("input"); input.Exists() && input.IsArray() {
 		input.ForEach(func(_, item gjson.Result) bool {
@@ -279,10 +293,26 @@ func ConvertOpenAIResponsesRequestToClaude(modelName string, inputRawJSON []byte
 					}
 				}
 
+				hasReasoningParts := false
+				if len(pendingReasoningParts) > 0 {
+					if role == "assistant" {
+						if len(partsJSON) == 0 && textAggregate.Len() > 0 {
+							contentPart := `{"type":"text","text":""}`
+							contentPart, _ = sjson.Set(contentPart, "text", textAggregate.String())
+							partsJSON = append(partsJSON, contentPart)
+						}
+						partsJSON = append(append([]string{}, pendingReasoningParts...), partsJSON...)
+						pendingReasoningParts = nil
+						hasReasoningParts = true
+					} else {
+						flushPendingReasoning()
+					}
+				}
+
 				if len(partsJSON) > 0 {
 					msg := `{"role":"","content":[]}`
 					msg, _ = sjson.Set(msg, "role", role)
-					if len(partsJSON) == 1 && !hasImage && !hasFile {
+					if len(partsJSON) == 1 && !hasImage && !hasFile && !hasReasoningParts {
 						// Preserve legacy behavior for single text content
 						msg, _ = sjson.Delete(msg, "content")
 						textPart := gjson.Parse(partsJSON[0])
@@ -298,6 +328,11 @@ func ConvertOpenAIResponsesRequestToClaude(modelName string, inputRawJSON []byte
 					msg, _ = sjson.Set(msg, "role", role)
 					msg, _ = sjson.Set(msg, "content", textAggregate.String())
 					out, _ = sjson.SetRaw(out, "messages.-1", msg)
+				}
+
+			case "reasoning":
+				if thinkingPart := convertResponsesReasoningToClaudeThinking(item); thinkingPart != "" {
+					pendingReasoningParts = append(pendingReasoningParts, thinkingPart)
 				}
 
 			case "function_call":
@@ -320,10 +355,15 @@ func ConvertOpenAIResponsesRequestToClaude(modelName string, inputRawJSON []byte
 				}
 
 				asst := `{"role":"assistant","content":[]}`
+				for _, partJSON := range pendingReasoningParts {
+					asst, _ = sjson.SetRaw(asst, "content.-1", partJSON)
+				}
+				pendingReasoningParts = nil
 				asst, _ = sjson.SetRaw(asst, "content.-1", toolUse)
 				out, _ = sjson.SetRaw(out, "messages.-1", asst)
 
 			case "function_call_output":
+				flushPendingReasoning()
 				// Map to user tool_result
 				callID := item.Get("call_id").String()
 				toolResult := `{"type":"tool_result","tool_use_id":"","content":""}`
@@ -342,6 +382,7 @@ func ConvertOpenAIResponsesRequestToClaude(modelName string, inputRawJSON []byte
 			return true
 		})
 	}
+	flushPendingReasoning()
 
 	includedToolNames := map[string]struct{}{}
 	toolNameMap := map[string]string{}
@@ -400,6 +441,38 @@ func ConvertOpenAIResponsesRequestToClaude(modelName string, inputRawJSON []byte
 	}
 
 	return []byte(out)
+}
+
+// convertResponsesReasoningToClaudeThinking 将 Responses reasoning 签名恢复成 Claude thinking block。
+func convertResponsesReasoningToClaudeThinking(item gjson.Result) string {
+	signature := item.Get("encrypted_content").String()
+	if signature == "" {
+		return ""
+	}
+
+	thinkingText := responsesReasoningSummaryText(item)
+	thinkingPart := `{"type":"thinking","thinking":"","signature":""}`
+	thinkingPart, _ = sjson.Set(thinkingPart, "thinking", thinkingText)
+	thinkingPart, _ = sjson.Set(thinkingPart, "signature", signature)
+	return thinkingPart
+}
+
+// responsesReasoningSummaryText 拼接 Responses reasoning.summary 中的文本片段。
+func responsesReasoningSummaryText(item gjson.Result) string {
+	var builder strings.Builder
+	if summary := item.Get("summary"); summary.Exists() && summary.IsArray() {
+		summary.ForEach(func(_, part gjson.Result) bool {
+			if text := part.Get("text"); text.Exists() {
+				builder.WriteString(text.String())
+				return true
+			}
+			if part.Type == gjson.String {
+				builder.WriteString(part.String())
+			}
+			return true
+		})
+	}
+	return builder.String()
 }
 
 // convertResponsesToolResultContent 兼容非字符串 tool result 输出，避免 object/array 被粗暴降级成字符串。

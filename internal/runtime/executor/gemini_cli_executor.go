@@ -134,6 +134,7 @@ func (e *GeminiCLIExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth
 	basePayload = fixGeminiCLIImageAspectRatio(baseModel, basePayload)
 	requestedModel := payloadRequestedModel(opts, req.Model)
 	basePayload = applyPayloadConfigWithRequest(e.cfg, baseModel, "gemini", from.String(), "request", basePayload, originalTranslated, requestedModel, payloadRequestPath(opts), opts.Headers)
+	basePayload = cleanGeminiCLIRequestSchemas(basePayload)
 
 	action := "generateContent"
 	if req.Metadata != nil {
@@ -288,6 +289,7 @@ func (e *GeminiCLIExecutor) ExecuteStream(ctx context.Context, auth *cliproxyaut
 	basePayload = fixGeminiCLIImageAspectRatio(baseModel, basePayload)
 	requestedModel := payloadRequestedModel(opts, req.Model)
 	basePayload = applyPayloadConfigWithRequest(e.cfg, baseModel, "gemini", from.String(), "request", basePayload, originalTranslated, requestedModel, payloadRequestPath(opts), opts.Headers)
+	basePayload = cleanGeminiCLIRequestSchemas(basePayload)
 
 	projectID := resolveGeminiProjectID(auth)
 
@@ -508,6 +510,7 @@ func (e *GeminiCLIExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.
 		payload = deleteJSONField(payload, "model")
 		payload = deleteJSONField(payload, "request.safetySettings")
 		payload = fixGeminiCLIImageAspectRatio(baseModel, payload)
+		payload = cleanGeminiCLIRequestSchemas(payload)
 
 		tok, errTok := tokenSource.Token()
 		if errTok != nil {
@@ -797,6 +800,94 @@ func deleteJSONField(body []byte, key string) []byte {
 	}
 	updated, err := sjson.DeleteBytes(body, key)
 	if err != nil {
+		return body
+	}
+	return updated
+}
+
+// cleanGeminiCLIRequestSchemas 只清理 Gemini CLI 真正会校验的 schema 路径，避免误改普通业务字段。
+func cleanGeminiCLIRequestSchemas(body []byte) []byte {
+	if len(body) == 0 {
+		return body
+	}
+	hasTools := gjson.GetBytes(body, "request.tools.0").Exists()
+	hasResponseSchema := gjson.GetBytes(body, "request.generationConfig.responseSchema").Exists()
+	hasResponseJSONSchema := gjson.GetBytes(body, "request.generationConfig.responseJsonSchema").Exists()
+	if !hasTools && !hasResponseSchema && !hasResponseJSONSchema {
+		return body
+	}
+
+	body = cleanGeminiCLIToolSchemas(body)
+	return cleanGeminiCLIResponseSchemas(body)
+}
+
+// cleanGeminiCLIToolSchemas 清理 tools 中 snake_case 与 camelCase 两种函数声明 schema。
+func cleanGeminiCLIToolSchemas(body []byte) []byte {
+	tools := gjson.GetBytes(body, "request.tools")
+	if !tools.IsArray() {
+		return body
+	}
+
+	for i, tool := range tools.Array() {
+		for _, declarationsKey := range []string{"function_declarations", "functionDeclarations"} {
+			funcDecls := tool.Get(declarationsKey)
+			if !funcDecls.IsArray() {
+				continue
+			}
+			for j, decl := range funcDecls.Array() {
+				location := geminiCLIFunctionDeclarationLocation{
+					ToolIndex:        i,
+					DeclarationsKey:  declarationsKey,
+					DeclarationIndex: j,
+				}
+				body = cleanGeminiCLIFunctionDeclarationSchema(body, location, decl)
+			}
+		}
+	}
+	return body
+}
+
+// geminiCLIFunctionDeclarationLocation 描述函数声明 schema 在 Gemini CLI 请求中的写回位置。
+type geminiCLIFunctionDeclarationLocation struct {
+	ToolIndex        int
+	DeclarationsKey  string
+	DeclarationIndex int
+}
+
+// cleanGeminiCLIFunctionDeclarationSchema 清理单个函数声明中的参数 schema。
+func cleanGeminiCLIFunctionDeclarationSchema(body []byte, location geminiCLIFunctionDeclarationLocation, decl gjson.Result) []byte {
+	for _, schemaKey := range []string{"parameters", "parametersJsonSchema"} {
+		params := decl.Get(schemaKey)
+		if !params.Exists() || !params.IsObject() {
+			continue
+		}
+		path := fmt.Sprintf("request.tools.%d.%s.%d.%s", location.ToolIndex, location.DeclarationsKey, location.DeclarationIndex, schemaKey)
+		body = setCleanGeminiCLISchema(body, path, params.Raw)
+	}
+	return body
+}
+
+// cleanGeminiCLIResponseSchemas 清理 generationConfig 中两种响应 schema 字段。
+func cleanGeminiCLIResponseSchemas(body []byte) []byte {
+	for _, schemaPath := range []string{
+		"request.generationConfig.responseSchema",
+		"request.generationConfig.responseJsonSchema",
+	} {
+		responseSchema := gjson.GetBytes(body, schemaPath)
+		if !responseSchema.IsObject() {
+			continue
+		}
+		body = setCleanGeminiCLISchema(body, schemaPath, responseSchema.Raw)
+	}
+	return body
+}
+
+// setCleanGeminiCLISchema 统一写回清洗后的 schema，失败时保留原请求并打印可定位日志。
+func setCleanGeminiCLISchema(body []byte, path string, rawSchema string) []byte {
+	cleaned := util.CleanJSONSchemaForGemini(rawSchema)
+	updated, errSet := sjson.SetRawBytes(body, path, []byte(cleaned))
+	if errSet != nil {
+		log.Errorf("gemini cli executor: failed to set cleaned schema at %s: %v", path, errSet)
 		return body
 	}
 	return updated

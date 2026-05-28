@@ -304,6 +304,11 @@ func repairResponsesToolCallsArray(outputCache, callCache *websocketToolOutputCa
 				continue
 			}
 
+			if allowOrphanOutputs {
+				filtered = append(filtered, item)
+				continue
+			}
+
 			if callCache != nil {
 				if cached, ok := callCache.get(sessionKey, callID); ok {
 					if _, already := insertedCalls[callID]; !already {
@@ -314,11 +319,6 @@ func repairResponsesToolCallsArray(outputCache, callCache *websocketToolOutputCa
 					filtered = append(filtered, item)
 					continue
 				}
-			}
-
-			if allowOrphanOutputs {
-				filtered = append(filtered, item)
-				continue
 			}
 
 			// 缺少对应 tool call 的孤儿 output 不能继续上送。
@@ -336,6 +336,11 @@ func repairResponsesToolCallsArray(outputCache, callCache *websocketToolOutputCa
 		}
 
 		if _, ok := outputPresent[callID]; ok {
+			filtered = append(filtered, item)
+			continue
+		}
+
+		if allowOrphanOutputs {
 			filtered = append(filtered, item)
 			continue
 		}

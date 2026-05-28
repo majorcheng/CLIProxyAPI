@@ -31,6 +31,7 @@ type claudeToResponsesState struct {
 	ReasoningActive    bool
 	ReasoningItemID    string
 	ReasoningBuf       strings.Builder
+	ReasoningSignature string
 	ReasoningPartAdded bool
 	ReasoningIndex     int
 	// usage aggregation
@@ -88,6 +89,7 @@ func ConvertClaudeResponseToOpenAIResponses(ctx context.Context, modelName strin
 			st.CurrentMsgID = ""
 			st.CurrentFCID = ""
 			st.ReasoningItemID = ""
+			st.ReasoningSignature = ""
 			st.ReasoningIndex = 0
 			st.ReasoningPartAdded = false
 			st.FuncArgsBuf = make(map[int]*strings.Builder)
@@ -162,11 +164,13 @@ func ConvertClaudeResponseToOpenAIResponses(ctx context.Context, modelName strin
 			st.ReasoningActive = true
 			st.ReasoningIndex = idx
 			st.ReasoningBuf.Reset()
+			st.ReasoningSignature = cb.Get("signature").String()
 			st.ReasoningItemID = fmt.Sprintf("rs_%s_%d", st.ResponseID, idx)
-			item := `{"type":"response.output_item.added","sequence_number":0,"output_index":0,"item":{"id":"","type":"reasoning","status":"in_progress","summary":[]}}`
+			item := `{"type":"response.output_item.added","sequence_number":0,"output_index":0,"item":{"id":"","type":"reasoning","status":"in_progress","encrypted_content":"","summary":[]}}`
 			item, _ = sjson.Set(item, "sequence_number", nextSeq())
 			item, _ = sjson.Set(item, "output_index", idx)
 			item, _ = sjson.Set(item, "item.id", st.ReasoningItemID)
+			item, _ = sjson.Set(item, "item.encrypted_content", st.ReasoningSignature)
 			out = append(out, emitEvent("response.output_item.added", item))
 			// add a summary part placeholder
 			part := `{"type":"response.reasoning_summary_part.added","sequence_number":0,"item_id":"","output_index":0,"summary_index":0,"part":{"type":"summary_text","text":""}}`
@@ -217,6 +221,12 @@ func ConvertClaudeResponseToOpenAIResponses(ctx context.Context, modelName strin
 					msg, _ = sjson.Set(msg, "output_index", st.ReasoningIndex)
 					msg, _ = sjson.Set(msg, "delta", t.String())
 					out = append(out, emitEvent("response.reasoning_summary_text.delta", msg))
+				}
+			}
+		} else if dt == "signature_delta" {
+			if st.ReasoningActive {
+				if signature := d.Get("signature"); signature.Exists() && signature.String() != "" {
+					st.ReasoningSignature = signature.String()
 				}
 			}
 		}
@@ -276,6 +286,17 @@ func ConvertClaudeResponseToOpenAIResponses(ctx context.Context, modelName strin
 			partDone, _ = sjson.Set(partDone, "output_index", st.ReasoningIndex)
 			partDone, _ = sjson.Set(partDone, "part.text", full)
 			out = append(out, emitEvent("response.reasoning_summary_part.done", partDone))
+			itemDone := `{"type":"response.output_item.done","sequence_number":0,"output_index":0,"item":{"id":"","type":"reasoning","encrypted_content":"","summary":[]}}`
+			itemDone, _ = sjson.Set(itemDone, "sequence_number", nextSeq())
+			itemDone, _ = sjson.Set(itemDone, "item.id", st.ReasoningItemID)
+			itemDone, _ = sjson.Set(itemDone, "output_index", st.ReasoningIndex)
+			itemDone, _ = sjson.Set(itemDone, "item.encrypted_content", st.ReasoningSignature)
+			if full != "" {
+				summary := `{"type":"summary_text","text":""}`
+				summary, _ = sjson.Set(summary, "text", full)
+				itemDone, _ = sjson.SetRaw(itemDone, "item.summary.-1", summary)
+			}
+			out = append(out, emitEvent("response.output_item.done", itemDone))
 			st.ReasoningActive = false
 			st.ReasoningPartAdded = false
 		}
@@ -366,10 +387,15 @@ func ConvertClaudeResponseToOpenAIResponses(ctx context.Context, modelName strin
 		// Build response.output from aggregated state
 		outputsWrapper := `{"arr":[]}`
 		// reasoning item (if any)
-		if st.ReasoningBuf.Len() > 0 || st.ReasoningPartAdded {
-			item := `{"id":"","type":"reasoning","summary":[{"type":"summary_text","text":""}]}`
+		if st.ReasoningBuf.Len() > 0 || st.ReasoningPartAdded || st.ReasoningSignature != "" {
+			item := `{"id":"","type":"reasoning","encrypted_content":"","summary":[]}`
 			item, _ = sjson.Set(item, "id", st.ReasoningItemID)
-			item, _ = sjson.Set(item, "summary.0.text", st.ReasoningBuf.String())
+			item, _ = sjson.Set(item, "encrypted_content", st.ReasoningSignature)
+			if st.ReasoningBuf.Len() > 0 {
+				summary := `{"type":"summary_text","text":""}`
+				summary, _ = sjson.Set(summary, "text", st.ReasoningBuf.String())
+				item, _ = sjson.SetRaw(item, "summary.-1", summary)
+			}
 			outputsWrapper, _ = sjson.SetRaw(outputsWrapper, "arr.-1", item)
 		}
 		// assistant message item (if any text)
@@ -475,6 +501,7 @@ func ConvertClaudeResponseToOpenAIResponsesNonStream(_ context.Context, _ string
 		reasoningBuf    strings.Builder
 		reasoningActive bool
 		reasoningItemID string
+		reasoningSig    string
 		inputTokens     int64
 		outputTokens    int64
 	)
@@ -524,6 +551,7 @@ func ConvertClaudeResponseToOpenAIResponsesNonStream(_ context.Context, _ string
 			case "thinking":
 				reasoningActive = true
 				reasoningItemID = fmt.Sprintf("rs_%s_%d", responseID, idx)
+				reasoningSig = cb.Get("signature").String()
 			}
 
 		case "content_block_delta":
@@ -549,6 +577,12 @@ func ConvertClaudeResponseToOpenAIResponsesNonStream(_ context.Context, _ string
 				if reasoningActive {
 					if t := d.Get("thinking"); t.Exists() {
 						reasoningBuf.WriteString(t.String())
+					}
+				}
+			case "signature_delta":
+				if reasoningActive {
+					if signature := d.Get("signature"); signature.Exists() && signature.String() != "" {
+						reasoningSig = signature.String()
 					}
 				}
 			}
@@ -636,10 +670,15 @@ func ConvertClaudeResponseToOpenAIResponsesNonStream(_ context.Context, _ string
 
 	// Build output array
 	outputsWrapper := `{"arr":[]}`
-	if reasoningBuf.Len() > 0 {
-		item := `{"id":"","type":"reasoning","summary":[{"type":"summary_text","text":""}]}`
+	if reasoningBuf.Len() > 0 || reasoningSig != "" {
+		item := `{"id":"","type":"reasoning","encrypted_content":"","summary":[]}`
 		item, _ = sjson.Set(item, "id", reasoningItemID)
-		item, _ = sjson.Set(item, "summary.0.text", reasoningBuf.String())
+		item, _ = sjson.Set(item, "encrypted_content", reasoningSig)
+		if reasoningBuf.Len() > 0 {
+			summary := `{"type":"summary_text","text":""}`
+			summary, _ = sjson.Set(summary, "text", reasoningBuf.String())
+			item, _ = sjson.SetRaw(item, "summary.-1", summary)
+		}
 		outputsWrapper, _ = sjson.SetRaw(outputsWrapper, "arr.-1", item)
 	}
 	if currentMsgID != "" || textBuf.Len() > 0 {

@@ -274,7 +274,7 @@ func (fh *FallbackHandler) WrapHandler(handler gin.HandlerFunc) gin.HandlerFunc 
 			// Log: Model was mapped to another model
 			log.Debugf("amp model mapping: request %s -> %s", normalizedModel, resolvedModel)
 			logAmpRouting(RouteTypeModelMapping, modelName, resolvedModel, providerName, requestPath)
-			rewriter := NewResponseRewriter(c.Writer, modelName)
+			rewriter := NewResponseRewriterForRequest(c.Writer, modelName, bodyBytes)
 			rewriter.suppressThinking = true
 			c.Writer = rewriter
 			// Filter Anthropic-Beta header only for local handling paths
@@ -287,7 +287,7 @@ func (fh *FallbackHandler) WrapHandler(handler gin.HandlerFunc) gin.HandlerFunc 
 			// Log: Using local provider (free)
 			logAmpRouting(RouteTypeLocalProvider, modelName, resolvedModel, providerName, requestPath)
 			// 本地 provider 同样需要经过 rewriter，保证返回模型名与 Amp 期望字段一致。
-			rewriter := NewResponseRewriter(c.Writer, modelName)
+			rewriter := NewResponseRewriterForRequest(c.Writer, modelName, bodyBytes)
 			rewriter.suppressThinking = providerName != "claude"
 			c.Writer = rewriter
 			// Filter Anthropic-Beta header only for local handling paths

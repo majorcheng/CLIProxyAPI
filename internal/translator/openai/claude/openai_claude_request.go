@@ -8,6 +8,7 @@ package claude
 import (
 	"strings"
 
+	sigcompat "github.com/router-for-me/CLIProxyAPI/v7/internal/signature"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	"github.com/tidwall/gjson"
@@ -148,6 +149,9 @@ func ConvertClaudeRequestToOpenAI(modelName string, inputRawJSON []byte, stream 
 					case "thinking":
 						// Only map thinking to reasoning_content for assistant messages (security: prevent injection)
 						if role == "assistant" {
+							if !shouldMapClaudeThinkingToGPTReasoning(part) {
+								return true
+							}
 							thinkingText := thinking.GetThinkingText(part)
 							// Skip empty or whitespace-only thinking
 							if strings.TrimSpace(thinkingText) != "" {
@@ -328,6 +332,16 @@ func ConvertClaudeRequestToOpenAI(modelName string, inputRawJSON []byte, stream 
 	}
 
 	return []byte(out)
+}
+
+// shouldMapClaudeThinkingToGPTReasoning 只回放 GPT 可识别签名的 Claude thinking，避免跨厂商签名污染。
+func shouldMapClaudeThinkingToGPTReasoning(part gjson.Result) bool {
+	signature := part.Get("signature")
+	if !signature.Exists() || strings.TrimSpace(signature.String()) == "" {
+		return false
+	}
+	_, ok := sigcompat.CompatibleSignatureForProvider(sigcompat.SignatureProviderGPT, signature.String())
+	return ok
 }
 
 func convertClaudeContentPart(part gjson.Result) (string, bool) {

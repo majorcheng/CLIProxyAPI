@@ -122,6 +122,7 @@ func (e *CodexExecutor) buildCodexRequestPlan(ctx context.Context, req cliproxye
 	body = applyPayloadConfigWithRequest(e.cfg, baseModel, to.String(), from.String(), "", body, originalTranslated, requestedModel, requestPath, opts.Headers)
 	disableImageGeneration := imageGenerationDisabledForRequest(e.cfg, requestPath)
 	body = normalizeCodexPreparedBody(body, mode, baseModel, disableImageGeneration)
+	body = sanitizeOpenAIResponsesReasoningEncryptedContent(ctx, "codex executor", body)
 
 	conversationID := codexPromptCacheID(ctx, from, req)
 	if conversationID != "" {

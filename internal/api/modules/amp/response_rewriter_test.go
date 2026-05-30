@@ -231,6 +231,66 @@ func TestNormalizeAmpToolNames_UnknownToolUntouched(t *testing.T) {
 	}
 }
 
+func TestNormalizeAmpToolNames_RequestToolCasing_NonStreaming(t *testing.T) {
+	requestTools := collectRequestToolNames([]byte(`{"tools":[{"name":"BASH"},{"name":"customTool"}]}`))
+	input := []byte(`{"content":[{"type":"tool_use","id":"toolu_01","name":"bash","input":{}},{"type":"tool_use","id":"toolu_02","name":"customtool","input":{}}]}`)
+	result := normalizeAmpToolNamesForRequest(input, requestTools)
+
+	if !contains(result, []byte(`"name":"BASH"`)) {
+		t.Fatalf("expected bash to follow request casing, got %s", string(result))
+	}
+	if !contains(result, []byte(`"name":"customTool"`)) {
+		t.Fatalf("expected custom tool to follow request casing, got %s", string(result))
+	}
+}
+
+func TestNormalizeAmpToolNames_RequestToolCasing_Streaming(t *testing.T) {
+	requestTools := collectRequestToolNames([]byte(`{"tools":[{"name":"GREP"}]}`))
+	input := []byte(`{"type":"content_block_start","content_block":{"type":"tool_use","name":"grep","input":{}}}`)
+	result := normalizeAmpToolNamesForRequest(input, requestTools)
+
+	if !contains(result, []byte(`"name":"GREP"`)) {
+		t.Fatalf("expected streaming tool to follow request casing, got %s", string(result))
+	}
+}
+
+func TestResponseRewriter_RequestToolCasingFromBody(t *testing.T) {
+	rw := &ResponseRewriter{requestToolNames: collectRequestToolNames([]byte(`{"tools":[{"name":"BASH"}]}`))}
+	input := []byte(`{"content":[{"type":"tool_use","id":"toolu_01","name":"bash","input":{}}]}`)
+	result := rw.rewriteModelInResponse(input)
+
+	if !contains(result, []byte(`"name":"BASH"`)) {
+		t.Fatalf("expected response tool name to follow request casing, got %s", string(result))
+	}
+}
+
+func TestResponseRewriter_LowercaseNativeRequestPreserved(t *testing.T) {
+	rw := &ResponseRewriter{requestToolNames: collectRequestToolNames([]byte(`{"tools":[{"name":"bash"}]}`))}
+	input := []byte(`{"content":[{"type":"tool_use","id":"toolu_01","name":"Bash","input":{}}]}`)
+	result := rw.rewriteModelInResponse(input)
+
+	if !contains(result, []byte(`"name":"bash"`)) {
+		t.Fatalf("expected lowercase request tool name to be preserved, got %s", string(result))
+	}
+}
+
+func TestCollectRequestToolNames_CollisionIgnored(t *testing.T) {
+	names := collectRequestToolNames([]byte(`{"tools":[{"name":"Bash"},{"name":"bash"}]}`))
+	if canonical, ok := canonicalAmpToolName("bash", names); ok && canonical != "Bash" {
+		t.Fatalf("conflicting request tools should not override Amp canonical name, got %q", canonical)
+	}
+}
+
+func TestResponseRewriter_RequestToolCasingFromBody_Streaming(t *testing.T) {
+	rw := &ResponseRewriter{requestToolNames: collectRequestToolNames([]byte(`{"tools":[{"name":"GREP"}]}`))}
+	input := []byte(`{"type":"content_block_start","content_block":{"type":"tool_use","name":"grep","input":{}}}`)
+	result := rw.rewriteStreamEvent(input)
+
+	if !contains(result, []byte(`"name":"GREP"`)) {
+		t.Fatalf("expected streaming response tool name to follow request casing, got %s", string(result))
+	}
+}
+
 func contains(data, substr []byte) bool {
 	for i := 0; i <= len(data)-len(substr); i++ {
 		if string(data[i:i+len(substr)]) == string(substr) {

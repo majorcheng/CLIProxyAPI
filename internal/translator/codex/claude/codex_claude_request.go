@@ -7,12 +7,12 @@ package claude
 
 import (
 	"crypto/sha256"
-	"encoding/base64"
 	"encoding/hex"
 	"fmt"
 	"strconv"
 	"strings"
 
+	sigcompat "github.com/router-for-me/CLIProxyAPI/v7/internal/signature"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	"github.com/tidwall/gjson"
@@ -149,8 +149,8 @@ func ConvertClaudeRequestToCodex(modelName string, inputRawJSON []byte, _ bool) 
 						appendTextContent(messageContentResult.Get("text").String())
 					case "thinking":
 						if messageRole == "assistant" {
-							signature := strings.TrimSpace(messageContentResult.Get("signature").String())
-							if isFernetLikeReasoningSignature(signature) {
+							signature, ok := sigcompat.CompatibleSignatureForProvider(sigcompat.SignatureProviderGPT, messageContentResult.Get("signature").String())
+							if ok {
 								appendReasoningContent(signature)
 							}
 						}
@@ -330,34 +330,6 @@ func ConvertClaudeRequestToCodex(modelName string, inputRawJSON []byte, _ bool) 
 	template, _ = sjson.Set(template, "include", []string{"reasoning.encrypted_content"})
 
 	return []byte(template)
-}
-
-func isFernetLikeReasoningSignature(signature string) bool {
-	const (
-		fernetVersionLen = 1
-		fernetTimestamp  = 8
-		fernetIV         = 16
-		fernetHMAC       = 32
-		aesBlockSize     = 16
-	)
-
-	signature = strings.TrimSpace(signature)
-	if !strings.HasPrefix(signature, "gAAAA") {
-		return false
-	}
-	decoded, err := base64.URLEncoding.DecodeString(signature)
-	if err != nil {
-		decoded, err = base64.RawURLEncoding.DecodeString(signature)
-		if err != nil {
-			return false
-		}
-	}
-	minLen := fernetVersionLen + fernetTimestamp + fernetIV + aesBlockSize + fernetHMAC
-	if len(decoded) < minLen || decoded[0] != 0x80 {
-		return false
-	}
-	ciphertextLen := len(decoded) - fernetVersionLen - fernetTimestamp - fernetIV - fernetHMAC
-	return ciphertextLen > 0 && ciphertextLen%aesBlockSize == 0
 }
 
 // shortenCodexCallIDIfNeeded 将 Claude 工具调用 ID 稳定压到 Codex call_id 长度限制内。

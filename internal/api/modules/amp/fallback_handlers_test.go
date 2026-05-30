@@ -16,6 +16,38 @@ import (
 	"github.com/tidwall/gjson"
 )
 
+func TestFallbackHandler_RequestToolCasing_RewritesStreamingResponse(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	reg := registry.GetGlobalRegistry()
+	reg.RegisterClient("test-client-amp-tool-casing", "codex", []*registry.ModelInfo{
+		{ID: "test/gpt-tool-casing", OwnedBy: "openai", Type: "codex"},
+	})
+	defer reg.UnregisterClient("test-client-amp-tool-casing")
+
+	fallback := NewFallbackHandlerWithMapper(func() *httputil.ReverseProxy { return nil }, nil, nil)
+	handler := func(c *gin.Context) {
+		c.Writer.Header().Set("Content-Type", "text/event-stream")
+		_, _ = c.Writer.Write([]byte("event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"name\":\"glob\",\"id\":\"toolu_01\",\"input\":{}}}\n\n"))
+	}
+
+	r := gin.New()
+	r.POST("/messages", fallback.WrapHandler(handler))
+
+	reqBody := []byte(`{"model":"test/gpt-tool-casing","tools":[{"name":"Glob","input_schema":{"type":"object"}}]}`)
+	req := httptest.NewRequest(http.MethodPost, "/messages", bytes.NewReader(reqBody))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d，期望 %d", w.Code, http.StatusOK)
+	}
+	if !bytes.Contains(w.Body.Bytes(), []byte(`"name":"Glob"`)) {
+		t.Fatalf("streaming response 未恢复 glob->Glob：%s", w.Body.String())
+	}
+}
+
 func TestFallbackHandler_ModelMapping_PreservesThinkingSuffixAndRewritesResponse(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 

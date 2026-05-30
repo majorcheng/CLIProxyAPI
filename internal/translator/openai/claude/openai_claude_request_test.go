@@ -1,6 +1,7 @@
 package claude
 
 import (
+	"encoding/base64"
 	"testing"
 
 	"github.com/tidwall/gjson"
@@ -18,7 +19,7 @@ func TestConvertClaudeRequestToOpenAI_ThinkingToReasoningContent(t *testing.T) {
 		wantHasContent          bool
 	}{
 		{
-			name: "AC1: assistant message with thinking and text",
+			name: "AC1: unsigned assistant thinking is dropped",
 			inputJSON: `{
 				"model": "claude-3-opus",
 				"messages": [{
@@ -29,8 +30,8 @@ func TestConvertClaudeRequestToOpenAI_ThinkingToReasoningContent(t *testing.T) {
 					]
 				}]
 			}`,
-			wantReasoningContent:    "Let me analyze this step by step...",
-			wantHasReasoningContent: true,
+			wantReasoningContent:    "",
+			wantHasReasoningContent: false,
 			wantContentText:         "Here is my response.",
 			wantHasContent:          true,
 		},
@@ -52,7 +53,7 @@ func TestConvertClaudeRequestToOpenAI_ThinkingToReasoningContent(t *testing.T) {
 			wantHasContent:          true,
 		},
 		{
-			name: "AC3: thinking-only message preserved with reasoning_content",
+			name: "AC3: unsigned thinking-only message is dropped",
 			inputJSON: `{
 				"model": "claude-3-opus",
 				"messages": [{
@@ -62,11 +63,10 @@ func TestConvertClaudeRequestToOpenAI_ThinkingToReasoningContent(t *testing.T) {
 					]
 				}]
 			}`,
-			wantReasoningContent:    "Internal reasoning only.",
-			wantHasReasoningContent: true,
+			wantReasoningContent:    "",
+			wantHasReasoningContent: false,
 			wantContentText:         "",
-			// For OpenAI compatibility, content field is set to empty string "" when no text content exists
-			wantHasContent: false,
+			wantHasContent:          false,
 		},
 		{
 			name: "AC4: thinking in user role must be ignored",
@@ -139,7 +139,7 @@ func TestConvertClaudeRequestToOpenAI_ThinkingToReasoningContent(t *testing.T) {
 			wantHasContent:          true,
 		},
 		{
-			name: "Multiple thinking parts concatenated",
+			name: "Unsigned thinking parts are dropped",
 			inputJSON: `{
 				"model": "claude-3-opus",
 				"messages": [{
@@ -151,13 +151,13 @@ func TestConvertClaudeRequestToOpenAI_ThinkingToReasoningContent(t *testing.T) {
 					]
 				}]
 			}`,
-			wantReasoningContent:    "First thought.\n\nSecond thought.",
-			wantHasReasoningContent: true,
+			wantReasoningContent:    "",
+			wantHasReasoningContent: false,
 			wantContentText:         "Final answer.",
 			wantHasContent:          true,
 		},
 		{
-			name: "Mixed thinking and redacted_thinking",
+			name: "Mixed unsigned thinking and redacted_thinking",
 			inputJSON: `{
 				"model": "claude-3-opus",
 				"messages": [{
@@ -169,8 +169,8 @@ func TestConvertClaudeRequestToOpenAI_ThinkingToReasoningContent(t *testing.T) {
 					]
 				}]
 			}`,
-			wantReasoningContent:    "Visible thought.",
-			wantHasReasoningContent: true,
+			wantReasoningContent:    "",
+			wantHasReasoningContent: false,
 			wantContentText:         "Answer.",
 			wantHasContent:          true,
 		},
@@ -246,9 +246,8 @@ func TestConvertClaudeRequestToOpenAI_ThinkingToReasoningContent(t *testing.T) {
 	}
 }
 
-// TestConvertClaudeRequestToOpenAI_ThinkingOnlyMessagePreserved tests AC3:
-// that a message with only thinking content is preserved (not dropped).
-func TestConvertClaudeRequestToOpenAI_ThinkingOnlyMessagePreserved(t *testing.T) {
+// TestConvertClaudeRequestToOpenAI_UnsignedThinkingOnlyMessageDropped 验证无签名 thinking 不会迁移为 GPT reasoning。
+func TestConvertClaudeRequestToOpenAI_UnsignedThinkingOnlyMessageDropped(t *testing.T) {
 	inputJSON := `{
 		"model": "claude-3-opus",
 		"messages": [
@@ -272,24 +271,45 @@ func TestConvertClaudeRequestToOpenAI_ThinkingOnlyMessagePreserved(t *testing.T)
 
 	messages := resultJSON.Get("messages").Array()
 
-	// Should have: user + assistant (thinking-only) + user = 3 messages
-	if len(messages) != 3 {
-		t.Fatalf("Expected 3 messages, got %d. Messages: %v", len(messages), resultJSON.Get("messages").Raw)
+	// Should have: user + user; unsigned thinking-only assistant message is dropped.
+	if len(messages) != 2 {
+		t.Fatalf("Expected 2 messages, got %d. Messages: %v", len(messages), resultJSON.Get("messages").Raw)
 	}
+	if messages[0].Get("role").String() != "user" || messages[1].Get("role").String() != "user" {
+		t.Fatalf("Expected only user messages after unsigned thinking drop, got %s", resultJSON.Get("messages").Raw)
+	}
+}
 
-	// Check the assistant message (index 1) has reasoning_content
-	assistantMsg := messages[1]
-	if assistantMsg.Get("role").String() != "assistant" {
-		t.Errorf("Expected message[1] to be assistant, got %s", assistantMsg.Get("role").String())
-	}
+func TestConvertClaudeRequestToOpenAI_SignedThinkingCompatibility(t *testing.T) {
+	inputJSON := `{
+		"model": "claude-3-opus",
+		"messages": [{
+			"role": "assistant",
+			"content": [
+				{"type": "thinking", "thinking": "provider state", "signature": "` + validGPTChatReasoningSignature() + `"},
+				{"type": "text", "text": "visible answer"}
+			]
+		}]
+	}`
 
-	if !assistantMsg.Get("reasoning_content").Exists() {
-		t.Error("Expected assistant message to have reasoning_content")
+	result := ConvertClaudeRequestToOpenAI("gpt-5", []byte(inputJSON), false)
+	assistantMsg := gjson.GetBytes(result, "messages.0")
+	if got := assistantMsg.Get("reasoning_content").String(); got != "provider state" {
+		t.Fatalf("reasoning_content = %q，期望 provider state。输出：%s", got, string(result))
 	}
+	if got := assistantMsg.Get("content.0.text").String(); got != "visible answer" {
+		t.Fatalf("visible content = %q，期望 visible answer。输出：%s", got, string(result))
+	}
+}
 
-	if assistantMsg.Get("reasoning_content").String() != "Let me calculate: 2+2=4" {
-		t.Errorf("Unexpected reasoning_content: %s", assistantMsg.Get("reasoning_content").String())
+func validGPTChatReasoningSignature() string {
+	payload := make([]byte, 1+8+16+16+32)
+	payload[0] = 0x80
+	payload[8] = 1
+	for i := 9; i < len(payload); i++ {
+		payload[i] = byte(i)
 	}
+	return base64.URLEncoding.EncodeToString(payload)
 }
 
 func TestConvertClaudeRequestToOpenAI_SystemMessageScenarios(t *testing.T) {
@@ -691,8 +711,8 @@ func TestConvertClaudeRequestToOpenAI_AssistantThinkingToolUseThinkingSplit(t *t
 		t.Fatalf("Expected assistant message to have tool_calls")
 	}
 
-	// Should have combined reasoning_content from both thinking blocks
-	if got := assistantMsg.Get("reasoning_content").String(); got != "t1\n\nt2" {
-		t.Fatalf("Expected reasoning_content %q, got %q", "t1\n\nt2", got)
+	// Unsigned thinking must not become GPT reasoning_content.
+	if assistantMsg.Get("reasoning_content").Exists() {
+		t.Fatalf("Unexpected reasoning_content for unsigned thinking: %s", assistantMsg.Raw)
 	}
 }

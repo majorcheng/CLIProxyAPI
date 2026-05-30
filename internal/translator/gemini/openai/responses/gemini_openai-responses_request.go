@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"strings"
 
+	sigcompat "github.com/router-for-me/CLIProxyAPI/v7/internal/signature"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/translator/gemini/common"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	"github.com/tidwall/gjson"
@@ -118,7 +119,7 @@ func ConvertOpenAIResponsesRequestToGemini(modelName string, inputRawJSON []byte
 
 			switch itemType {
 			case "message":
-				if strings.EqualFold(itemRole, "system") {
+				if strings.EqualFold(itemRole, "system") || strings.EqualFold(itemRole, "developer") {
 					if contentArray := item.Get("content"); contentArray.Exists() {
 						systemInstr := ""
 						if systemInstructionResult := gjson.Get(out, "systemInstruction"); systemInstructionResult.Exists() {
@@ -356,7 +357,7 @@ func ConvertOpenAIResponsesRequestToGemini(modelName string, inputRawJSON []byte
 				thoughtContent := `{"role":"model","parts":[]}`
 				thought := `{"text":"","thoughtSignature":"","thought":true}`
 				thought, _ = sjson.Set(thought, "text", item.Get("summary.0.text").String())
-				thought, _ = sjson.Set(thought, "thoughtSignature", item.Get("encrypted_content").String())
+				thought, _ = sjson.Set(thought, "thoughtSignature", openAIResponsesGeminiThoughtSignature(item.Get("encrypted_content").String()))
 
 				thoughtContent, _ = sjson.SetRaw(thoughtContent, "parts.-1", thought)
 				out, _ = sjson.SetRaw(out, "contents.-1", thoughtContent)
@@ -454,4 +455,9 @@ func ConvertOpenAIResponsesRequestToGemini(modelName string, inputRawJSON []byte
 	result := []byte(out)
 	result = common.AttachDefaultSafetySettings(result, "safetySettings")
 	return result
+}
+
+// openAIResponsesGeminiThoughtSignature 将 Responses encrypted_content 转成 Gemini 可回放签名或旁路占位。
+func openAIResponsesGeminiThoughtSignature(rawSignature string) string {
+	return sigcompat.GeminiReplaySignatureOrBypass(rawSignature, sigcompat.SignatureBlockKindGeminiModelPart)
 }

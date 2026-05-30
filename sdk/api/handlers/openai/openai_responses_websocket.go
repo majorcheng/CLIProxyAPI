@@ -214,6 +214,7 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 			continue
 		}
 		requestJSON = repairResponsesWebsocketToolCalls(downstreamSessionKey, requestJSON)
+		requestJSON = dedupeResponsesWebsocketInputItemsByID(requestJSON)
 		updatedLastRequest = bytes.Clone(requestJSON)
 		previousLastRequest := bytes.Clone(lastRequest)
 		previousLastResponseOutput := bytes.Clone(lastResponseOutput)
@@ -402,6 +403,10 @@ func normalizeResponseSubsequentRequest(rawJSON []byte, lastRequest []byte, last
 	if errDedupeFunctionCalls == nil {
 		mergedInput = dedupedInput
 	}
+	dedupedInput, errDedupeItemIDs := dedupeInputItemsByID(mergedInput)
+	if errDedupeItemIDs == nil {
+		mergedInput = dedupedInput
+	}
 
 	normalized, errDelete := sjson.DeleteBytes(rawJSON, "type")
 	if errDelete != nil {
@@ -504,6 +509,63 @@ func dedupeFunctionCallsByCallID(rawArray string) (string, error) {
 				}
 				seenCallIDs[callID] = struct{}{}
 			}
+		}
+		filtered = append(filtered, item)
+	}
+
+	out, errMarshal := json.Marshal(filtered)
+	if errMarshal != nil {
+		return "", errMarshal
+	}
+	return string(out), nil
+}
+
+// dedupeResponsesWebsocketInputItemsByID 去重完整请求里的 input item id，避免修复工具调用后重复发送旧对象。
+func dedupeResponsesWebsocketInputItemsByID(payload []byte) []byte {
+	input := gjson.GetBytes(payload, "input")
+	if !input.Exists() || !input.IsArray() {
+		return payload
+	}
+	dedupedInput, errDedupe := dedupeInputItemsByID(input.Raw)
+	if errDedupe != nil || dedupedInput == input.Raw {
+		return payload
+	}
+	updated, errSet := sjson.SetRawBytes(payload, "input", []byte(dedupedInput))
+	if errSet != nil {
+		return payload
+	}
+	return updated
+}
+
+// dedupeInputItemsByID 保留同一 input item id 的最后一次出现，匹配 Responses 增量 transcript 语义。
+func dedupeInputItemsByID(rawArray string) (string, error) {
+	rawArray = strings.TrimSpace(rawArray)
+	if rawArray == "" {
+		return "[]", nil
+	}
+	var items []json.RawMessage
+	if errUnmarshal := json.Unmarshal([]byte(rawArray), &items); errUnmarshal != nil {
+		return "", errUnmarshal
+	}
+
+	lastIndexByID := make(map[string]int, len(items))
+	for i, item := range items {
+		if len(item) == 0 {
+			continue
+		}
+		if itemID := strings.TrimSpace(gjson.GetBytes(item, "id").String()); itemID != "" {
+			lastIndexByID[itemID] = i
+		}
+	}
+
+	filtered := make([]json.RawMessage, 0, len(items))
+	for i, item := range items {
+		if len(item) == 0 {
+			continue
+		}
+		itemID := strings.TrimSpace(gjson.GetBytes(item, "id").String())
+		if itemID != "" && lastIndexByID[itemID] != i {
+			continue
 		}
 		filtered = append(filtered, item)
 	}

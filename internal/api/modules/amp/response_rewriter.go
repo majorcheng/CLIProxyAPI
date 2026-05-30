@@ -22,6 +22,7 @@ type ResponseRewriter struct {
 	originalModel    string
 	isStreaming      bool
 	suppressThinking bool
+	requestToolNames map[string]string
 }
 
 // NewResponseRewriter creates a new response rewriter for model name substitution.
@@ -31,6 +32,13 @@ func NewResponseRewriter(w gin.ResponseWriter, originalModel string) *ResponseRe
 		body:           &bytes.Buffer{},
 		originalModel:  originalModel,
 	}
+}
+
+// NewResponseRewriterForRequest 基于原始请求记录工具名大小写，用于把上游响应恢复成 Amp 请求期望的形式。
+func NewResponseRewriterForRequest(w gin.ResponseWriter, originalModel string, requestBody []byte) *ResponseRewriter {
+	rw := NewResponseRewriter(w, originalModel)
+	rw.requestToolNames = collectRequestToolNames(requestBody)
+	return rw
 }
 
 const maxBufferedResponseBytes = 2 * 1024 * 1024 // 2MB safety cap
@@ -134,16 +142,72 @@ var ampCanonicalToolNames = map[string]string{
 	"check": "Check",
 }
 
+// collectRequestToolNames 收集请求 tools/tool_choice 中的原始工具名大小写。
+func collectRequestToolNames(data []byte) map[string]string {
+	if len(data) == 0 {
+		return nil
+	}
+	parsed := gjson.ParseBytes(data)
+	names := map[string]string{}
+	conflicts := map[string]bool{}
+	record := func(name string) {
+		if name == "" {
+			return
+		}
+		key := strings.ToLower(name)
+		if conflicts[key] {
+			return
+		}
+		if existing, exists := names[key]; exists {
+			if existing != name {
+				names[key] = ""
+				conflicts[key] = true
+			}
+			return
+		}
+		names[key] = name
+	}
+
+	for _, tool := range parsed.Get("tools").Array() {
+		record(tool.Get("name").String())
+	}
+	if parsed.Get("tool_choice.type").String() == "tool" {
+		record(parsed.Get("tool_choice.name").String())
+	}
+	if len(names) == 0 {
+		return nil
+	}
+	return names
+}
+
+// canonicalAmpToolName 优先使用请求里的大小写；冲突时退回 Amp 内置白名单规范名。
+func canonicalAmpToolName(name string, requestToolNames map[string]string) (string, bool) {
+	key := strings.ToLower(name)
+	if canonical, ok := requestToolNames[key]; ok {
+		if canonical == "" {
+			return "", false
+		}
+		return canonical, true
+	}
+	canonical, ok := ampCanonicalToolNames[key]
+	return canonical, ok
+}
+
 // normalizeAmpToolNames 把 tool_use 工具名修正为 Amp 白名单认可的规范大小写。
 // 部分上游模型会返回小写工具名，若不修正会被 Amp 的大小写敏感白名单拒绝。
 func normalizeAmpToolNames(data []byte) []byte {
+	return normalizeAmpToolNamesForRequest(data, nil)
+}
+
+// normalizeAmpToolNamesForRequest 根据请求工具名或 Amp 内置白名单修正 tool_use 工具名大小写。
+func normalizeAmpToolNamesForRequest(data []byte, requestToolNames map[string]string) []byte {
 	// 非流式响应：修正 content[] 中 tool_use block 的 name。
 	for index, block := range gjson.GetBytes(data, "content").Array() {
 		if block.Get("type").String() != "tool_use" {
 			continue
 		}
 		name := block.Get("name").String()
-		if canonical, ok := ampCanonicalToolNames[strings.ToLower(name)]; ok && name != canonical {
+		if canonical, ok := canonicalAmpToolName(name, requestToolNames); ok && name != canonical {
 			path := fmt.Sprintf("content.%d.name", index)
 			var err error
 			data, err = sjson.SetBytes(data, path, canonical)
@@ -156,7 +220,7 @@ func normalizeAmpToolNames(data []byte) []byte {
 	// 流式响应：修正 content_block_start 事件里的 content_block.name。
 	if gjson.GetBytes(data, "content_block.type").String() == "tool_use" {
 		name := gjson.GetBytes(data, "content_block.name").String()
-		if canonical, ok := ampCanonicalToolNames[strings.ToLower(name)]; ok && name != canonical {
+		if canonical, ok := canonicalAmpToolName(name, requestToolNames); ok && name != canonical {
 			var err error
 			data, err = sjson.SetBytes(data, "content_block.name", canonical)
 			if err != nil {
@@ -166,6 +230,11 @@ func normalizeAmpToolNames(data []byte) []byte {
 	}
 
 	return data
+}
+
+// normalizeToolNames 使用当前请求的工具名大小写重写响应，避免工具名被错误规范化。
+func (rw *ResponseRewriter) normalizeToolNames(data []byte) []byte {
+	return normalizeAmpToolNamesForRequest(data, rw.requestToolNames)
 }
 
 // ensureAmpSignature injects empty signature fields into tool_use/thinking blocks
@@ -225,7 +294,7 @@ func (rw *ResponseRewriter) suppressAmpThinking(data []byte) []byte {
 
 func (rw *ResponseRewriter) rewriteModelInResponse(data []byte) []byte {
 	data = ensureAmpSignature(data)
-	data = normalizeAmpToolNames(data)
+	data = rw.normalizeToolNames(data)
 	data = rw.suppressAmpThinking(data)
 	if len(data) == 0 {
 		return data
@@ -324,7 +393,7 @@ func (rw *ResponseRewriter) rewriteStreamEvent(data []byte) []byte {
 	data = ensureAmpSignature(data)
 
 	// 修正工具名大小写，避免 Amp 白名单按大小写敏感规则拒绝。
-	data = normalizeAmpToolNames(data)
+	data = rw.normalizeToolNames(data)
 
 	// Rewrite model name
 	if rw.originalModel != "" {

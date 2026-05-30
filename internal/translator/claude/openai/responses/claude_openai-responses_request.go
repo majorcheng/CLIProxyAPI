@@ -10,6 +10,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
+	sigcompat "github.com/router-for-me/CLIProxyAPI/v7/internal/signature"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
@@ -445,8 +446,8 @@ func ConvertOpenAIResponsesRequestToClaude(modelName string, inputRawJSON []byte
 
 // convertResponsesReasoningToClaudeThinking 将 Responses reasoning 签名恢复成 Claude thinking block。
 func convertResponsesReasoningToClaudeThinking(item gjson.Result) string {
-	signature := item.Get("encrypted_content").String()
-	if signature == "" {
+	signature, ok := sigcompat.CompatibleSignatureForProvider(sigcompat.SignatureProviderClaude, item.Get("encrypted_content").String())
+	if !ok {
 		return ""
 	}
 

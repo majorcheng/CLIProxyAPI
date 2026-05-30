@@ -1575,6 +1575,10 @@ func authMaintenanceShouldProtectCodexRefresh401(auth *coreauth.Auth, result *co
 	if authMaintenanceHasQuota429(auth, result) {
 		return false
 	}
+	// app_session_terminated 已明确要求重新登录，不应再套用普通 refresh 401 的 429 保护。
+	if authMaintenanceTerminalErrorCode(auth, result) == codexauth.RefreshAppSessionTerminatedErrorCode {
+		return false
+	}
 	// 请求链里的 terminal refresh 401 已经意味着“业务请求先 401，现场 refresh 也失败”；
 	// 这类结果应直接交给 delete-status-codes 决定，不能继续套用后台/主动 refresh 的 429 保护。
 	if authMaintenanceResultTerminalRefresh401(result) {
@@ -1599,6 +1603,8 @@ func authMaintenanceCodexTerminalDeleteReason(auth *coreauth.Auth, result *corea
 		return "terminal_refresh_token_reused", true
 	case codexauth.RefreshTokenRevokedErrorCode:
 		return "terminal_refresh_token_revoked", true
+	case codexauth.RefreshAppSessionTerminatedErrorCode:
+		return "terminal_app_session_terminated", true
 	case codexauth.RefreshUnauthorizedErrorCode:
 		return "terminal_refresh_unauthorized", true
 	case codexauth.UnauthorizedAfterRecoveryErrorCode:
@@ -1613,6 +1619,7 @@ func authMaintenanceCodexTerminalRefresh401(auth *coreauth.Auth, result *coreaut
 	case codexauth.RefreshTokenExpiredErrorCode,
 		codexauth.RefreshTokenReusedErrorCode,
 		codexauth.RefreshTokenRevokedErrorCode,
+		codexauth.RefreshAppSessionTerminatedErrorCode,
 		codexauth.RefreshUnauthorizedErrorCode:
 		return true
 	default:
@@ -1630,6 +1637,7 @@ func authMaintenanceResultTerminalRefresh401(result *coreauth.Result) bool {
 	case codexauth.RefreshTokenExpiredErrorCode,
 		codexauth.RefreshTokenReusedErrorCode,
 		codexauth.RefreshTokenRevokedErrorCode,
+		codexauth.RefreshAppSessionTerminatedErrorCode,
 		codexauth.RefreshUnauthorizedErrorCode:
 		return true
 	default:
@@ -1745,6 +1753,10 @@ func authMaintenanceDeleteAllowed(auth *coreauth.Auth, result *coreauth.Result) 
 		return false
 	}
 	if !strings.EqualFold(strings.TrimSpace(auth.Provider), "codex") {
+		return true
+	}
+	// 会话终止不是额度类信号；无论 plan_type 是否可识别，都可以进入终态清理。
+	if authMaintenanceTerminalErrorCode(auth, result) == codexauth.RefreshAppSessionTerminatedErrorCode {
 		return true
 	}
 	return authMaintenanceDeletePlanType(auth, result) == "free"

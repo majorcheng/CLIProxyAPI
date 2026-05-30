@@ -52,6 +52,53 @@ func TestScanAuthMaintenanceCandidates_CodexTerminalRefresh401Without429SkipsDel
 	}
 }
 
+func TestScanAuthMaintenanceCandidates_CodexAppSessionTerminatedQueuesDeleteForNonFree(t *testing.T) {
+	authDir := t.TempDir()
+	service := &Service{
+		cfg: &config.Config{
+			AuthDir: authDir,
+			AuthMaintenance: config.AuthMaintenanceConfig{
+				Enable:                true,
+				DeleteStatusCodes:     []int{401},
+				Refresh401Requires429: true,
+			},
+		},
+		coreManager: coreauth.NewManager(nil, nil, nil),
+	}
+
+	filePath := filepath.Join(authDir, "app-session-terminated.json")
+	auth := &coreauth.Auth{
+		ID:                "app-session-terminated",
+		FileName:          filepath.Base(filePath),
+		Provider:          "codex",
+		Status:            coreauth.StatusError,
+		StatusMessage:     "unauthorized",
+		FailureHTTPStatus: 401,
+		LastError: &coreauth.Error{
+			Code:       codexauth.RefreshAppSessionTerminatedErrorCode,
+			HTTPStatus: 401,
+			Message:    "token refresh failed with status 400: app_session_terminated",
+		},
+		Attributes: map[string]string{
+			"path":      filePath,
+			"plan_type": "team",
+		},
+		UpdatedAt:   timeNowForTest(),
+		Unavailable: true,
+	}
+	if _, err := service.coreManager.Register(context.Background(), auth); err != nil {
+		t.Fatalf("failed to register auth: %v", err)
+	}
+
+	candidates := service.scanAuthMaintenanceCandidates(timeNowForTest(), service.cfg.AuthMaintenance, authDir)
+	if len(candidates) != 1 {
+		t.Fatalf("expected app session terminated to queue delete, got %d", len(candidates))
+	}
+	if got := candidates[0].Reason; got != "terminal_app_session_terminated" {
+		t.Fatalf("expected semantic terminal reason, got %q", got)
+	}
+}
+
 func TestScanAuthMaintenanceCandidates_CodexTerminalRefresh401Without429QueuesDeleteWhenProtectionDisabled(t *testing.T) {
 	authDir := t.TempDir()
 	service := &Service{

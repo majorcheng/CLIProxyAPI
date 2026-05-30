@@ -280,6 +280,7 @@ func persistedRuntimeLastErrorCode(auth *Auth) string {
 	case codexauth.RefreshTokenExpiredErrorCode,
 		codexauth.RefreshTokenReusedErrorCode,
 		codexauth.RefreshTokenRevokedErrorCode,
+		codexauth.RefreshAppSessionTerminatedErrorCode,
 		codexauth.RefreshUnauthorizedErrorCode,
 		codexauth.UnauthorizedAfterRecoveryErrorCode:
 		return code

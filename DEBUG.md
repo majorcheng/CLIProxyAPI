@@ -424,3 +424,34 @@
 - `timeout 60s go test ./internal/api/modules/amp -run 'TestRegisterManagementRoutes' -count=1`
 - `timeout 60s go test ./internal/api/modules/amp ./internal/runtime/executor ./sdk/api/handlers/openai -count=1`
 - `git diff --check`
+
+### Codex app_session_terminated 自动清理
+
+#### Observations
+- 现场日志显示 Codex RT 交换失败：上游 token refresh 返回 HTTP 400，错误码为 `app_session_terminated`，消息明确要求重新登录。
+- `internal/auth/codex/openai_auth.go::newRefreshFailureError` 当前只把 `refresh_token_expired`、`refresh_token_reused`、`refresh_token_invalidated`/`revoked` 和 HTTP 401 归一成终态 refresh 错误；`app_session_terminated` 会保留为普通 400。
+- 普通 400 不会触发 `RefreshTokensWithRetry` 的非重试终止，也不会进入 `sdk/cliproxy/service.go` 里现有的 Codex terminal delete reason，因此账号不会被自动清理。
+
+#### Hypotheses
+- H1：根因是 `app_session_terminated` 缺少 Codex refresh 终态错误分类。（ROOT）Supports：日志里的 400/code 不在现有 switch 条件中；现有清理依赖稳定错误码。Conflicts：无。Test：构造 400/app_session_terminated refresh 响应，应只尝试一次并返回稳定错误码。
+- H2：根因是 auth-maintenance 只看 HTTP 状态码，不看语义错误码。Supports：默认删除状态码不含 400。Conflicts：现有 terminal refresh token 错误已经有语义删除路径。Test：带 app_session_terminated 终态错误码的 Codex auth 在 protection 开启、且非 free plan 时仍应按语义排队。
+- H3：根因是运行态错误码没有持久化，重启后清理链路丢失语义。Supports：`runtime_state_persistence.go` 白名单只包含已知错误码。Conflicts：当前故障可能在同进程内被扫描到，但重启后会丢。Test：新增错误码应进入 `last_error_code` 并可恢复。
+
+#### Experiment Plan
+- 先补 400/app_session_terminated refresh 分类测试、auth-maintenance 清理测试和 runtime state 持久化测试，旧实现应暴露缺口。
+- 再实现最小分类与维护链路变更，不新增配置项，不改变普通未知 400 的重试/保留行为。
+
+#### Root Cause
+- 根因是 Codex refresh 对 `app_session_terminated` 缺少终态分类：上游虽然返回 HTTP 400，但错误语义明确要求重新登录，旧逻辑会把它当普通 400 重试三次，并且不会进入 auth-maintenance 的语义删除路径。
+
+#### Fix Implemented
+- 新增 `codex_refresh_app_session_terminated` 机器错误码，并在 refresh 400 响应包含 `app_session_terminated` 或 “Your session has ended” 时归一为不可恢复的认证终态失败。
+- auth manager 将该错误码纳入 unauthorized 语义与运行态 `last_error_code` 持久化，避免重启后丢失清理依据。
+- auth-maintenance 对该错误码使用 `terminal_app_session_terminated` 删除原因，并显式绕过“普通 refresh 401 需要 429 佐证”和“Codex 非 free 不自动删”的保护规则；未知 400 仍保持原行为。
+
+#### Validation
+- `timeout 180s go test ./internal/auth/codex ./sdk/cliproxy/auth ./sdk/cliproxy -run 'AppSession|RefreshTokensWithRetry|PersistedRuntimeState|AuthMaintenanceCandidates_Codex|NonFreeCodexSkipsDelete' -count=1` 通过。
+- 首次完整包级验证中 `sdk/cliproxy/auth` 的 `TestManager_PickNextMixed_DisallowFreeAuthSkipsMetadataOnlyCodexFreePlan` 单次失败；单测复跑与包级复跑均通过，未形成稳定回归。
+- `timeout 180s go test ./sdk/cliproxy/auth -run TestManager_PickNextMixed_DisallowFreeAuthSkipsMetadataOnlyCodexFreePlan -count=1 -v` 通过。
+- `timeout 180s go test ./sdk/cliproxy/auth -count=1` 通过。
+- `timeout 180s go test ./internal/auth/codex ./sdk/cliproxy/auth ./sdk/cliproxy -count=1 && git diff --check` 通过；非 free 普通错误保护仍由 `NonFreeCodexSkipsDelete` 覆盖。

@@ -3040,6 +3040,7 @@ func isUnauthorizedAuthCode(code string) bool {
 		codexauth.RefreshTokenExpiredErrorCode,
 		codexauth.RefreshTokenReusedErrorCode,
 		codexauth.RefreshTokenRevokedErrorCode,
+		codexauth.RefreshAppSessionTerminatedErrorCode,
 		codexauth.RefreshUnauthorizedErrorCode,
 		codexauth.UnauthorizedAfterRecoveryErrorCode:
 		return true

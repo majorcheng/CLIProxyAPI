@@ -352,7 +352,8 @@ func isNonRetryableRefreshErr(err error) bool {
 	raw := strings.ToLower(err.Error())
 	return strings.Contains(raw, "refresh_token_reused") ||
 		strings.Contains(raw, "token_invalidated") ||
-		strings.Contains(raw, "token_revoked")
+		strings.Contains(raw, "token_revoked") ||
+		strings.Contains(raw, "app_session_terminated")
 }
 
 func newRefreshFailureError(statusCode int, body string) error {
@@ -379,6 +380,12 @@ func newRefreshFailureError(statusCode int, body string) error {
 		classifiedStatus = http.StatusUnauthorized
 		terminal = true
 		code = RefreshTokenRevokedErrorCode
+	case strings.Contains(raw, "app_session_terminated"),
+		strings.Contains(raw, "your session has ended"):
+		// 上游用 400 表达“应用会话已结束”，但业务含义是当前登录态不可恢复。
+		classifiedStatus = http.StatusUnauthorized
+		terminal = true
+		code = RefreshAppSessionTerminatedErrorCode
 	case statusCode == http.StatusUnauthorized:
 		classifiedStatus = http.StatusUnauthorized
 		terminal = true

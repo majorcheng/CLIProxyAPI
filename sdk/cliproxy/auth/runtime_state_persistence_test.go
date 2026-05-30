@@ -323,6 +323,46 @@ func TestMetadataWithPersistedRuntimeState_PersistsTerminalRefreshErrorCodeWitho
 	}
 }
 
+func TestMetadataWithPersistedRuntimeState_PersistsAppSessionTerminatedCode(t *testing.T) {
+	t.Parallel()
+
+	source := &Auth{
+		ID:                "app-session-terminated",
+		Provider:          "codex",
+		Status:            StatusError,
+		StatusMessage:     "unauthorized",
+		Unavailable:       true,
+		FailureHTTPStatus: 401,
+		LastError: &Error{
+			Code:       codexauth.RefreshAppSessionTerminatedErrorCode,
+			Message:    "token refresh failed with status 400: app_session_terminated",
+			HTTPStatus: 401,
+		},
+		Metadata: map[string]any{
+			"type":  "codex",
+			"email": "user@example.com",
+		},
+	}
+
+	metadata := MetadataWithPersistedRuntimeState(source)
+	restored := &Auth{
+		ID:       source.ID,
+		Provider: source.Provider,
+		Metadata: metadata,
+	}
+	RestorePersistedRuntimeState(restored, time.Now())
+
+	if restored.LastError == nil {
+		t.Fatal("expected restored.LastError to keep app session terminated code")
+	}
+	if restored.LastError.Code != codexauth.RefreshAppSessionTerminatedErrorCode {
+		t.Fatalf("restored.LastError.Code = %q, want %q", restored.LastError.Code, codexauth.RefreshAppSessionTerminatedErrorCode)
+	}
+	if !hasUnauthorizedAuthFailure(restored) {
+		t.Fatal("expected restored app session terminated code to keep unauthorized semantics")
+	}
+}
+
 func TestMetadataWithPersistedRuntimeState_DoesNotPersistTransientRetryOnlyErrors(t *testing.T) {
 	t.Parallel()
 

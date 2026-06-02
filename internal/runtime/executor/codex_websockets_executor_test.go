@@ -4,14 +4,17 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
+	internalcache "github.com/router-for-me/CLIProxyAPI/v7/internal/cache"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
@@ -518,6 +521,159 @@ func TestCodexAutoExecutorExecuteStream_WebsocketStripsPrefixedModelFromOutbound
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for websocket request body")
+	}
+}
+
+func TestCodexWebsocketsExecutePatchesCompletedOutputFromItemDone(t *testing.T) {
+	t.Parallel()
+
+	upgrader := websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Errorf("upgrade websocket: %v", err)
+			return
+		}
+		defer func() { _ = conn.Close() }()
+
+		if _, _, errRead := conn.ReadMessage(); errRead != nil {
+			t.Errorf("read websocket request: %v", errRead)
+			return
+		}
+		itemDone := `{"type":"response.output_item.done","output_index":0,"item":{"type":"message","id":"msg_ws","role":"assistant","content":[{"type":"output_text","text":"ws-patched"}]}}`
+		if errWrite := conn.WriteMessage(websocket.TextMessage, []byte(itemDone)); errWrite != nil {
+			t.Errorf("write output item done: %v", errWrite)
+			return
+		}
+		completed := `{"type":"response.completed","response":{"id":"resp_ws","model":"gpt-5.4","status":"completed","output":[],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}`
+		if errWrite := conn.WriteMessage(websocket.TextMessage, []byte(completed)); errWrite != nil {
+			t.Errorf("write completed event: %v", errWrite)
+		}
+	}))
+	defer server.Close()
+
+	executor := NewCodexWebsocketsExecutor(&config.Config{})
+	resp, err := executor.Execute(
+		context.Background(),
+		newCodexTestAuth(server.URL, "ws-patch-key"),
+		cliproxyexecutor.Request{
+			Model:   "gpt-5.4",
+			Payload: []byte(`{"model":"gpt-5.4","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}]}`),
+		},
+		cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("openai-response")},
+	)
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if !strings.Contains(string(resp.Payload), "ws-patched") {
+		t.Fatalf("response payload missing patched output item: %s", string(resp.Payload))
+	}
+}
+
+func TestCodexWebsocketsExecuteInjectsReplayAfterSessionLock(t *testing.T) {
+	t.Parallel()
+
+	encryptedContent := validCodexReplayEncryptedContentForTest(31)
+	executionSession := "ws-lock-execution-" + strings.ReplaceAll(t.Name(), "/", "-")
+	internalcache.DeleteCodexReasoningReplayItem("gpt-5.4", "execution:"+executionSession)
+	t.Cleanup(func() {
+		internalcache.DeleteCodexReasoningReplayItem("gpt-5.4", "execution:"+executionSession)
+	})
+
+	upgrader := websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
+	firstRead := make(chan struct{})
+	allowFirstComplete := make(chan struct{})
+	secondBody := make(chan []byte, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Errorf("upgrade websocket: %v", err)
+			return
+		}
+		defer func() { _ = conn.Close() }()
+
+		for index := 0; index < 2; index++ {
+			_, payload, errRead := conn.ReadMessage()
+			if errRead != nil {
+				t.Errorf("read websocket request %d: %v", index+1, errRead)
+				return
+			}
+			if index == 0 {
+				close(firstRead)
+				<-allowFirstComplete
+				completed := fmt.Sprintf(`{"type":"response.completed","response":{"id":"resp_first","model":"gpt-5.4","status":"completed","output":[{"type":"reasoning","summary":[],"content":null,"encrypted_content":%q}],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}`, encryptedContent)
+				if errWrite := conn.WriteMessage(websocket.TextMessage, []byte(completed)); errWrite != nil {
+					t.Errorf("write first completed event: %v", errWrite)
+				}
+				continue
+			}
+			secondBody <- append([]byte(nil), payload...)
+			if errWrite := conn.WriteMessage(websocket.TextMessage, []byte(codexCompletedEventJSON("resp_second", "gpt-5.4", "second"))); errWrite != nil {
+				t.Errorf("write second completed event: %v", errWrite)
+			}
+			return
+		}
+	}))
+	defer server.Close()
+
+	executor := NewCodexWebsocketsExecutor(&config.Config{})
+	auth := newCodexTestAuth(server.URL, "ws-lock-key")
+	req := cliproxyexecutor.Request{
+		Model: "gpt-5.4",
+		Payload: []byte(`{
+			"model":"gpt-5.4",
+			"metadata":{"user_id":"{\"device_id\":\"device-a\",\"session_id\":\"ws-lock-session\"}"},
+			"messages":[{"role":"user","content":[{"type":"text","text":"next"}]}],
+			"max_tokens":100
+		}`),
+	}
+	newOpts := func() cliproxyexecutor.Options {
+		return cliproxyexecutor.Options{
+			SourceFormat: sdktranslator.FormatClaude,
+			Metadata: map[string]any{
+				cliproxyexecutor.ExecutionSessionMetadataKey: executionSession,
+			},
+		}
+	}
+
+	var wg sync.WaitGroup
+	errCh := make(chan error, 2)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		_, err := executor.Execute(context.Background(), auth, req, newOpts())
+		errCh <- err
+	}()
+
+	select {
+	case <-firstRead:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for first websocket request")
+	}
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		_, err := executor.Execute(context.Background(), auth, req, newOpts())
+		errCh <- err
+	}()
+	time.Sleep(100 * time.Millisecond)
+	close(allowFirstComplete)
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		if err != nil {
+			t.Fatalf("Execute() error = %v", err)
+		}
+	}
+
+	select {
+	case payload := <-secondBody:
+		if got := gjson.GetBytes(payload, `input.#(type=="reasoning").encrypted_content`).String(); got != encryptedContent {
+			t.Fatalf("second websocket body replay encrypted_content = %q, want %q; body=%s", got, encryptedContent, string(payload))
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for second websocket body")
 	}
 }
 

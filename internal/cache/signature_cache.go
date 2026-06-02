@@ -91,6 +91,7 @@ func purgeExpiredCaches() {
 		}
 		return true
 	})
+	purgeExpiredCodexReasoningReplayCache(now)
 }
 
 // CacheSignature stores a thinking signature for a given model group and text.

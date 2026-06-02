@@ -6,7 +6,6 @@ import (
 	"net/http"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/google/uuid"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
@@ -37,6 +36,7 @@ type codexPreparedRequestPlanKey struct {
 type codexPreparedRequestPlan struct {
 	body           []byte
 	conversationID string
+	replayScope    codexReasoningReplayScope
 }
 
 type codexPreparedRequestCache struct {
@@ -94,12 +94,20 @@ func (e *CodexExecutor) prepareCodexRequestPlan(ctx context.Context, req cliprox
 
 	cache := existingCodexPreparedRequestCache(opts.Metadata)
 	if cache == nil && !shouldCacheCodexPreparedRequestPlan(req, opts) {
-		return e.buildCodexRequestPlan(ctx, req, opts, mode, baseModel, requestedModel)
+		plan, err := e.buildCodexRequestPlan(ctx, req, opts, mode, baseModel, requestedModel)
+		if err != nil {
+			return codexPreparedRequestPlan{}, err
+		}
+		return applyCodexReasoningReplayToPreparedPlan(ctx, opts.SourceFormat, req, opts, plan), nil
 	}
 	cache = ensureCodexPreparedRequestCache(opts.Metadata)
-	return cache.getOrBuild(key, func() (codexPreparedRequestPlan, error) {
+	plan, err := cache.getOrBuild(key, func() (codexPreparedRequestPlan, error) {
 		return e.buildCodexRequestPlan(ctx, req, opts, mode, baseModel, requestedModel)
 	})
+	if err != nil {
+		return codexPreparedRequestPlan{}, err
+	}
+	return applyCodexReasoningReplayToPreparedPlan(ctx, opts.SourceFormat, req, opts, plan), nil
 }
 
 func (e *CodexExecutor) buildCodexRequestPlan(ctx context.Context, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, mode codexPreparedRequestPlanMode, baseModel, requestedModel string) (codexPreparedRequestPlan, error) {
@@ -133,6 +141,13 @@ func (e *CodexExecutor) buildCodexRequestPlan(ctx context.Context, req cliproxye
 		body:           body,
 		conversationID: conversationID,
 	}, nil
+}
+
+func applyCodexReasoningReplayToPreparedPlan(ctx context.Context, from sdktranslator.Format, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, plan codexPreparedRequestPlan) codexPreparedRequestPlan {
+	body, replayScope := applyCodexReasoningReplayCache(ctx, from, req, opts, plan.body)
+	plan.body = body
+	plan.replayScope = replayScope
+	return plan
 }
 
 func codexPreparedRequestTargetFormat(mode codexPreparedRequestPlanMode) sdktranslator.Format {
@@ -357,30 +372,20 @@ func deleteJSONFieldIfExists(body []byte, path string) []byte {
 }
 
 func codexPromptCacheID(ctx context.Context, from sdktranslator.Format, req cliproxyexecutor.Request) string {
-	if from == "claude" {
-		userIDResult := gjson.GetBytes(req.Payload, "metadata.user_id")
-		if userIDResult.Exists() {
-			key := req.Model + "-" + userIDResult.String()
-			if cache, ok := getCodexCache(key); ok {
-				return cache.ID
-			}
-			cache := codexCache{
-				ID:     uuid.New().String(),
-				Expire: time.Now().Add(1 * time.Hour),
-			}
-			setCodexCache(key, cache)
+	if sourceFormatEqual(from, sdktranslator.FormatClaude) {
+		if cache, ok := codexClaudeCodePromptCache(req); ok {
 			return cache.ID
 		}
 		return ""
 	}
-	if from == "openai-response" {
+	if sourceFormatEqual(from, sdktranslator.FormatOpenAIResponse) {
 		promptCacheKey := gjson.GetBytes(req.Payload, "prompt_cache_key")
 		if promptCacheKey.Exists() {
 			return promptCacheKey.String()
 		}
 		return ""
 	}
-	if from == "openai" {
+	if sourceFormatEqual(from, sdktranslator.FormatOpenAI) {
 		if apiKey := strings.TrimSpace(apiKeyFromContext(ctx)); apiKey != "" {
 			return uuid.NewSHA1(uuid.NameSpaceOID, []byte("cli-proxy-api:codex:prompt-cache:"+apiKey)).String()
 		}

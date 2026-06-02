@@ -73,11 +73,11 @@ func patchCodexCompletedOutput(eventData []byte, outputItemsByIndex map[int64][]
 
 // codexTerminalStreamContextLengthErr 将 Codex SSE 里的终态上下文长度错误转成稳定 statusErr。
 func codexTerminalStreamContextLengthErr(eventData []byte) (statusErr, bool) {
-	body := codexTerminalStreamErrorBody(eventData)
-	if len(body) == 0 || !codexTerminalErrorIsContextLength(body) {
+	streamErr, body, ok := codexTerminalStreamErr(eventData)
+	if !ok || !codexTerminalErrorIsContextLength(body) {
 		return statusErr{}, false
 	}
-	return newCodexStatusErr(http.StatusBadRequest, body), true
+	return streamErr, true
 }
 
 // codexTerminalStreamErrorBody 从 Codex 终态 SSE 事件里提取统一 OpenAI 风格错误体。
@@ -312,10 +312,11 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 		appendAPIResponseChunk(ctx, e.cfg, b)
 		logWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, summarizeErrorBody(httpResp.Header.Get("Content-Type"), b))
 		err = newCodexStatusErr(httpResp.StatusCode, b)
+		err = wrapCodexReasoningReplayInvalidErr(plan.replayScope, httpResp.StatusCode, b, err)
 		return resp, err
 	}
 
-	data, err := readCodexCompletedEvent(ctx, e.cfg, httpResp.Body, body, reporter)
+	data, err := readCodexCompletedEvent(ctx, e.cfg, httpResp.Body, body, reporter, plan.replayScope)
 	if err != nil {
 		if _, ok := err.(statusErr); !ok {
 			recordAPIResponseError(ctx, e.cfg, err)
@@ -485,6 +486,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 		appendAPIResponseChunk(ctx, e.cfg, data)
 		logWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, summarizeErrorBody(httpResp.Header.Get("Content-Type"), data))
 		err = newCodexStatusErr(httpResp.StatusCode, data)
+		err = wrapCodexReasoningReplayInvalidErr(plan.replayScope, httpResp.StatusCode, data, err)
 		return nil, err
 	}
 	out := make(chan cliproxyexecutor.StreamChunk)
@@ -512,10 +514,11 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 
 			if bytes.HasPrefix(line, dataTag) {
 				data := bytes.TrimSpace(line[5:])
-				if streamErr, ok := codexTerminalStreamContextLengthErr(data); ok {
-					recordAPIResponseError(ctx, e.cfg, streamErr)
+				if streamErr, terminalBody, ok := codexTerminalStreamErr(data); ok {
+					errOut := wrapCodexReasoningReplayInvalidErr(plan.replayScope, streamErr.StatusCode(), terminalBody, streamErr)
+					recordAPIResponseError(ctx, e.cfg, errOut)
 					reporter.publishFailure(ctx)
-					if !sendStreamChunk(ctx, out, cliproxyexecutor.StreamChunk{Err: streamErr}) {
+					if !sendStreamChunk(ctx, out, cliproxyexecutor.StreamChunk{Err: errOut}) {
 						return
 					}
 					return
@@ -530,6 +533,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 					}
 					publishCodexImageToolUsage(ctx, reporter, body, data)
 					reporter.ensurePublished(ctx)
+					cacheCodexReasoningReplayFromCompleted(plan.replayScope, data)
 					translatedLine = append([]byte("data: "), data...)
 				}
 			}
@@ -765,7 +769,7 @@ func (e *CodexExecutor) cacheHelper(ctx context.Context, from sdktranslator.Form
 	return newCodexHTTPRequest(ctx, url, rawJSON, conversationID)
 }
 
-func readCodexCompletedEvent(ctx context.Context, cfg *config.Config, body io.ReadCloser, requestBody []byte, reporter *usageReporter) ([]byte, error) {
+func readCodexCompletedEvent(ctx context.Context, cfg *config.Config, body io.ReadCloser, requestBody []byte, reporter *usageReporter, replayScope codexReasoningReplayScope) ([]byte, error) {
 	reader := bufio.NewReader(body)
 	outputItemsByIndex := make(map[int64][]byte)
 	var outputItemsFallback [][]byte
@@ -775,8 +779,8 @@ func readCodexCompletedEvent(ctx context.Context, cfg *config.Config, body io.Re
 			appendAPIResponseChunk(ctx, cfg, line)
 			if bytes.HasPrefix(line, dataTag) {
 				data := bytes.TrimSpace(line[len(dataTag):])
-				if streamErr, ok := codexTerminalStreamContextLengthErr(data); ok {
-					return nil, streamErr
+				if streamErr, terminalBody, ok := codexTerminalStreamErr(data); ok {
+					return nil, wrapCodexReasoningReplayInvalidErr(replayScope, streamErr.StatusCode(), terminalBody, streamErr)
 				}
 				switch gjson.GetBytes(data, "type").String() {
 				case "response.output_item.done":
@@ -788,6 +792,7 @@ func readCodexCompletedEvent(ctx context.Context, cfg *config.Config, body io.Re
 					}
 					publishCodexImageToolUsage(ctx, reporter, requestBody, completedData)
 					reporter.ensurePublished(ctx)
+					cacheCodexReasoningReplayFromCompleted(replayScope, completedData)
 					drainCodexCompletedBody(ctx, cfg, reader, body)
 					return bytes.Clone(completedData), nil
 				}

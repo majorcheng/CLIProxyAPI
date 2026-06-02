@@ -3247,6 +3247,9 @@ func isBlockableInvalidRequestError(err error) bool {
 	if err == nil {
 		return false
 	}
+	if shouldSkipInvalidRequestBlock(err) {
+		return false
+	}
 	if isModelSupportError(err) {
 		return false
 	}
@@ -3276,6 +3279,11 @@ func isBlockableInvalidRequestError(err error) bool {
 		return true
 	}
 	return false
+}
+
+func shouldSkipInvalidRequestBlock(err error) bool {
+	var skipper interface{ SkipInvalidRequestBlock() bool }
+	return errors.As(err, &skipper) && skipper.SkipInvalidRequestBlock()
 }
 
 func (m *Manager) rejectBlockedRequest(opts cliproxyexecutor.Options) (cliproxyexecutor.Options, error) {

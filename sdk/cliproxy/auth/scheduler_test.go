@@ -1048,7 +1048,8 @@ func TestManager_PickNextMixed_DisallowFreeAuthSkipsMetadataOnlyCodexFreePlan(t 
 	t.Parallel()
 
 	model := "gpt-5.4-mini"
-	registerSchedulerModels(t, "codex", model, "codex-a-free-meta", "codex-b-plus")
+	plusID := "codex-b-plus-meta"
+	registerSchedulerModels(t, "codex", model, "codex-a-free-meta", plusID)
 
 	manager := NewManager(nil, &RoundRobinSelector{}, nil)
 	manager.executors["codex"] = schedulerTestExecutor{}
@@ -1060,11 +1061,11 @@ func TestManager_PickNextMixed_DisallowFreeAuthSkipsMetadataOnlyCodexFreePlan(t 
 		t.Fatalf("Register(codex-a-free-meta) error = %v", errRegister)
 	}
 	if _, errRegister := manager.Register(context.Background(), &Auth{
-		ID:       "codex-b-plus",
+		ID:       plusID,
 		Provider: "codex",
 		Metadata: map[string]any{"plan_type": "plus"},
 	}); errRegister != nil {
-		t.Fatalf("Register(codex-b-plus) error = %v", errRegister)
+		t.Fatalf("Register(%s) error = %v", plusID, errRegister)
 	}
 
 	opts := cliproxyexecutor.Options{
@@ -1080,8 +1081,8 @@ func TestManager_PickNextMixed_DisallowFreeAuthSkipsMetadataOnlyCodexFreePlan(t 
 	if provider != "codex" {
 		t.Fatalf("pickNextMixed() provider = %q, want %q", provider, "codex")
 	}
-	if got.ID != "codex-b-plus" {
-		t.Fatalf("pickNextMixed() auth.ID = %q, want %q", got.ID, "codex-b-plus")
+	if got.ID != plusID {
+		t.Fatalf("pickNextMixed() auth.ID = %q, want %q", got.ID, plusID)
 	}
 }
 

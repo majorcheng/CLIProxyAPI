@@ -7,6 +7,22 @@ import (
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 )
 
+type requestBlockSkipError struct {
+	inner *Error
+}
+
+func (e requestBlockSkipError) Error() string {
+	return e.inner.Error()
+}
+
+func (e requestBlockSkipError) StatusCode() int {
+	return e.inner.StatusCode()
+}
+
+func (e requestBlockSkipError) SkipInvalidRequestBlock() bool {
+	return true
+}
+
 func TestRequestBodyHashFromOptionsStableAcrossJSONKeyOrder(t *testing.T) {
 	leftOpts, left, lok := requestBodyHashFromOptions(cliproxyexecutor.Options{
 		OriginalRequest: []byte(`{"b":2,"a":1}`),
@@ -50,6 +66,7 @@ func TestIsBlockableInvalidRequestError(t *testing.T) {
 		{name: "invalid function parameters", err: &Error{HTTPStatus: http.StatusBadRequest, Message: "invalid_function_parameters"}, want: true},
 		{name: "bad request invalid request error", err: &Error{HTTPStatus: http.StatusBadRequest, Message: "invalid_request_error: malformed payload"}, want: true},
 		{name: "unprocessable entity", err: &Error{HTTPStatus: http.StatusUnprocessableEntity, Message: "unprocessable entity"}, want: true},
+		{name: "internal replay invalid request", err: requestBlockSkipError{inner: &Error{HTTPStatus: http.StatusBadRequest, Message: "invalid_request_error: invalid_encrypted_content"}}, want: false},
 		{name: "unauthorized", err: &Error{HTTPStatus: http.StatusUnauthorized, Message: "unauthorized"}, want: false},
 		{name: "quota", err: &Error{HTTPStatus: http.StatusTooManyRequests, Message: "quota exceeded"}, want: false},
 		{name: "timeout", err: &Error{Code: "deadline_exceeded", Message: "context deadline exceeded"}, want: false},

@@ -38,12 +38,7 @@ func filterCodexReasoningReplayItemsForInput(body []byte, items [][]byte) [][]by
 	}
 
 	hasInputReasoning := codexInputHasValidReasoningEncryptedContent(body)
-	existingCalls := make(map[string]bool)
-	for _, inputItem := range input.Array() {
-		for _, key := range codexReplayToolCallKeys(inputItem) {
-			existingCalls[key] = true
-		}
-	}
+	existingCalls, existingOutputs := codexReplayExistingCallState(input)
 
 	filtered := make([][]byte, 0, len(items))
 	for _, item := range items {
@@ -58,6 +53,10 @@ func filterCodexReasoningReplayItemsForInput(body []byte, items [][]byte) [][]by
 			if len(keys) == 0 || codexReplayAnyToolCallKeyExists(existingCalls, keys) {
 				continue
 			}
+			// 只回放本轮已有输出引用的 tool call，避免把孤儿 tool call 注入给上游。
+			if !codexReplayItemHasMatchingOutput(itemResult, existingOutputs) {
+				continue
+			}
 			for _, key := range keys {
 				existingCalls[key] = true
 			}
@@ -67,6 +66,34 @@ func filterCodexReasoningReplayItemsForInput(body []byte, items [][]byte) [][]by
 		filtered = append(filtered, item)
 	}
 	return filtered
+}
+
+// codexReplayExistingCallState 收集当前请求已有 tool call 和 tool output 的可比较 ID。
+func codexReplayExistingCallState(input gjson.Result) (map[string]bool, map[string]bool) {
+	existingCalls := make(map[string]bool)
+	existingOutputs := make(map[string]bool)
+	for _, inputItem := range input.Array() {
+		itemType := strings.TrimSpace(inputItem.Get("type").String())
+		if itemType == "function_call_output" || itemType == "custom_tool_call_output" {
+			for _, callID := range codexReplayComparableCallIDs(inputItem.Get("call_id").String()) {
+				existingOutputs[callID] = true
+			}
+		}
+		for _, key := range codexReplayToolCallKeys(inputItem) {
+			existingCalls[key] = true
+		}
+	}
+	return existingCalls, existingOutputs
+}
+
+// codexReplayItemHasMatchingOutput 判断缓存 tool call 是否被当前请求的 output 引用。
+func codexReplayItemHasMatchingOutput(item gjson.Result, existingOutputs map[string]bool) bool {
+	for _, callID := range codexReplayComparableCallIDs(item.Get("call_id").String()) {
+		if existingOutputs[callID] {
+			return true
+		}
+	}
+	return false
 }
 
 func insertCodexReasoningReplayItems(body []byte, replayItems [][]byte) ([]byte, bool) {

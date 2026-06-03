@@ -669,7 +669,7 @@ func TestScanAuthMaintenanceCandidates_429DoesNotQueueDeleteWithoutExplicitQuota
 	}
 }
 
-func TestDeleteAuthMaintenanceCandidate_RemovesFileAndDisablesAllAuths(t *testing.T) {
+func TestDeleteAuthMaintenanceCandidate_RemovesFileAndRuntimeAuths(t *testing.T) {
 	authDir := t.TempDir()
 	trashBase := filepath.Join(t.TempDir(), "writable")
 	t.Setenv("WRITABLE_PATH", trashBase)
@@ -736,12 +736,8 @@ func TestDeleteAuthMaintenanceCandidate_RemovesFileAndDisablesAllAuths(t *testin
 		t.Fatalf("expected token store delete for %s, got %#v", filePath, store.deleted)
 	}
 	for _, id := range []string{"shared-primary", "shared-project-1"} {
-		auth, ok := service.coreManager.GetByID(id)
-		if !ok {
-			t.Fatalf("expected auth %s to remain in manager", id)
-		}
-		if !auth.Disabled || auth.Status != coreauth.StatusDisabled {
-			t.Fatalf("expected auth %s to be disabled after maintenance delete, got disabled=%v status=%q", id, auth.Disabled, auth.Status)
+		if auth, ok := service.coreManager.GetByID(id); ok || auth != nil {
+			t.Fatalf("expected auth %s to be removed from manager after maintenance delete", id)
 		}
 	}
 }
@@ -804,7 +800,7 @@ func TestDeleteAuthMaintenanceCandidate_TokenStoreFailureStillDisablesAuths(t *t
 		allDisabled := true
 		for _, id := range []string{"shared-primary", "shared-project-1"} {
 			auth, ok := service.coreManager.GetByID(id)
-			if !ok || auth == nil || !auth.Disabled || auth.Status != coreauth.StatusDisabled {
+			if !ok || auth == nil || !auth.Disabled || auth.Status != coreauth.StatusDisabled || !authMaintenancePendingDelete(auth) {
 				allDisabled = false
 				break
 			}
@@ -922,12 +918,8 @@ func TestDeleteAuthMaintenanceCandidate_ClearsPendingDeleteMarkerOnSuccess(t *te
 		t.Fatalf("deleteAuthMaintenanceCandidate() error = %v", err)
 	}
 
-	updated, ok := service.coreManager.GetByID("pending-delete")
-	if !ok || updated == nil {
-		t.Fatal("expected auth to remain in manager after delete")
-	}
-	if authMaintenancePendingDelete(updated) {
-		t.Fatal("expected pending delete marker to be cleared after successful delete")
+	if auth, ok := service.coreManager.GetByID("pending-delete"); ok || auth != nil {
+		t.Fatal("expected auth to be removed from manager after successful delete")
 	}
 	candidates := service.scanAuthMaintenanceCandidates(timeNowForTest(), config.AuthMaintenanceConfig{
 		Enable:            true,
@@ -1037,12 +1029,8 @@ func TestDeleteAuthMaintenanceCandidate_RetryAfterArchiveWithMissingSourceStillS
 	if err := service.deleteAuthMaintenanceCandidate(context.Background(), candidate); err != nil {
 		t.Fatalf("deleteAuthMaintenanceCandidate() second error = %v", err)
 	}
-	updated, ok = service.coreManager.GetByID("retry-auth")
-	if !ok || updated == nil {
-		t.Fatal("expected auth to remain in manager after retry")
-	}
-	if authMaintenancePendingDelete(updated) {
-		t.Fatal("expected pending delete marker to be cleared after retry succeeds")
+	if auth, ok := service.coreManager.GetByID("retry-auth"); ok || auth != nil {
+		t.Fatal("expected auth to be removed from manager after retry succeeds")
 	}
 	matches, errGlob := filepath.Glob(filepath.Join(trashBase, "logs", "delete", "401", "*.json"))
 	if errGlob != nil {
@@ -1651,24 +1639,23 @@ func TestAuthMaintenanceBackgroundQueue_MixedLoadGraduallyRemoves401And429(t *te
 	deadline := time.Now().Add(9 * time.Second)
 	for {
 		allRemoved := true
-		allDisabled := true
+		allRuntimeRemoved := true
 		for _, id := range badIDs {
 			path := filepath.Join(authDir, id+".json")
 			if _, err := os.Stat(path); !os.IsNotExist(err) {
 				allRemoved = false
 			}
-			auth, ok := service.coreManager.GetByID(id)
-			if !ok || auth == nil || !auth.Disabled || auth.Status != coreauth.StatusDisabled {
-				allDisabled = false
+			if auth, ok := service.coreManager.GetByID(id); ok || auth != nil {
+				allRuntimeRemoved = false
 			}
 		}
-		if allRemoved && allDisabled {
+		if allRemoved && allRuntimeRemoved {
 			break
 		}
 		if time.Now().After(deadline) {
 			stopWork()
 			wg.Wait()
-			t.Fatalf("timed out waiting for maintenance deletes: removed=%v disabled=%v", allRemoved, allDisabled)
+			t.Fatalf("timed out waiting for maintenance deletes: removed=%v runtimeRemoved=%v", allRemoved, allRuntimeRemoved)
 		}
 		time.Sleep(100 * time.Millisecond)
 	}

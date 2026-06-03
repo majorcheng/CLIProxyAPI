@@ -160,6 +160,26 @@ func TestConvertCodexResponseToOpenAI_NonStreamImageGenerationCallAddsMessageIma
 	}
 }
 
+// TestConvertCodexResponseToOpenAI_NonStreamMultiMessageEmptyTrailingKeepsContent 验证尾部空 message 不覆盖有效内容。
+func TestConvertCodexResponseToOpenAI_NonStreamMultiMessageEmptyTrailingKeepsContent(t *testing.T) {
+	ctx := context.Background()
+	raw := []byte(`{"type":"response.completed","response":{"id":"resp_1","created_at":1700000000,"model":"gpt-5.5","status":"completed","usage":{"input_tokens":10,"output_tokens":5,"total_tokens":15},"output":[` +
+		`{"type":"reasoning","summary":[{"type":"summary_text","text":"thinking"}]},` +
+		`{"type":"message","content":[{"type":"output_text","text":"the real answer"}]},` +
+		`{"type":"reasoning","summary":[{"type":"summary_text","text":"thinking again"}]},` +
+		`{"type":"message","content":[{"type":"output_text","text":""}]}` +
+		`]}}`)
+	out := ConvertCodexResponseToOpenAINonStream(ctx, "gpt-5.5", nil, nil, raw, nil)
+
+	got := gjson.Get(out, "choices.0.message.content")
+	if !got.Exists() || got.Type == gjson.Null {
+		t.Fatalf("content was dropped to null by trailing empty message; resp=%s", string(out))
+	}
+	if got.String() != "the real answer" {
+		t.Fatalf("expected content %q, got %q; resp=%s", "the real answer", got.String(), string(out))
+	}
+}
+
 func TestConvertCodexResponseToOpenAI_StreamPartialImageEscapesImageURL(t *testing.T) {
 	ctx := context.Background()
 	var param any

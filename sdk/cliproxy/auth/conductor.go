@@ -1282,27 +1282,30 @@ func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
 		return nil, nil
 	}
 	m.mu.Lock()
-	if existing, ok := m.auths[auth.ID]; ok && existing != nil {
-		// 请求统计是纯运行态数据；同 ID 配置更新不能把它清零。
-		auth.Success = existing.Success
-		auth.Failed = existing.Failed
-		auth.recentRequests = existing.recentRequests
-		if !auth.indexAssigned && auth.Index == "" {
-			auth.Index = existing.Index
-			auth.indexAssigned = existing.indexAssigned
+	existing, ok := m.auths[auth.ID]
+	if !ok || existing == nil {
+		m.mu.Unlock()
+		return nil, nil
+	}
+	// 请求统计是纯运行态数据；同 ID 配置更新不能把它清零。
+	auth.Success = existing.Success
+	auth.Failed = existing.Failed
+	auth.recentRequests = existing.recentRequests
+	if !auth.indexAssigned && auth.Index == "" {
+		auth.Index = existing.Index
+		auth.indexAssigned = existing.indexAssigned
+	}
+	if registeredAt, okRegisteredAt := FirstRegisteredAt(existing); okRegisteredAt {
+		auth.CreatedAt = registeredAt
+		if auth.Metadata != nil {
+			auth.Metadata[FirstRegisteredAtMetadataKey] = registeredAt.Format(time.RFC3339Nano)
 		}
-		if registeredAt, okRegisteredAt := FirstRegisteredAt(existing); okRegisteredAt {
-			auth.CreatedAt = registeredAt
-			if auth.Metadata != nil {
-				auth.Metadata[FirstRegisteredAtMetadataKey] = registeredAt.Format(time.RFC3339Nano)
-			}
-		} else if auth.CreatedAt.IsZero() {
-			auth.CreatedAt = existing.CreatedAt
-		}
-		if !existing.Disabled && existing.Status != StatusDisabled && !auth.Disabled && auth.Status != StatusDisabled {
-			if len(auth.ModelStates) == 0 && len(existing.ModelStates) > 0 {
-				auth.ModelStates = existing.ModelStates
-			}
+	} else if auth.CreatedAt.IsZero() {
+		auth.CreatedAt = existing.CreatedAt
+	}
+	if !existing.Disabled && existing.Status != StatusDisabled && !auth.Disabled && auth.Status != StatusDisabled {
+		if len(auth.ModelStates) == 0 && len(existing.ModelStates) > 0 {
+			auth.ModelStates = existing.ModelStates
 		}
 	}
 	EnsureFirstRegisteredAt(auth, auth.CreatedAt)
@@ -1322,6 +1325,58 @@ func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
 	hook := m.Hook()
 	hook.OnAuthUpdated(ctx, auth.Clone())
 	return auth.Clone(), nil
+}
+
+// Remove 从运行态删除 auth；磁盘文件和 token store 删除由调用方负责。
+func (m *Manager) Remove(ctx context.Context, id string) {
+	if m == nil {
+		return
+	}
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return
+	}
+	_ = ctx
+
+	m.mu.Lock()
+	existing := m.auths[id]
+	if existing == nil {
+		m.mu.Unlock()
+		return
+	}
+	provider := strings.TrimSpace(existing.Provider)
+	delete(m.auths, id)
+	m.removeModelPoolOffsetsForAuthLocked(id)
+	m.mu.Unlock()
+
+	m.rebuildAPIKeyModelAliasFromRuntimeConfig()
+	if m.scheduler != nil {
+		m.scheduler.removeAuth(id)
+	}
+	m.queueRefreshUnschedule(id)
+	invalidateSessionAffinityAuth(m.selector, id)
+
+	if provider == "" {
+		return
+	}
+	if exec, ok := m.Executor(provider); ok && exec != nil {
+		if closer, okCloser := exec.(ExecutionSessionCloser); okCloser {
+			closer.CloseExecutionSession(CloseAllExecutionSessionsID)
+		}
+	}
+}
+
+// removeModelPoolOffsetsForAuthLocked 清理指定 auth 的模型池轮转游标。
+func (m *Manager) removeModelPoolOffsetsForAuthLocked(authID string) {
+	if m == nil || len(m.modelPoolOffsets) == 0 {
+		return
+	}
+	prefix := strings.ToLower(strings.TrimSpace(authID)) + "|"
+	for key := range m.modelPoolOffsets {
+		if strings.HasPrefix(key, prefix) {
+			delete(m.modelPoolOffsets, key)
+		}
+	}
 }
 
 // Load resets manager state from the backing store.
@@ -4183,6 +4238,20 @@ func (m *Manager) queueRefreshReschedule(authID string) {
 	loop.queueReschedule(authID)
 }
 
+// queueRefreshUnschedule 从自动刷新循环中移除指定 auth。
+func (m *Manager) queueRefreshUnschedule(authID string) {
+	if m == nil || authID == "" {
+		return
+	}
+	m.mu.RLock()
+	loop := m.refreshLoop
+	m.mu.RUnlock()
+	if loop == nil {
+		return
+	}
+	loop.remove(authID)
+}
+
 func (m *Manager) checkRefreshes(ctx context.Context) {
 	// log.Debugf("checking refreshes")
 	now := time.Now()
@@ -4799,11 +4868,14 @@ func (m *Manager) executeRefreshAuth(ctx context.Context, id string) (*Auth, err
 	if m.shouldRefresh(updated, now) {
 		updated.NextRefreshAfter = now.Add(refreshIneffectiveBackoff)
 	}
-	persisted, _ := m.Update(ctx, updated)
+	persisted, errUpdate := m.Update(ctx, updated)
+	if errUpdate != nil {
+		return m.cloneAuthByID(id), errUpdate
+	}
 	if persisted != nil {
 		return persisted, nil
 	}
-	return m.cloneAuthByID(id), nil
+	return nil, ErrAuthNotFound
 }
 
 func (m *Manager) executorFor(provider string) ProviderExecutor {

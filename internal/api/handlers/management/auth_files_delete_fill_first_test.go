@@ -66,7 +66,7 @@ func (e *deleteFillFirstExecutor) snapshotCalls() []string {
 	return append([]string(nil), e.calls...)
 }
 
-func TestDeleteAuthFile_DisablesAllAuthsForSharedBackingPath(t *testing.T) {
+func TestDeleteAuthFile_RemovesAllAuthsForSharedBackingPath(t *testing.T) {
 	fixture := newDeleteFillFirstFixture(t)
 	deleteRec := httptest.NewRecorder()
 	deleteCtx, _ := gin.CreateTestContext(deleteRec)
@@ -76,8 +76,8 @@ func TestDeleteAuthFile_DisablesAllAuthsForSharedBackingPath(t *testing.T) {
 		t.Fatalf("DeleteAuthFile status=%d body=%s", deleteRec.Code, deleteRec.Body.String())
 	}
 
-	assertDeleteFillFirstAuthDisabled(t, fixture.manager, "shared-primary")
-	assertDeleteFillFirstAuthDisabled(t, fixture.manager, "shared-project")
+	assertDeleteFillFirstAuthRemoved(t, fixture.manager, "shared-primary")
+	assertDeleteFillFirstAuthRemoved(t, fixture.manager, "shared-project")
 	assertDeleteFillFirstRegistryCleared(t, "shared-primary")
 	assertDeleteFillFirstRegistryCleared(t, "shared-project")
 	req := coreexecutor.Request{Model: fixture.model, Payload: []byte(`{"model":"delete-fill-first-shared-model"}`)}
@@ -89,7 +89,7 @@ func TestDeleteAuthFile_DisablesAllAuthsForSharedBackingPath(t *testing.T) {
 	}
 }
 
-func TestDeleteAuthFileAll_DisablesAllAuthsForSharedBackingPath(t *testing.T) {
+func TestDeleteAuthFileAll_RemovesAllAuthsForSharedBackingPath(t *testing.T) {
 	fixture := newDeleteFillFirstFixture(t)
 	deleteRec := httptest.NewRecorder()
 	deleteCtx, _ := gin.CreateTestContext(deleteRec)
@@ -99,9 +99,9 @@ func TestDeleteAuthFileAll_DisablesAllAuthsForSharedBackingPath(t *testing.T) {
 		t.Fatalf("DeleteAuthFile all status=%d body=%s", deleteRec.Code, deleteRec.Body.String())
 	}
 
-	assertDeleteFillFirstAuthDisabled(t, fixture.manager, "shared-primary")
-	assertDeleteFillFirstAuthDisabled(t, fixture.manager, "shared-project")
-	assertDeleteFillFirstAuthDisabled(t, fixture.manager, "good-token")
+	assertDeleteFillFirstAuthRemoved(t, fixture.manager, "shared-primary")
+	assertDeleteFillFirstAuthRemoved(t, fixture.manager, "shared-project")
+	assertDeleteFillFirstAuthRemoved(t, fixture.manager, "good-token")
 	assertDeleteFillFirstRegistryCleared(t, "shared-primary")
 	assertDeleteFillFirstRegistryCleared(t, "shared-project")
 	assertDeleteFillFirstRegistryCleared(t, "good-token")
@@ -198,14 +198,10 @@ func registerDeleteFillFirstAuth(t *testing.T, manager *coreauth.Manager, id str
 	time.Sleep(deleteFillFirstRegisterOrderGap)
 }
 
-func assertDeleteFillFirstAuthDisabled(t *testing.T, manager *coreauth.Manager, id string) {
+func assertDeleteFillFirstAuthRemoved(t *testing.T, manager *coreauth.Manager, id string) {
 	t.Helper()
-	auth, ok := manager.GetByID(id)
-	if !ok || auth == nil {
-		t.Fatalf("expected auth %s to remain for disabled-state tracking", id)
-	}
-	if !auth.Disabled || auth.Status != coreauth.StatusDisabled {
-		t.Fatalf("expected auth %s disabled, got disabled=%v status=%q", id, auth.Disabled, auth.Status)
+	if _, ok := manager.GetByID(id); ok {
+		t.Fatalf("expected auth %s to be removed from runtime state", id)
 	}
 }
 

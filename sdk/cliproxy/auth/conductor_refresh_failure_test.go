@@ -774,6 +774,7 @@ type codexRecoveryTestExecutor struct {
 	refreshed             bool
 	refreshErr            error
 	retryUnauthorized     bool
+	onRefreshSuccess      func(*Auth)
 	executeCalls          int
 	streamCalls           int
 	refreshCalls          int
@@ -829,6 +830,9 @@ func (e *codexRecoveryTestExecutor) Refresh(_ context.Context, auth *Auth) (*Aut
 	cloned.Metadata["refresh_token"] = "rotated-refresh-token"
 	cloned.Metadata["last_refresh"] = time.Now().Format(time.RFC3339)
 	cloned.Metadata["expired"] = time.Now().Add(24 * time.Hour).Format(time.RFC3339)
+	if e.onRefreshSuccess != nil {
+		e.onRefreshSuccess(cloned)
+	}
 	return cloned, nil
 }
 
@@ -949,6 +953,58 @@ func TestManagerExecute_CodexRetryStill401MarksUnauthorizedAfterRecovery(t *test
 	}
 	if authErr.HTTPStatus != http.StatusUnauthorized {
 		t.Fatalf("error status = %d, want 401", authErr.HTTPStatus)
+	}
+}
+
+// TestExecuteWithCodex401Recovery_DeletedDuringRefreshDoesNotRetryStaleAuth 验证 refresh 期间被删除的 auth 不会用旧凭据重试。
+func TestExecuteWithCodex401Recovery_DeletedDuringRefreshDoesNotRetryStaleAuth(t *testing.T) {
+	t.Parallel()
+
+	manager := NewManager(nil, nil, nil)
+	auth := &Auth{
+		ID:       "codex-recovery-deleted",
+		Provider: "codex",
+		Status:   StatusActive,
+		Metadata: map[string]any{
+			"access_token":  "stale-access-token",
+			"refresh_token": "refresh-token",
+		},
+	}
+	executor := &codexRecoveryTestExecutor{
+		onRefreshSuccess: func(updated *Auth) {
+			manager.Remove(context.Background(), updated.ID)
+		},
+	}
+	manager.RegisterExecutor(executor)
+	if _, err := manager.Register(context.Background(), auth); err != nil {
+		t.Fatalf("register auth: %v", err)
+	}
+
+	runCalls := 0
+	_, _, err := executeWithCodex401Recovery(manager, context.Background(), auth, "codex", cliproxyexecutor.Request{Model: "gpt-5.4"}, cliproxyexecutor.Options{}, func(_ context.Context, runAuth *Auth) (cliproxyexecutor.Response, error) {
+		runCalls++
+		executor.mu.Lock()
+		executor.lastAccessTokenByCall = append(executor.lastAccessTokenByCall, authMetadataString(runAuth, "access_token"))
+		executor.mu.Unlock()
+		return cliproxyexecutor.Response{}, &Error{HTTPStatus: http.StatusUnauthorized, Message: "unauthorized before refresh"}
+	})
+	if err == nil {
+		t.Fatal("expected original 401 when refreshed auth was deleted")
+	}
+	if statusCodeFromError(err) != http.StatusUnauthorized {
+		t.Fatalf("error status = %d, want 401; err=%v", statusCodeFromError(err), err)
+	}
+	if runCalls != 1 {
+		t.Fatalf("runCalls = %d, want 1; stale auth must not be retried", runCalls)
+	}
+	if executor.refreshCalls != 1 {
+		t.Fatalf("refreshCalls = %d, want 1", executor.refreshCalls)
+	}
+	if len(executor.lastAccessTokenByCall) != 1 || executor.lastAccessTokenByCall[0] != "stale-access-token" {
+		t.Fatalf("access token sequence = %v, want only stale first attempt", executor.lastAccessTokenByCall)
+	}
+	if _, ok := manager.GetByID(auth.ID); ok {
+		t.Fatalf("expected auth %q to stay removed", auth.ID)
 	}
 }
 

@@ -537,7 +537,13 @@ func dedupeResponsesWebsocketInputItemsByID(payload []byte) []byte {
 	return updated
 }
 
-// dedupeInputItemsByID 保留同一 input item id 的最后一次出现，匹配 Responses 增量 transcript 语义。
+type responsesInputItemMetadata struct {
+	itemType string
+	id       string
+	callID   string
+}
+
+// dedupeInputItemsByID 去重同一 input item id，同时保留仍被 tool output 引用的 tool call。
 func dedupeInputItemsByID(rawArray string) (string, error) {
 	rawArray = strings.TrimSpace(rawArray)
 	if rawArray == "" {
@@ -548,23 +554,16 @@ func dedupeInputItemsByID(rawArray string) (string, error) {
 		return "", errUnmarshal
 	}
 
-	lastIndexByID := make(map[string]int, len(items))
-	for i, item := range items {
-		if len(item) == 0 {
-			continue
-		}
-		if itemID := strings.TrimSpace(gjson.GetBytes(item, "id").String()); itemID != "" {
-			lastIndexByID[itemID] = i
-		}
-	}
+	meta := responsesInputItemMetadataList(items)
+	keepIndexByID := responsesInputKeepIndexByID(meta)
 
 	filtered := make([]json.RawMessage, 0, len(items))
 	for i, item := range items {
 		if len(item) == 0 {
 			continue
 		}
-		itemID := strings.TrimSpace(gjson.GetBytes(item, "id").String())
-		if itemID != "" && lastIndexByID[itemID] != i {
+		itemID := meta[i].id
+		if itemID != "" && keepIndexByID[itemID] != i {
 			continue
 		}
 		filtered = append(filtered, item)
@@ -575,6 +574,61 @@ func dedupeInputItemsByID(rawArray string) (string, error) {
 		return "", errMarshal
 	}
 	return string(out), nil
+}
+
+// responsesInputItemMetadataList 单次解析 input item 的去重所需字段，避免重复扫描 JSON。
+func responsesInputItemMetadataList(items []json.RawMessage) []responsesInputItemMetadata {
+	meta := make([]responsesInputItemMetadata, len(items))
+	for i, item := range items {
+		if len(item) == 0 {
+			continue
+		}
+		values := gjson.GetManyBytes(item, "type", "id", "call_id")
+		meta[i] = responsesInputItemMetadata{
+			itemType: strings.TrimSpace(values[0].String()),
+			id:       strings.TrimSpace(values[1].String()),
+			callID:   strings.TrimSpace(values[2].String()),
+		}
+	}
+	return meta
+}
+
+// responsesInputKeepIndexByID 为每个 item id 选择最终保留的 input 下标。
+func responsesInputKeepIndexByID(meta []responsesInputItemMetadata) map[string]int {
+	referencedCallIDs := responsesReferencedToolCallIDs(meta)
+	keepIndexByID := make(map[string]int, len(meta))
+	keepReferencedByID := make(map[string]bool, len(meta))
+	for i, item := range meta {
+		if item.id == "" {
+			continue
+		}
+		_, referenced := referencedCallIDs[item.callID]
+		referenced = referenced && item.callID != ""
+		if _, seen := keepIndexByID[item.id]; !seen {
+			keepIndexByID[item.id] = i
+			keepReferencedByID[item.id] = referenced
+			continue
+		}
+		if referenced || !keepReferencedByID[item.id] {
+			keepIndexByID[item.id] = i
+			keepReferencedByID[item.id] = referenced
+		}
+	}
+	return keepIndexByID
+}
+
+// responsesReferencedToolCallIDs 收集仍被 tool output 引用的 call_id。
+func responsesReferencedToolCallIDs(meta []responsesInputItemMetadata) map[string]struct{} {
+	referencedCallIDs := make(map[string]struct{}, len(meta))
+	for _, item := range meta {
+		switch item.itemType {
+		case "function_call_output", "custom_tool_call_output":
+			if item.callID != "" {
+				referencedCallIDs[item.callID] = struct{}{}
+			}
+		}
+	}
+	return referencedCallIDs
 }
 
 func websocketUpstreamSupportsIncrementalInput(attributes map[string]string, metadata map[string]any) bool {

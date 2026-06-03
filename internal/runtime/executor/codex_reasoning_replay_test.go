@@ -115,6 +115,56 @@ func TestCodexPrepareRequestPlan_DoesNotCacheInjectedReplay(t *testing.T) {
 	}
 }
 
+// TestCodexReasoningReplayDropsFunctionCallWithoutMatchingOutput 验证 replay 不注入孤儿 tool call。
+func TestCodexReasoningReplayDropsFunctionCallWithoutMatchingOutput(t *testing.T) {
+	internalcache.ClearCodexReasoningReplayCache()
+	t.Cleanup(internalcache.ClearCodexReasoningReplayCache)
+
+	encryptedContent := validCodexReplayEncryptedContentForTest(25)
+	scope := codexReasoningReplayScope{
+		modelName:  "gpt-5.4",
+		sessionKey: "claude:session-dropped-tool",
+	}
+	completed := []byte(`{"response":{"output":[` +
+		`{"type":"reasoning","summary":[],"content":null,"encrypted_content":"` + encryptedContent + `"},` +
+		`{"type":"function_call","call_id":"call_dropped","name":"TaskCreate","arguments":"{}"}` +
+		`]}}`)
+	cacheCodexReasoningReplayFromCompleted(scope, completed)
+
+	body := []byte(`{"model":"gpt-5.4","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"next"}]}]}`)
+	req := cliproxyexecutor.Request{
+		Model: "gpt-5.4",
+		Payload: []byte(`{
+			"model":"gpt-5.4",
+			"metadata":{"user_id":"{\"device_id\":\"device-test\",\"session_id\":\"session-dropped-tool\"}"},
+			"messages":[{"role":"user","content":[{"type":"text","text":"next"}]}]
+		}`),
+	}
+
+	updated, replayScope := applyCodexReasoningReplayCache(
+		context.Background(),
+		sdktranslator.FormatClaude,
+		req,
+		cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatClaude},
+		body,
+	)
+	if replayScope.modelName != scope.modelName || replayScope.sessionKey != scope.sessionKey {
+		t.Fatalf("replay scope = %#v, want model=%q session=%q", replayScope, scope.modelName, scope.sessionKey)
+	}
+	if got := gjson.GetBytes(updated, "input.0.type").String(); got != "reasoning" {
+		t.Fatalf("input.0.type = %q, want reasoning; body=%s", got, string(updated))
+	}
+	if got := gjson.GetBytes(updated, "input.0.encrypted_content").String(); got != encryptedContent {
+		t.Fatalf("input.0.encrypted_content = %q, want cached reasoning; body=%s", got, string(updated))
+	}
+	if gjson.GetBytes(updated, `input.#(call_id=="call_dropped")`).Exists() {
+		t.Fatalf("cached function_call without matching output should not be replayed; body=%s", string(updated))
+	}
+	if got := gjson.GetBytes(updated, "input.1.role").String(); got != "user" {
+		t.Fatalf("input.1.role = %q, want user; body=%s", got, string(updated))
+	}
+}
+
 func TestCodexReasoningReplaySkipsNativeOpenAIResponses(t *testing.T) {
 	internalcache.ClearCodexReasoningReplayCache()
 	t.Cleanup(internalcache.ClearCodexReasoningReplayCache)

@@ -9,17 +9,17 @@ import (
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 )
 
-// disableAuthsForDeletedPath 按 token 实际落盘路径禁用所有同源 auth。
+// removeAuthsForDeletedPath 按 token 实际落盘路径移除所有同源 auth。
 // 同一个 Codex token 文件可能派生 primary/project 等多个 auth ID；
 // 删除文件时必须一次性清掉这些 ID，避免 fill-first 继续命中兄弟候选。
-func (h *Handler) disableAuthsForDeletedPath(ctx context.Context, targetPath string, fallbackID string) {
+func (h *Handler) removeAuthsForDeletedPath(ctx context.Context, targetPath string, fallbackID string) {
 	ids := h.authIDsForDeletedPath(targetPath, fallbackID)
 	if len(ids) == 0 {
-		h.disableAuth(ctx, targetPath)
+		h.removeAuth(ctx, targetPath)
 		return
 	}
 	for _, id := range ids {
-		h.disableAuth(ctx, id)
+		h.removeAuth(ctx, id)
 	}
 }
 

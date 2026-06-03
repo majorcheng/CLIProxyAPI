@@ -810,49 +810,49 @@ func (s *Service) applyCoreAuthRemovalWithReason(ctx context.Context, id string,
 		s.removeAuthMaintenanceAuth(id)
 		return
 	}
-	alreadyDisabled := existing.Disabled && existing.Status == coreauth.StatusDisabled && existing.Unavailable
-	existingPending := authMaintenancePendingDelete(existing)
-	existingReason, _ := authMaintenancePendingDeleteReason(existing)
-	normalizedReason := strings.TrimSpace(reason)
-	if alreadyDisabled && existingPending == pendingDelete && (!pendingDelete || existingReason == normalizedReason) {
-		if pendingDelete {
-			s.indexAuthMaintenanceAuth(existing)
-		} else {
-			s.removeAuthMaintenanceAuth(id)
-		}
+	if !pendingDelete {
+		s.coreManager.Remove(ctx, id)
+		s.removeAuthMaintenanceAuth(id)
 		return
 	}
+	s.applyCoreAuthPendingDeleteMarker(ctx, existing, id, reason)
+}
+
+// applyCoreAuthPendingDeleteMarker 标记维护删除中的 auth，供失败重试继续识别。
+func (s *Service) applyCoreAuthPendingDeleteMarker(ctx context.Context, existing *coreauth.Auth, id string, reason string) {
+	if s == nil || existing == nil {
+		return
+	}
+	normalizedReason := strings.TrimSpace(reason)
+	alreadyDisabled := existing.Disabled &&
+		existing.Status == coreauth.StatusDisabled &&
+		existing.Unavailable
+	existingPending := authMaintenancePendingDelete(existing)
+	existingReason, _ := authMaintenancePendingDeleteReason(existing)
+	if alreadyDisabled && existingPending && existingReason == normalizedReason {
+		s.indexAuthMaintenanceAuth(existing)
+		return
+	}
+
 	existing.Disabled = true
 	existing.Status = coreauth.StatusDisabled
 	existing.Unavailable = true
 	existing.UpdatedAt = time.Now().UTC()
-	if existing.Metadata == nil && pendingDelete {
+	if existing.Metadata == nil {
 		existing.Metadata = make(map[string]any)
 	}
-	if existing.Metadata != nil {
-		existing.Metadata["disabled"] = true
-		if pendingDelete {
-			existing.Metadata[authMaintenancePendingDeleteMetadataKey] = true
-			if reason = strings.TrimSpace(reason); reason != "" {
-				existing.Metadata[authMaintenanceDeleteReasonMetadataKey] = reason
-			} else {
-				delete(existing.Metadata, authMaintenanceDeleteReasonMetadataKey)
-			}
-			existing.Metadata[authMaintenanceDeleteQueuedAtMetadataKey] = existing.UpdatedAt.Format(time.RFC3339Nano)
-		} else {
-			delete(existing.Metadata, authMaintenancePendingDeleteMetadataKey)
-			delete(existing.Metadata, authMaintenanceDeleteReasonMetadataKey)
-			delete(existing.Metadata, authMaintenanceDeleteQueuedAtMetadataKey)
-		}
+	existing.Metadata["disabled"] = true
+	existing.Metadata[authMaintenancePendingDeleteMetadataKey] = true
+	if normalizedReason != "" {
+		existing.Metadata[authMaintenanceDeleteReasonMetadataKey] = normalizedReason
+	} else {
+		delete(existing.Metadata, authMaintenanceDeleteReasonMetadataKey)
 	}
+	existing.Metadata[authMaintenanceDeleteQueuedAtMetadataKey] = existing.UpdatedAt.Format(time.RFC3339Nano)
 	if _, err := s.coreManager.Update(ctx, existing); err != nil {
 		log.Errorf("failed to disable auth %s: %v", id, err)
 	}
-	if pendingDelete {
-		s.indexAuthMaintenanceAuth(existing)
-	} else {
-		s.removeAuthMaintenanceAuth(id)
-	}
+	s.indexAuthMaintenanceAuth(existing)
 	if strings.EqualFold(strings.TrimSpace(existing.Provider), "codex") {
 		s.ensureExecutorsForAuth(existing)
 	}
@@ -1871,6 +1871,8 @@ func (s *Service) deleteAuthMaintenanceCandidate(ctx context.Context, candidate 
 		return nil
 	}
 	ctx = coreauth.WithSkipPersist(ctx)
+	// 删除前先幂等标记为 pending-delete，确保后端清理失败时仍保留可重试状态。
+	s.disableAuthMaintenanceCandidate(ctx, candidate, "")
 	path := strings.TrimSpace(candidate.Path)
 	var cleanupErr error
 	if path != "" {
@@ -1884,17 +1886,18 @@ func (s *Service) deleteAuthMaintenanceCandidate(ctx context.Context, candidate 
 			cleanupErr = fmt.Errorf("delete auth token record: %w", err)
 		}
 	}
-	if cleanupErr == nil {
-		for _, id := range candidate.IDs {
-			s.clearAuthMaintenancePendingDelete(ctx, id)
-		}
+	if cleanupErr != nil {
+		return cleanupErr
+	}
+	for _, id := range candidate.IDs {
+		s.clearAuthMaintenancePendingDelete(ctx, id)
 	}
 	for _, id := range candidate.IDs {
 		if trimmed := strings.TrimSpace(id); trimmed != "" {
 			s.emitAuthUpdate(ctx, watcher.AuthUpdate{Action: watcher.AuthUpdateActionDelete, ID: trimmed})
 		}
 	}
-	return cleanupErr
+	return nil
 }
 
 func (s *Service) deleteAuthTokenRecord(ctx context.Context, path string) error {

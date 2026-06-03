@@ -49,6 +49,13 @@ func TestWithSkipPersist_DisablesUpdatePersistence(t *testing.T) {
 		Metadata: map[string]any{"type": "antigravity"},
 	}
 
+	if _, err := mgr.Register(WithSkipPersist(context.Background()), auth); err != nil {
+		t.Fatalf("Register(skipPersist) returned error: %v", err)
+	}
+	if got := store.saveCount.Load(); got != 0 {
+		t.Fatalf("expected 0 Save calls after skipped register, got %d", got)
+	}
+
 	if _, err := mgr.Update(context.Background(), auth); err != nil {
 		t.Fatalf("Update returned error: %v", err)
 	}
@@ -89,6 +96,10 @@ func TestWithoutSkipPersist_ReEnablesPersistence(t *testing.T) {
 		ID:       "auth-1",
 		Provider: "antigravity",
 		Metadata: map[string]any{"type": "antigravity"},
+	}
+
+	if _, err := mgr.Register(WithSkipPersist(context.Background()), auth); err != nil {
+		t.Fatalf("Register(skipPersist) returned error: %v", err)
 	}
 
 	ctx := WithoutSkipPersist(WithSkipPersist(context.Background()))

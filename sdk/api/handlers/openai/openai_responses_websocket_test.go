@@ -1544,6 +1544,24 @@ func TestDedupeResponsesWebsocketInputItemsByIDAfterRepair(t *testing.T) {
 	}
 }
 
+// TestDedupeResponsesWebsocketInputItemsByIDKeepsReferencedToolCall 验证去重时保留仍被 output 引用的 tool call。
+func TestDedupeResponsesWebsocketInputItemsByIDKeepsReferencedToolCall(t *testing.T) {
+	payload := []byte(`{"input":[{"type":"function_call","id":"fc-1","call_id":"call-1","name":"exec_command"},{"type":"function_call","id":"fc-1","call_id":"call-2","name":"exec_command"},{"type":"function_call_output","id":"fco-1","call_id":"call-1"}]}`)
+
+	deduped := dedupeResponsesWebsocketInputItemsByID(payload)
+
+	items := gjson.GetBytes(deduped, "input").Array()
+	if len(items) != 2 {
+		t.Fatalf("deduped input len = %d, want 2: %s", len(items), deduped)
+	}
+	if items[0].Get("id").String() != "fc-1" ||
+		items[0].Get("call_id").String() != "call-1" ||
+		items[1].Get("id").String() != "fco-1" ||
+		items[1].Get("call_id").String() != "call-1" {
+		t.Fatalf("unexpected deduped input: %s", deduped)
+	}
+}
+
 func TestResponsesWebsocketCompactionResetsTurnStateOnTranscriptReplacement(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 

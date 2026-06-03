@@ -94,6 +94,9 @@ func TestDeleteAuthFile_UsesAuthPathFromManager(t *testing.T) {
 	if len(store.deletedIDs) != 0 {
 		t.Fatalf("expected delete fallback to stay unused, got %#v", store.deletedIDs)
 	}
+	if _, ok := manager.GetByID(record.ID); ok {
+		t.Fatalf("expected runtime auth %q to be removed", record.ID)
+	}
 
 	listRec := httptest.NewRecorder()
 	listCtx, _ := gin.CreateTestContext(listRec)
@@ -166,7 +169,7 @@ func TestDeleteAuthFile_FallbackToAuthDirPath(t *testing.T) {
 	}
 }
 
-func TestDeleteAuthFile_AlreadyMissingStillDisablesAuth(t *testing.T) {
+func TestDeleteAuthFile_AlreadyMissingStillRemovesAuth(t *testing.T) {
 	t.Setenv("MANAGEMENT_PASSWORD", "")
 	gin.SetMode(gin.TestMode)
 
@@ -218,15 +221,8 @@ func TestDeleteAuthFile_AlreadyMissingStillDisablesAuth(t *testing.T) {
 		t.Fatalf("expected already_missing=true, payload: %#v", deletePayload)
 	}
 
-	auth, ok := manager.GetByID(record.ID)
-	if !ok {
-		t.Fatalf("expected auth record to remain in manager for disabled-state tracking")
-	}
-	if !auth.Disabled {
-		t.Fatalf("expected auth to be disabled after idempotent delete")
-	}
-	if auth.Status != coreauth.StatusDisabled {
-		t.Fatalf("expected auth status %q, got %q", coreauth.StatusDisabled, auth.Status)
+	if _, ok := manager.GetByID(record.ID); ok {
+		t.Fatalf("expected runtime auth %q to be removed after idempotent delete", record.ID)
 	}
 
 	listRec := httptest.NewRecorder()
@@ -327,7 +323,7 @@ func TestDeleteAuthFile_AllArchivesFiles(t *testing.T) {
 	}
 }
 
-func TestDeleteAuthFile_AlreadyMissingConcurrentStormDisablesAllAuths(t *testing.T) {
+func TestDeleteAuthFile_AlreadyMissingConcurrentStormRemovesAllAuths(t *testing.T) {
 	t.Setenv("MANAGEMENT_PASSWORD", "")
 	gin.SetMode(gin.TestMode)
 
@@ -403,12 +399,8 @@ func TestDeleteAuthFile_AlreadyMissingConcurrentStormDisablesAllAuths(t *testing
 	}
 
 	for _, name := range names {
-		auth, ok := manager.GetByID("storm/" + name)
-		if !ok {
-			t.Fatalf("expected auth %s to remain in manager", name)
-		}
-		if !auth.Disabled || auth.Status != coreauth.StatusDisabled {
-			t.Fatalf("expected auth %s to be disabled after concurrent delete storm, got disabled=%v status=%q", name, auth.Disabled, auth.Status)
+		if _, ok := manager.GetByID("storm/" + name); ok {
+			t.Fatalf("expected auth %s to be removed from manager", name)
 		}
 	}
 

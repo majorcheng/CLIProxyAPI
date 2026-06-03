@@ -1017,7 +1017,7 @@ func (h *Handler) DeleteAuthFile(c *gin.Context) {
 				return
 			}
 			deleted++
-			h.disableAuthsForDeletedPath(ctx, full, "")
+			h.removeAuthsForDeletedPath(ctx, full, "")
 		}
 		c.JSON(200, gin.H{"status": "ok", "deleted": deleted})
 		return
@@ -1257,7 +1257,7 @@ func (h *Handler) deleteAuthFileByName(ctx context.Context, name string) (string
 	if errDeleteRecord := h.deleteTokenRecord(ctx, targetPath); errDeleteRecord != nil {
 		return filepath.Base(name), alreadyMissing, http.StatusInternalServerError, errDeleteRecord
 	}
-	h.disableAuthsForDeletedPath(ctx, targetPath, targetID)
+	h.removeAuthsForDeletedPath(ctx, targetPath, targetID)
 	return filepath.Base(name), alreadyMissing, http.StatusOK, nil
 }
 
@@ -1493,7 +1493,7 @@ func (h *Handler) PatchAuthFileStatus(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"status": "ok", "disabled": *req.Disabled})
 }
 
-func (h *Handler) disableAuth(ctx context.Context, id string) {
+func (h *Handler) removeAuth(ctx context.Context, id string) {
 	if h == nil {
 		return
 	}
@@ -1506,12 +1506,8 @@ func (h *Handler) disableAuth(ctx context.Context, id string) {
 		return
 	}
 	if auth, ok := manager.GetByID(id); ok {
-		auth.Disabled = true
-		auth.Status = coreauth.StatusDisabled
-		auth.StatusMessage = "removed via management API"
-		auth.UpdatedAt = time.Now()
-		_, _ = manager.Update(ctx, auth)
 		registry.GetGlobalRegistry().UnregisterClient(auth.ID)
+		manager.Remove(ctx, auth.ID)
 		return
 	}
 	authID := h.authIDForPath(id)
@@ -1519,12 +1515,8 @@ func (h *Handler) disableAuth(ctx context.Context, id string) {
 		return
 	}
 	if auth, ok := manager.GetByID(authID); ok {
-		auth.Disabled = true
-		auth.Status = coreauth.StatusDisabled
-		auth.StatusMessage = "removed via management API"
-		auth.UpdatedAt = time.Now()
-		_, _ = manager.Update(ctx, auth)
 		registry.GetGlobalRegistry().UnregisterClient(auth.ID)
+		manager.Remove(ctx, auth.ID)
 	}
 }
 

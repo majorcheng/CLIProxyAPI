@@ -238,7 +238,7 @@ func TestNextRefreshCheckAt_RefreshEvaluatorFallback(t *testing.T) {
 
 func TestNextRefreshCheckAt_CodexUsesAccessTokenExpiryWindow(t *testing.T) {
 	now := time.Date(2026, 4, 12, 0, 0, 0, 0, time.UTC)
-	expiry := now.Add(24 * time.Hour)
+	expiry := now.Add(72 * time.Hour)
 	auth := &Auth{
 		ID:       "codex-exp",
 		Provider: "codex",
@@ -260,7 +260,7 @@ func TestNextRefreshCheckAt_CodexUsesAccessTokenExpiryWindow(t *testing.T) {
 
 func TestNextRefreshCheckAt_CodexUsesMetadataExpiryWindow(t *testing.T) {
 	now := time.Date(2026, 4, 12, 0, 0, 0, 0, time.UTC)
-	expiry := now.Add(24 * time.Hour)
+	expiry := now.Add(72 * time.Hour)
 	auth := &Auth{
 		ID:       "codex-expired-meta",
 		Provider: "codex",

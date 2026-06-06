@@ -44,23 +44,23 @@ func TestManagerShouldRefresh_CodexUsesConservativeTokenJSONGate(t *testing.T) {
 			want: true,
 		},
 		{
-			name: "codex refreshes when JWT exp enters 12 hour proactive window",
+			name: "codex refreshes when JWT exp enters 48 hour proactive window",
 			auth: &Auth{
 				Provider: "codex",
 				Metadata: map[string]any{
 					"refresh_token": "refresh-token",
-					"access_token":  testJWTWithExp(now.Add(11*time.Hour + 30*time.Minute)),
+					"access_token":  testJWTWithExp(now.Add(47*time.Hour + 30*time.Minute)),
 				},
 			},
 			want: true,
 		},
 		{
-			name: "codex does not refresh when JWT exp is still beyond 12 hour window",
+			name: "codex does not refresh when JWT exp is still beyond 48 hour window",
 			auth: &Auth{
 				Provider: "codex",
 				Metadata: map[string]any{
 					"refresh_token": "refresh-token",
-					"access_token":  testJWTWithExp(now.Add(13 * time.Hour)),
+					"access_token":  testJWTWithExp(now.Add(49 * time.Hour)),
 				},
 			},
 			want: false,
@@ -77,12 +77,12 @@ func TestManagerShouldRefresh_CodexUsesConservativeTokenJSONGate(t *testing.T) {
 			want: true,
 		},
 		{
-			name: "codex does not refresh when metadata expiry is still beyond 12 hour window",
+			name: "codex does not refresh when metadata expiry is still beyond 48 hour window",
 			auth: &Auth{
 				Provider: "codex",
 				Metadata: map[string]any{
 					"refresh_token": "refresh-token",
-					"expired":       now.Add(13 * time.Hour).Format(time.RFC3339),
+					"expired":       now.Add(49 * time.Hour).Format(time.RFC3339),
 				},
 			},
 			want: false,

@@ -19,9 +19,15 @@ type authAutoRefreshLoop struct {
 	queue refreshMinHeap
 	index map[string]*refreshHeapItem
 	dirty map[string]struct{}
+	// dispatching 记录已进入后台 jobs 或正在 refresh 的 auth，避免等待期间重复入队。
+	dispatching map[string]struct{}
 
 	wakeCh chan struct{}
 	jobs   chan string
+
+	dispatchInterval time.Duration
+	dispatchMu       sync.Mutex
+	lastDispatchAt   time.Time
 }
 
 func newAuthAutoRefreshLoop(manager *Manager, interval time.Duration, concurrency int) *authAutoRefreshLoop {
@@ -36,13 +42,15 @@ func newAuthAutoRefreshLoop(manager *Manager, interval time.Duration, concurrenc
 		jobBuffer = 64
 	}
 	return &authAutoRefreshLoop{
-		manager:     manager,
-		interval:    interval,
-		concurrency: concurrency,
-		index:       make(map[string]*refreshHeapItem),
-		dirty:       make(map[string]struct{}),
-		wakeCh:      make(chan struct{}, 1),
-		jobs:        make(chan string, jobBuffer),
+		manager:          manager,
+		interval:         interval,
+		concurrency:      concurrency,
+		index:            make(map[string]*refreshHeapItem),
+		dirty:            make(map[string]struct{}),
+		dispatching:      make(map[string]struct{}),
+		wakeCh:           make(chan struct{}, 1),
+		jobs:             make(chan string, jobBuffer),
+		dispatchInterval: refreshDispatchInterval,
 	}
 }
 
@@ -84,8 +92,11 @@ func (l *authAutoRefreshLoop) worker(ctx context.Context) {
 			if authID == "" {
 				continue
 			}
-			l.manager.refreshAuth(ctx, authID)
-			l.queueReschedule(authID)
+			refreshed := l.runRefreshJob(ctx, authID)
+			l.finishDispatching(authID)
+			if refreshed {
+				l.queueReschedule(authID)
+			}
 		}
 	}
 }
@@ -221,6 +232,9 @@ func (l *authAutoRefreshLoop) handleDueAuth(ctx context.Context, now time.Time, 
 	if authID == "" {
 		return
 	}
+	if l.isDispatching(authID) {
+		return
+	}
 
 	manager := l.manager
 	manager.mu.RLock()
@@ -258,9 +272,13 @@ func (l *authAutoRefreshLoop) handleDueAuth(ctx context.Context, now time.Time, 
 		}
 		return
 	}
+	if !l.beginDispatching(authID) {
+		return
+	}
 
 	select {
 	case <-ctx.Done():
+		l.finishDispatching(authID)
 		return
 	case l.jobs <- authID:
 	}
@@ -322,6 +340,7 @@ func (l *authAutoRefreshLoop) remove(authID string) {
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	delete(l.dispatching, authID)
 	item, ok := l.index[authID]
 	if !ok || item == nil {
 		return

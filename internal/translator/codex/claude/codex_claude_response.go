@@ -87,6 +87,9 @@ func ConvertCodexResponseToClaude(_ context.Context, _ string, originalRequestRa
 	template := ""
 
 	switch typeStr {
+	case "error":
+		appendClaudeStreamError(&output, rootResult)
+
 	case "response.created":
 		template = `{"type":"message_start","message":{"id":"","type":"message","role":"assistant","model":"claude-opus-4-1-20250805","stop_sequence":null,"usage":{"input_tokens":0,"output_tokens":0},"content":[],"stop_reason":null}}`
 		template, _ = sjson.Set(template, "message.model", rootResult.Get("response.model").String())
@@ -251,6 +254,39 @@ func ConvertCodexResponseToClaude(_ context.Context, _ string, originalRequestRa
 	}
 
 	return []string{output.String()}
+}
+
+// appendClaudeStreamError 将 Codex 流式错误映射为 Claude Code 可消费的 SSE error 事件。
+func appendClaudeStreamError(output *strings.Builder, rootResult gjson.Result) {
+	errorResult := rootResult.Get("error")
+	errType := strings.TrimSpace(errorResult.Get("type").String())
+	if errType == "" {
+		errType = strings.TrimSpace(rootResult.Get("error_type").String())
+	}
+	if errType == "" {
+		errType = "api_error"
+	}
+
+	code := strings.TrimSpace(errorResult.Get("code").String())
+	message := strings.TrimSpace(errorResult.Get("message").String())
+	if message == "" {
+		message = strings.TrimSpace(rootResult.Get("message").String())
+	}
+	if message == "" {
+		message = code
+	}
+	if message == "" {
+		message = errType
+	}
+
+	if code == "cyber_policy" || errType == "invalid_request" {
+		errType = "invalid_request_error"
+	}
+
+	payload := `{"type":"error","error":{"type":"api_error","message":""}}`
+	payload, _ = sjson.Set(payload, "error.type", errType)
+	payload, _ = sjson.Set(payload, "error.message", message)
+	appendClaudeSSEEvent(output, "error", payload)
 }
 
 // ConvertCodexResponseToClaudeNonStream converts a non-streaming Codex response to a non-streaming Claude Code response.
